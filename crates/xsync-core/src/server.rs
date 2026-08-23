@@ -2159,38 +2159,19 @@ pub fn sync_push_server<F: FnMut(LocalEvent)>(
     host: Option<&str>,
     emit: F,
 ) -> Result<LocalSyncReport, ServerError> {
-    let mut child = spawn_server_child(dest_path, rsh, host)?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| ServerError::Transport {
-            stream: 0,
-            message: "failed to open child stdin".to_owned(),
-        })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ServerError::Transport {
-            stream: 0,
-            message: "failed to open child stdout".to_owned(),
-        })?;
-
-    let mut writer = BufWriter::new(stdin);
-    let mut reader = BufReader::new(stdout);
-
-    let result = run_client_push(
-        source_path,
-        source_trailing_slash,
-        dest_path,
-        dest_trailing_slash,
-        options,
-        &mut reader,
-        &mut writer,
-        emit,
-    );
-
-    let _ = child.wait();
-    result
+    let child = spawn_server_child(dest_path, rsh, host)?;
+    run_server_child_session(child, |reader, writer| {
+        run_client_push(
+            source_path,
+            source_trailing_slash,
+            dest_path,
+            dest_trailing_slash,
+            options,
+            reader,
+            writer,
+            emit,
+        )
+    })
 }
 
 /// Spawn a local child `xsync --server <path>` process and execute pull.
@@ -2207,38 +2188,35 @@ pub fn sync_pull_server<F: FnMut(LocalEvent)>(
     host: Option<&str>,
     emit: F,
 ) -> Result<LocalSyncReport, ServerError> {
-    let mut child = spawn_server_child(src_path, rsh, host)?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| ServerError::Transport {
-            stream: 0,
-            message: "failed to open child stdin".to_owned(),
-        })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ServerError::Transport {
-            stream: 0,
-            message: "failed to open child stdout".to_owned(),
-        })?;
+    let child = spawn_server_child(src_path, rsh, host)?;
+    run_server_child_session(child, |reader, writer| {
+        run_client_pull(
+            src_path,
+            src_trailing_slash,
+            dest_path,
+            dest_trailing_slash,
+            options,
+            reader,
+            writer,
+            emit,
+        )
+    })
+}
 
-    let mut writer = BufWriter::new(stdin);
-    let mut reader = BufReader::new(stdout);
+/// Message reported when the remote `xsync` binary cannot be located.
+const MISSING_XSYNC_MSG: &str = "xsync not found on remote host — install it or check PATH";
 
-    let result = run_client_pull(
-        src_path,
-        src_trailing_slash,
-        dest_path,
-        dest_trailing_slash,
-        options,
-        &mut reader,
-        &mut writer,
-        emit,
-    );
+fn parse_rsh_command(rsh: &str) -> Vec<String> {
+    shlex::split(rsh).unwrap_or_else(|| vec![rsh.to_owned()])
+}
 
-    let _ = child.wait();
-    result
+fn is_missing_xsync_stderr(stderr: &str, exit_code: Option<i32>) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("xsync: command not found")
+        || lower.contains("command not found")
+        || lower.contains("no such file")
+        || lower.contains("not found")
+        || exit_code == Some(127)
 }
 
 fn spawn_server_child(
@@ -2247,7 +2225,17 @@ fn spawn_server_child(
     host: Option<&str>,
 ) -> Result<Child, ServerError> {
     let mut cmd = if let Some(rsh_cmd) = rsh {
-        let mut c = Command::new(rsh_cmd);
+        let parts = parse_rsh_command(rsh_cmd);
+        if parts.is_empty() {
+            return Err(ServerError::Transport {
+                stream: 0,
+                message: "empty --rsh command".to_owned(),
+            });
+        }
+        let mut c = Command::new(&parts[0]);
+        for arg in &parts[1..] {
+            c.arg(arg);
+        }
         if let Some(h) = host {
             c.arg(h);
         }
@@ -2262,12 +2250,73 @@ fn spawn_server_child(
 
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::inherit());
+    cmd.stderr(Stdio::piped());
 
     cmd.spawn().map_err(|err| ServerError::Transport {
         stream: 0,
         message: format!("cannot spawn xsync --server: {err}"),
     })
+}
+
+/// Run a client protocol session against a spawned remote child, draining the
+/// child's stderr so a missing remote binary is reported as
+/// [`MISSING_XSYNC_MSG`] rather than as a raw broken-pipe error.
+fn run_server_child_session<F>(
+    child: Child,
+    f: F,
+) -> Result<LocalSyncReport, ServerError>
+where
+    F: FnOnce(
+        &mut BufReader<std::process::ChildStdout>,
+        &mut BufWriter<std::process::ChildStdin>,
+    ) -> Result<LocalSyncReport, ServerError>,
+{
+    let mut child = child;
+    let stdin = child.stdin.take().ok_or_else(|| ServerError::Transport {
+        stream: 0,
+        message: "failed to open child stdin".to_owned(),
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ServerError::Transport {
+            stream: 0,
+            message: "failed to open child stdout".to_owned(),
+        })?;
+    let stderr = child.stderr.take();
+
+    // Drain stderr on a background thread: it both unblocks the child should its
+    // own (little) stderr pipe fill, and lets us inspect a missing-binary message.
+    let stderr_handle = stderr.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = std::io::Read::read_to_string(&mut pipe, &mut buf);
+            buf
+        })
+    });
+
+    let mut reader = BufReader::new(stdout);
+    let mut writer = BufWriter::new(stdin);
+    let result = f(&mut reader, &mut writer);
+
+    // Close both streams to signal EOF to the child before reaping it.
+    drop(reader);
+    drop(writer);
+
+    let status = child.wait().ok();
+    let stderr_text = stderr_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let exit_code = status.and_then(|s| s.code());
+
+    if is_missing_xsync_stderr(&stderr_text, exit_code) {
+        return Err(ServerError::Transport {
+            stream: 0,
+            message: MISSING_XSYNC_MSG.to_owned(),
+        });
+    }
+
+    result
 }
 
 #[cfg(test)]

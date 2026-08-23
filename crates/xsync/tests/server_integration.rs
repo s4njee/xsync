@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use tempfile::tempdir;
@@ -31,6 +31,43 @@ fn populate_test_tree(root: &Path) {
         perms.set_mode(0o755);
         fs::set_permissions(root.join("nested/alpha/beta/small.txt"), perms).unwrap();
     }
+}
+
+/// Write an executable fake-rsh script that ignores the host and the literal
+/// `xsync` command word, then execs the local server binary: `xsync --server <path>`.
+///
+/// `mode` is one of `"exec"`, `"missing"`, or `"crash"`.
+fn write_fake_rsh(script_dir: &Path, mode: &str) -> PathBuf {
+    let script = script_dir.join(format!("fake_rsh_{mode}.sh"));
+    let body = match mode {
+        // Exec the local server directly (ignoring host + the "xsync" word).
+        "exec" | "missing" => {
+            let target = if mode == "missing" {
+                "definitely-not-a-real-xsync-binary".to_owned()
+            } else {
+                xsync_bin().to_owned()
+            };
+            format!("#!/bin/sh\nexec {target} \"$3\" \"$4\"\n")
+        }
+        // Start the server, then SIGKILL it shortly after so the client sees a
+        // mid-transfer disconnect and leaves only staging artifacts.
+        "crash" => {
+            let xs = xsync_bin();
+            format!(
+                "#!/bin/sh\n\"{xs}\" \"$3\" \"$4\" &\nPID=$!\nsleep 0.05\nkill -9 $PID\nwait $PID\n"
+            )
+        }
+        _ => unreachable!(),
+    };
+    fs::write(&script, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+    }
+    script
 }
 
 #[test]
@@ -93,6 +130,161 @@ fn test_pull_matches_push_identically() {
     let manifest_pull = build_manifest(dst_pull.path()).unwrap();
     assert_eq!(manifest_push.manifest_digest, manifest_pull.manifest_digest);
     assert_eq!(manifest_push.entries.len(), manifest_pull.entries.len());
+}
+
+#[test]
+fn test_rsh_override_uses_fake_rsh_and_matches_push() {
+    let src = tempdir().unwrap();
+    populate_test_tree(src.path());
+
+    let dst_local = tempdir().unwrap();
+    let dst_fake = tempdir().unwrap();
+
+    // Local-to-local baseline.
+    let status_local = Command::new(xsync_bin())
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("{}", dst_local.path().display()))
+        .status()
+        .unwrap();
+    assert!(status_local.success());
+
+    // Remote push driven through an explicit fake-rsh (long `--rsh` form) that
+    // ignores the host and execs the local server binary — no sshd, no network.
+    let script_dir = tempdir().unwrap();
+    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let output = Command::new(xsync_bin())
+        .arg("--rsh")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}", dst_fake.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fake-rsh push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest_local = build_manifest(dst_local.path()).unwrap();
+    let manifest_fake = build_manifest(dst_fake.path()).unwrap();
+    assert_eq!(manifest_local.manifest_digest, manifest_fake.manifest_digest);
+    assert_eq!(manifest_local.entries.len(), manifest_fake.entries.len());
+
+    // `-e` short form routes through the same pipe transport.
+    let dst_short = tempdir().unwrap();
+    let status_short = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}", dst_short.path().display()))
+        .status()
+        .unwrap();
+    assert!(status_short.success());
+    let manifest_short = build_manifest(dst_short.path()).unwrap();
+    assert_eq!(manifest_fake.manifest_digest, manifest_short.manifest_digest);
+}
+
+#[test]
+fn test_fake_rsh_second_run_skips_all_files() {
+    let src = tempdir().unwrap();
+    populate_test_tree(src.path());
+
+    let dst = tempdir().unwrap();
+    let script_dir = tempdir().unwrap();
+    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
+
+    let run = || {
+        Command::new(xsync_bin())
+            .arg("-e")
+            .arg(&fake_rsh)
+            .arg(format!("{}/", src.path().display()))
+            .arg(format!("fakehost:{}", dst.path().display()))
+            .output()
+            .unwrap()
+    };
+
+    let first = run();
+    assert!(first.status.success());
+
+    // Second run transfers zero bytes: all files are classified unchanged.
+    let second = run();
+    assert!(second.status.success());
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains("0 transferred"),
+        "second run should report 0 transferred, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_fake_rsh_restart_safety_leaves_no_final_truncated_file() {
+    let src = tempdir().unwrap();
+    // Multi-segment file so a mid-transfer kill interrupts it.
+    fs::write(src.path().join("big.bin"), vec![0x42; 20 * 1024 * 1024]).unwrap();
+
+    let dst = tempdir().unwrap();
+    let script_dir = tempdir().unwrap();
+    let crash_rsh = write_fake_rsh(script_dir.path(), "crash");
+
+    // First attempt is killed mid-transfer.
+    let first = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&crash_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(!first.status.success());
+
+    // No truncated file may ever exist under its final name.
+    let final_big = dst.path().join("big.bin");
+    assert!(
+        !final_big.exists(),
+        "interrupted transfer must not publish a truncated final file"
+    );
+
+    // A clean re-run (with a functional fake-rsh) completes the transfer.
+    let good_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let second = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&good_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "re-run after interrupt failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let written = fs::read(&final_big).unwrap();
+    assert_eq!(written, vec![0x42; 20 * 1024 * 1024]);
+}
+
+#[test]
+fn test_missing_remote_binary_reports_clear_error() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file.txt"), b"data").unwrap();
+
+    let dst = tempdir().unwrap();
+    let script_dir = tempdir().unwrap();
+    let missing_rsh = write_fake_rsh(script_dir.path(), "missing");
+
+    let output = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&missing_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}", dst.path().display()))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("xsync not found on remote host — install it or check PATH"),
+        "missing remote binary must not surface as a raw broken-pipe error; got: {stderr}"
+    );
 }
 
 #[test]

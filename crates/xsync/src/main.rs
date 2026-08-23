@@ -65,7 +65,7 @@ struct Cli {
     quiet: bool,
 
     /// Remote shell used to invoke the server, default `ssh`.
-    #[arg(short = 'e', value_name = "CMD")]
+    #[arg(short = 'e', long, value_name = "CMD")]
     rsh: Option<String>,
 
     /// Source path. Either side may be `[user@]host:path`.

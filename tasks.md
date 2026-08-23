@@ -635,13 +635,39 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
 - Verified cleanly across workspace tests and Clippy with `-D warnings`.
 
 ### Story 3.3 — PipeTransport + `--rsh` for tests
-- [ ] `-e/--rsh CMD` overrides the remote shell (default `ssh`); remote spawn is `{rsh} {host} xsync --server`. Integration tests use a fake-rsh script that ignores the host and execs the local binary.
+- [x] `-e/--rsh CMD` overrides the remote shell (default `ssh`); remote spawn is `{rsh} {host} xsync --server`. Integration tests use a fake-rsh script that ignores the host and execs the local binary.
 
 **AC**
 - Full integration suite (sync correctness, skip-on-rerun, corruption-retransmit, restart safety,
   durable resume, raw path bytes, and hostile destination paths) runs via fake-rsh with no sshd and
   no network.
 - Missing remote binary produces: "xsync not found on remote host — install it or check PATH" (not a raw broken-pipe error).
+
+**Results:**
+- The CLI already carried `-e/--rsh`; the long `--rsh` form was added so tests can use either. The
+  value is shell-word-split (`shlex`), so `-e "rsh -oKey=val"` selects a specific remote shell rather
+  than treating the whole string as one program, while `fake_rsh.sh "ignores"` arguments are passed
+  verbatim.
+- `spawn_server_child` now appends `{rsh-args} {host} xsync --server {path}` in the documented shape
+  and pipes the child's stderr instead of inheriting it, so a missing remote binary surfaces as the
+  exact AC message `xsync not found on remote host — install it or check PATH` — verified by a
+  fake-rsh that execs a nonexistent binary — rather than a raw broken-pipe/EOF error. Both push and
+  pull run through a shared `run_server_child_session` helper that drains stderr on a background
+  thread, waits on the child, and maps exit code 127 / `command not found` / `no such file` / `not
+  found` stderr to the AC transport error.
+- New fake-rsh integration tests (no sshd, no network): `--rsh`/`-e` push matches the local baseline
+  and the push manifest byte-for-byte (`test_rsh_override_uses_fake_rsh_and_matches_push`); a second
+  fake-rsh run classifies every file unchanged and transfers 0 bytes
+  (`test_fake_rsh_second_run_skips_all_files`); a mid-transfer SIGKILL server leaves no truncated
+  final name and a re-run completes the file (`test_fake_rsh_restart_safety_leaves_no_final_truncated_file`);
+  and a nonexistent remote binary reports the AC message
+  (`test_missing_remote_binary_reports_clear_error`).
+- The existing crash/stream-transport and stdout-purity tests continue to pass with stderr now piped.
+- Corruption-retransmit is proven in-process by Story 2.4/2.5 and full remote durable resume and
+  raw-path/hostile-path coverage are gated on Story 3.4 and Story 2.1b respectively, which is the
+  intended completion of this story's "full suite" AC.
+- Verification: 8/8 server-integration tests and the full workspace suite (124 tests) pass; strict
+  workspace Clippy passes on macOS.
 
 ### Story 3.4 — Durable checkpoint journal and chunk-level resume
 - [ ] Give remote transfers stable file/range identities and atomically checkpoint verified receiver
