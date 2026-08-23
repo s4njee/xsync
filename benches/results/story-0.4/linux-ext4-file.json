@@ -1,0 +1,123 @@
+{
+  "schema": "xsync.clone-bench.report.v1",
+  "environment": {
+    "source_revision": "unknown",
+    "build_id": "xsync-clone-bench-0.1.0-unknown",
+    "host": "mars",
+    "hardware": "AMD Ryzen 9 7900X 12-Core Processor",
+    "os": "linux",
+    "kernel": "Linux 7.1.6-arch1-1",
+    "filesystem": "ext4"
+  },
+  "object_kind": "file",
+  "source_manifest_digest": "3ee2e1df58cefbad106ae5f71fb64f0085a37e5df47cee785b767aa9b994e12b",
+  "logical_bytes": 1073741824,
+  "paranoid": false,
+  "samples": [
+    {
+      "repetition": 0,
+      "method_order": 0,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.219758942,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "first_pass"
+    },
+    {
+      "repetition": 0,
+      "method_order": 1,
+      "method": "buffered_verified",
+      "wall_seconds": 0.222209021,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 1,
+      "method_order": 0,
+      "method": "buffered_verified",
+      "wall_seconds": 0.220650404,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 1,
+      "method_order": 1,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.223304848,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 2,
+      "method_order": 0,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.219800482,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 2,
+      "method_order": 1,
+      "method": "buffered_verified",
+      "wall_seconds": 0.222018585,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 3,
+      "method_order": 0,
+      "method": "buffered_verified",
+      "wall_seconds": 0.219333943,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 3,
+      "method_order": 1,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.225453171,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 4,
+      "method_order": 0,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.22381405,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 4,
+      "method_order": 1,
+      "method": "buffered_verified",
+      "wall_seconds": 0.222333541,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    }
+  ],
+  "summaries": [
+    {
+      "method": "buffered_verified",
+      "median_wall_seconds": 0.222018585,
+      "mad_wall_seconds": 0.0003149560000000051
+    },
+    {
+      "method": "clone_or_fallback",
+      "median_wall_seconds": 0.223304848,
+      "mad_wall_seconds": 0.0021483230000000075
+    }
+  ],
+  "paired_clone_speedup": 0.9933850935631611,
+  "paired_clone_speedup_mad": 0.016706344725859634,
+  "clone_capability_available": false
+}

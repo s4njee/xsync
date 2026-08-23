@@ -1,0 +1,123 @@
+{
+  "schema": "xsync.clone-bench.report.v1",
+  "environment": {
+    "source_revision": "unknown",
+    "build_id": "xsync-clone-bench-0.1.0-rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "host": "MacBookPro",
+    "hardware": "unknown",
+    "os": "macos",
+    "kernel": "Darwin 25.6.0",
+    "filesystem": "apfs"
+  },
+  "object_kind": "file",
+  "source_manifest_digest": "3ee2e1df58cefbad106ae5f71fb64f0085a37e5df47cee785b767aa9b994e12b",
+  "logical_bytes": 1073741824,
+  "paranoid": false,
+  "samples": [
+    {
+      "repetition": 0,
+      "method_order": 0,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.002834291,
+      "disposition": "cloned",
+      "verification_passed": true,
+      "cache_state": "first_pass"
+    },
+    {
+      "repetition": 0,
+      "method_order": 1,
+      "method": "buffered_verified",
+      "wall_seconds": 0.302879083,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 1,
+      "method_order": 0,
+      "method": "buffered_verified",
+      "wall_seconds": 0.310130875,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 1,
+      "method_order": 1,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.003227333,
+      "disposition": "cloned",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 2,
+      "method_order": 0,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.003016166,
+      "disposition": "cloned",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 2,
+      "method_order": 1,
+      "method": "buffered_verified",
+      "wall_seconds": 0.286953417,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 3,
+      "method_order": 0,
+      "method": "buffered_verified",
+      "wall_seconds": 0.2879995,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 3,
+      "method_order": 1,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.003356583,
+      "disposition": "cloned",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 4,
+      "method_order": 0,
+      "method": "clone_or_fallback",
+      "wall_seconds": 0.002831375,
+      "disposition": "cloned",
+      "verification_passed": true,
+      "cache_state": "warm"
+    },
+    {
+      "repetition": 4,
+      "method_order": 1,
+      "method": "buffered_verified",
+      "wall_seconds": 0.268214333,
+      "disposition": "buffered_fallback",
+      "verification_passed": true,
+      "cache_state": "warm"
+    }
+  ],
+  "summaries": [
+    {
+      "method": "buffered_verified",
+      "median_wall_seconds": 0.2879995,
+      "mad_wall_seconds": 0.014879582999999974
+    },
+    {
+      "method": "clone_or_fallback",
+      "median_wall_seconds": 0.003016166,
+      "mad_wall_seconds": 0.0001847909999999997
+    }
+  ],
+  "paired_clone_speedup": 95.13846950068398,
+  "paired_clone_speedup_mad": 0.9566266669565948,
+  "clone_capability_available": true
+}

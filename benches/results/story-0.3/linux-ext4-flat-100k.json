@@ -1,0 +1,99 @@
+{
+  "schema": "xsync.engine-bench.report.v1",
+  "environment": {
+    "source_revision": "unknown",
+    "build_id": "xsync-engine-bench-0.1.0-rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "host": "mars",
+    "hardware": "AMD Ryzen 9 7900X 12-Core Processor",
+    "os": "linux",
+    "kernel": "Linux 7.1.6-arch1-1",
+    "filesystem": "ext4"
+  },
+  "shape": "flat-small-100k",
+  "corpus_manifest_digest": "19e0b6ec9c89a540dbd793ef72f5bfdcffd941e4cad5da55d873b63ec24173f3",
+  "channel_capacity": 1024,
+  "memory_budget_bytes": 536870912,
+  "memory_budget_passed": true,
+  "samples": [
+    {
+      "repetition": 0,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.08700157,
+      "source_scan_seconds": 0.089551874,
+      "syscall_phase_seconds": 0.176553444,
+      "scan_entries_per_second": 1132801.4649207296,
+      "destination_index_seconds": 0.009332543,
+      "planner_seconds": 0.010949947,
+      "queue_high_water": 705,
+      "peak_rss_bytes": 50368512,
+      "planned_items": 100000
+    },
+    {
+      "repetition": 1,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.092950459,
+      "source_scan_seconds": 0.097999638,
+      "syscall_phase_seconds": 0.190950097,
+      "scan_entries_per_second": 1047394.0738558515,
+      "destination_index_seconds": 0.009035844,
+      "planner_seconds": 0.011624249,
+      "queue_high_water": 714,
+      "peak_rss_bytes": 49590272,
+      "planned_items": 100000
+    },
+    {
+      "repetition": 2,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.089903547,
+      "source_scan_seconds": 0.093642925,
+      "syscall_phase_seconds": 0.183546472,
+      "scan_entries_per_second": 1089642.300506871,
+      "destination_index_seconds": 0.008252615,
+      "planner_seconds": 0.010302685,
+      "queue_high_water": 996,
+      "peak_rss_bytes": 48795648,
+      "planned_items": 100000
+    },
+    {
+      "repetition": 3,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.078722846,
+      "source_scan_seconds": 0.090682067,
+      "syscall_phase_seconds": 0.169404913,
+      "scan_entries_per_second": 1180603.3039903631,
+      "destination_index_seconds": 0.014529202,
+      "planner_seconds": 0.017732066,
+      "queue_high_water": 709,
+      "peak_rss_bytes": 54542336,
+      "planned_items": 100000
+    },
+    {
+      "repetition": 4,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.084704455,
+      "source_scan_seconds": 0.082749646,
+      "syscall_phase_seconds": 0.167454101,
+      "scan_entries_per_second": 1194357.1331227056,
+      "destination_index_seconds": 0.013790417,
+      "planner_seconds": 0.017722989,
+      "queue_high_water": 1022,
+      "peak_rss_bytes": 50991104,
+      "planned_items": 100000
+    }
+  ],
+  "summary": {
+    "median_scan_entries_per_second": 1132801.4649207296,
+    "mad_scan_entries_per_second": 47801.83906963351,
+    "median_syscall_phase_seconds": 0.176553444,
+    "mad_syscall_phase_seconds": 0.0071485310000000135,
+    "median_destination_index_seconds": 0.009332543,
+    "median_planner_seconds": 0.011624249,
+    "peak_rss_bytes": 54542336,
+    "queue_high_water": 1022
+  },
+  "notes": [
+    "First repetition is first-pass; later repetitions are warm-cache. No cache eviction was claimed.",
+    "Peak RSS is measured in a fresh process for every repetition (Linux VmHWM; macOS /usr/bin/time -l).",
+    "The portable scanner currently rejects non-UTF-8 paths; Story 2.1b remains required before protocol freeze."
+  ]
+}

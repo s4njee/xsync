@@ -1,0 +1,99 @@
+{
+  "schema": "xsync.engine-bench.report.v1",
+  "environment": {
+    "source_revision": "unknown",
+    "build_id": "xsync-engine-bench-0.1.0-rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "host": "MacBookPro",
+    "hardware": "Apple M1 Max",
+    "os": "macos",
+    "kernel": "Darwin 25.6.0",
+    "filesystem": "apfs"
+  },
+  "shape": "flat-small-100k",
+  "corpus_manifest_digest": "19e0b6ec9c89a540dbd793ef72f5bfdcffd941e4cad5da55d873b63ec24173f3",
+  "channel_capacity": 1024,
+  "memory_budget_bytes": 536870912,
+  "memory_budget_passed": true,
+  "samples": [
+    {
+      "repetition": 0,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.159398417,
+      "source_scan_seconds": 0.154459791,
+      "syscall_phase_seconds": 0.31385820799999997,
+      "scan_entries_per_second": 637230.4273144898,
+      "destination_index_seconds": 0.007902542,
+      "planner_seconds": 0.019330334,
+      "queue_high_water": 1024,
+      "peak_rss_bytes": 279969792,
+      "planned_items": 100000
+    },
+    {
+      "repetition": 1,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.156546292,
+      "source_scan_seconds": 0.156710625,
+      "syscall_phase_seconds": 0.313256917,
+      "scan_entries_per_second": 638453.5796219944,
+      "destination_index_seconds": 0.007823042,
+      "planner_seconds": 0.011540875,
+      "queue_high_water": 1024,
+      "peak_rss_bytes": 280887296,
+      "planned_items": 100000
+    },
+    {
+      "repetition": 2,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.160305333,
+      "source_scan_seconds": 0.157441292,
+      "syscall_phase_seconds": 0.317746625,
+      "scan_entries_per_second": 629432.3346471422,
+      "destination_index_seconds": 0.008486625,
+      "planner_seconds": 0.016711542,
+      "queue_high_water": 1024,
+      "peak_rss_bytes": 281264128,
+      "planned_items": 100000
+    },
+    {
+      "repetition": 3,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.157027209,
+      "source_scan_seconds": 0.1548215,
+      "syscall_phase_seconds": 0.311848709,
+      "scan_entries_per_second": 641336.6296796182,
+      "destination_index_seconds": 0.007904833,
+      "planner_seconds": 0.017015542,
+      "queue_high_water": 1024,
+      "peak_rss_bytes": 280559616,
+      "planned_items": 100000
+    },
+    {
+      "repetition": 4,
+      "item_count": 100000,
+      "destination_scan_seconds": 0.157270917,
+      "source_scan_seconds": 0.1567045,
+      "syscall_phase_seconds": 0.313975417,
+      "scan_entries_per_second": 636992.5451838798,
+      "destination_index_seconds": 0.008081625,
+      "planner_seconds": 0.017054416,
+      "queue_high_water": 1024,
+      "peak_rss_bytes": 280526848,
+      "planned_items": 100000
+    }
+  ],
+  "summary": {
+    "median_scan_entries_per_second": 637230.4273144898,
+    "mad_scan_entries_per_second": 1223.1523075045552,
+    "median_syscall_phase_seconds": 0.31385820799999997,
+    "mad_syscall_phase_seconds": 0.0006012909999999483,
+    "median_destination_index_seconds": 0.007904833,
+    "median_planner_seconds": 0.017015542,
+    "peak_rss_bytes": 281264128,
+    "queue_high_water": 1024
+  },
+  "notes": [
+    "First repetition is first-pass; later repetitions are warm-cache. No cache eviction was claimed.",
+    "Peak RSS is measured in a fresh process for every repetition (Linux VmHWM; macOS /usr/bin/time -l).",
+    "The portable scanner currently rejects non-UTF-8 paths; Story 2.1b remains required before protocol freeze."
+  ]
+}

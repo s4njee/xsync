@@ -1,0 +1,876 @@
+{
+  "schema": "xsync.remote-bench.report.v1",
+  "generated_unix_nanos": 1787491368738138000,
+  "build": {
+    "source_revision": "unknown-no-vcs-metadata",
+    "build_id": "xsync-remote-spike-0.1.0-release-xsync-story-0.5-spike-v1",
+    "profile": "release"
+  },
+  "environment": {
+    "local_host": "MacBookPro",
+    "local_os_kernel": "Darwin MacBookPro 25.6.0 Darwin Kernel Version 25.6.0: Sat Jul 11 15:26:21 PDT 2026; root:xnu-12377.161.13~4/RELEASE_ARM64_T6000 arm64",
+    "local_hardware": "Apple M1 Max",
+    "remote_host": "sanjee@mars.local",
+    "remote_os_kernel": "Linux 7.1.6-arch1-1 x86_64 GNU/Linux",
+    "remote_hardware": "AMD Ryzen 9 7900X 12-Core Processor",
+    "destination_filesystem": "ext4",
+    "profile": "native-compressible",
+    "route": "ssh MacBookPro -> sanjee@mars.local",
+    "receiver_prefix": "none"
+  },
+  "corpus": {
+    "schema": "xsync.manifest.v1",
+    "manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+    "item_count": 257,
+    "logical_bytes": 268435456
+  },
+  "tools": {
+    "local_rsync": "rsync  version 3.4.4  protocol version 32",
+    "remote_rsync": "rsync  version 3.4.4  protocol version 32",
+    "ssh": "OpenSSH_10.3p1, LibreSSL 3.3.6",
+    "native_spike": "xsync.remote-spike.send.v1"
+  },
+  "transport_capabilities": {
+    "native_xsync": {
+      "status": "benchmark_spike_only",
+      "dialect": "xsync-story-0.5-spike-v1",
+      "features": [
+        "bounded frames",
+        "1/2/4/8 persistent data sessions",
+        "BLAKE3 before atomic publication",
+        "adaptive zstd"
+      ],
+      "correctness": "independent manifest required for every sample",
+      "degraded_guarantees": [
+        "flat regular-file corpus only",
+        "no durable resume",
+        "not production protocol v1"
+      ]
+    },
+    "rsync_protocol_fallback": {
+      "status": "not_implemented_story_4.5",
+      "dialect": "reference receiver protocol 32",
+      "features": [
+        "reference rsync -a/-az measured",
+        "server setup marker measured"
+      ],
+      "correctness": "reference client samples independently manifested; native codec unavailable",
+      "degraded_guarantees": [
+        "no xsync BLAKE3 framing",
+        "no xsync checkpoint resume",
+        "single stream",
+        "native fallback setup time unavailable until Story 4.5"
+      ]
+    }
+  },
+  "methods": [
+    {
+      "name": "rsync-a",
+      "config": {
+        "transport": "reference-rsync-client",
+        "streams": 1,
+        "compression": "none",
+        "baseline": null
+      },
+      "samples": [
+        {
+          "wall_seconds": 4.133984458050691,
+          "cpu_seconds": 1.035752,
+          "peak_rss_bytes": 106463232,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268514411,
+          "phases_seconds": {
+            "ssh_setup": 0.15821699996013194,
+            "transfer_and_teardown": 3.764797708019614,
+            "independent_verification": 0.2097897920757532
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.008 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 268,514,411\nTotal bytes received: 4,883\n\nsent 268,514,411 bytes  received 4,883 bytes  59,670,954.22 bytes/sec\ntotal size is 268,435,456  speedup is 1.00\n",
+          "repetition": 0,
+          "method_order": 0,
+          "cache_state": "first_pass"
+        },
+        {
+          "wall_seconds": 4.434906709007919,
+          "cpu_seconds": 1.075855,
+          "peak_rss_bytes": 134234112,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268514411,
+          "phases_seconds": {
+            "ssh_setup": 0.1606745000462979,
+            "transfer_and_teardown": 4.067650540964678,
+            "independent_verification": 0.20592004200443625
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.003 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 268,514,411\nTotal bytes received: 4,883\n\nsent 268,514,411 bytes  received 4,883 bytes  59,670,954.22 bytes/sec\ntotal size is 268,435,456  speedup is 1.00\n",
+          "repetition": 1,
+          "method_order": 0,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 4.174803458037786,
+          "cpu_seconds": 1.064597,
+          "peak_rss_bytes": 45170688,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268514411,
+          "phases_seconds": {
+            "ssh_setup": 0.15332308399956673,
+            "transfer_and_teardown": 3.799575874931179,
+            "independent_verification": 0.22121895791497082
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.003 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 268,514,411\nTotal bytes received: 4,883\n\nsent 268,514,411 bytes  received 4,883 bytes  59,670,954.22 bytes/sec\ntotal size is 268,435,456  speedup is 1.00\n",
+          "repetition": 2,
+          "method_order": 2,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 4.886036166106351,
+          "cpu_seconds": 1.0430719999999996,
+          "peak_rss_bytes": 88621056,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268514411,
+          "phases_seconds": {
+            "ssh_setup": 0.1494625830091536,
+            "transfer_and_teardown": 4.377702999976464,
+            "independent_verification": 0.3582052920246497
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.003 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 268,514,411\nTotal bytes received: 4,883\n\nsent 268,514,411 bytes  received 4,883 bytes  59,670,954.22 bytes/sec\ntotal size is 268,435,456  speedup is 1.00\n",
+          "repetition": 3,
+          "method_order": 2,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 4.3247530839871615,
+          "cpu_seconds": 1.0502219999999998,
+          "peak_rss_bytes": 86327296,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268514411,
+          "phases_seconds": {
+            "ssh_setup": 0.16141504200641066,
+            "transfer_and_teardown": 3.9162524580024183,
+            "independent_verification": 0.24640933296177536
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.005 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 268,514,411\nTotal bytes received: 4,883\n\nsent 268,514,411 bytes  received 4,883 bytes  59,670,954.22 bytes/sec\ntotal size is 268,435,456  speedup is 1.00\n",
+          "repetition": 4,
+          "method_order": 0,
+          "cache_state": "warm"
+        }
+      ],
+      "summary": {
+        "median_wall_seconds": 4.3247530839871615,
+        "mad_wall_seconds": 0.14994962594937533,
+        "median_wire_bytes": 268514411,
+        "median_setup_seconds": 0.15821699996013194,
+        "peak_rss_bytes": 134234112
+      }
+    },
+    {
+      "name": "rsync-az",
+      "config": {
+        "transport": "reference-rsync-client",
+        "streams": 1,
+        "compression": "rsync -z negotiated default",
+        "baseline": "rsync-a"
+      },
+      "samples": [
+        {
+          "wall_seconds": 1.116977583966218,
+          "cpu_seconds": 0.12307700000000002,
+          "peak_rss_bytes": 8978432,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 42913,
+          "phases_seconds": {
+            "ssh_setup": 0.15265662502497435,
+            "transfer_and_teardown": 0.24892625003121793,
+            "independent_verification": 0.7147074999520555
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.003 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 42,913\nTotal bytes received: 4,883\n\nsent 42,913 bytes  received 4,883 bytes  95,592.00 bytes/sec\ntotal size is 268,435,456  speedup is 5,616.27\n",
+          "repetition": 0,
+          "method_order": 1,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 2.1073228330351412,
+          "cpu_seconds": 0.11906299999999925,
+          "peak_rss_bytes": 8978432,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 42913,
+          "phases_seconds": {
+            "ssh_setup": 0.9676575000630692,
+            "transfer_and_teardown": 0.24563508399296552,
+            "independent_verification": 0.8929140419932082
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.003 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 42,913\nTotal bytes received: 4,883\n\nsent 42,913 bytes  received 4,883 bytes  31,864.00 bytes/sec\ntotal size is 268,435,456  speedup is 5,616.27\n",
+          "repetition": 1,
+          "method_order": 3,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 0.5840468750102445,
+          "cpu_seconds": 0.11262500000000042,
+          "peak_rss_bytes": 8962048,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 42913,
+          "phases_seconds": {
+            "ssh_setup": 0.1458917079726234,
+            "transfer_and_teardown": 0.235308124916628,
+            "independent_verification": 0.2021991249639541
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.005 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 42,913\nTotal bytes received: 4,883\n\nsent 42,913 bytes  received 4,883 bytes  31,864.00 bytes/sec\ntotal size is 268,435,456  speedup is 5,616.27\n",
+          "repetition": 2,
+          "method_order": 3,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 0.5889288750477135,
+          "cpu_seconds": 0.111927000000001,
+          "peak_rss_bytes": 8962048,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 42913,
+          "phases_seconds": {
+            "ssh_setup": 0.1561805410310626,
+            "transfer_and_teardown": 0.23447645897977054,
+            "independent_verification": 0.19765129208099097
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.004 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 42,913\nTotal bytes received: 4,883\n\nsent 42,913 bytes  received 4,883 bytes  31,864.00 bytes/sec\ntotal size is 268,435,456  speedup is 5,616.27\n",
+          "repetition": 3,
+          "method_order": 1,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 0.6503143749432638,
+          "cpu_seconds": 0.10861400000000021,
+          "peak_rss_bytes": 8978432,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 42913,
+          "phases_seconds": {
+            "ssh_setup": 0.1675481670536101,
+            "transfer_and_teardown": 0.26850554102566093,
+            "independent_verification": 0.21359950001351535
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "rsync_stdout": "./\npayload-000000.bin\npayload-000001.bin\npayload-000002.bin\npayload-000003.bin\npayload-000004.bin\npayload-000005.bin\npayload-000006.bin\npayload-000007.bin\npayload-000008.bin\npayload-000009.bin\npayload-000010.bin\npayload-000011.bin\npayload-000012.bin\npayload-000013.bin\npayload-000014.bin\npayload-000015.bin\npayload-000016.bin\npayload-000017.bin\npayload-000018.bin\npayload-000019.bin\npayload-000020.bin\npayload-000021.bin\npayload-000022.bin\npayload-000023.bin\npayload-000024.bin\npayload-000025.bin\npayload-000026.bin\npayload-000027.bin\npayload-000028.bin\npayload-000029.bin\npayload-000030.bin\npayload-000031.bin\npayload-000032.bin\npayload-000033.bin\npayload-000034.bin\npayload-000035.bin\npayload-000036.bin\npayload-000037.bin\npayload-000038.bin\npayload-000039.bin\npayload-000040.bin\npayload-000041.bin\npayload-000042.bin\npayload-000043.bin\npayload-000044.bin\npayload-000045.bin\npayload-000046.bin\npayload-000047.bin\npayload-000048.bin\npayload-000049.bin\npayload-000050.bin\npayload-000051.bin\npayload-000052.bin\npayload-000053.bin\npayload-000054.bin\npayload-000055.bin\npayload-000056.bin\npayload-000057.bin\npayload-000058.bin\npayload-000059.bin\npayload-000060.bin\npayload-000061.bin\npayload-000062.bin\npayload-000063.bin\npayload-000064.bin\npayload-000065.bin\npayload-000066.bin\npayload-000067.bin\npayload-000068.bin\npayload-000069.bin\npayload-000070.bin\npayload-000071.bin\npayload-000072.bin\npayload-000073.bin\npayload-000074.bin\npayload-000075.bin\npayload-000076.bin\npayload-000077.bin\npayload-000078.bin\npayload-000079.bin\npayload-000080.bin\npayload-000081.bin\npayload-000082.bin\npayload-000083.bin\npayload-000084.bin\npayload-000085.bin\npayload-000086.bin\npayload-000087.bin\npayload-000088.bin\npayload-000089.bin\npayload-000090.bin\npayload-000091.bin\npayload-000092.bin\npayload-000093.bin\npayload-000094.bin\npayload-000095.bin\npayload-000096.bin\npayload-000097.bin\npayload-000098.bin\npayload-000099.bin\npayload-000100.bin\npayload-000101.bin\npayload-000102.bin\npayload-000103.bin\npayload-000104.bin\npayload-000105.bin\npayload-000106.bin\npayload-000107.bin\npayload-000108.bin\npayload-000109.bin\npayload-000110.bin\npayload-000111.bin\npayload-000112.bin\npayload-000113.bin\npayload-000114.bin\npayload-000115.bin\npayload-000116.bin\npayload-000117.bin\npayload-000118.bin\npayload-000119.bin\npayload-000120.bin\npayload-000121.bin\npayload-000122.bin\npayload-000123.bin\npayload-000124.bin\npayload-000125.bin\npayload-000126.bin\npayload-000127.bin\npayload-000128.bin\npayload-000129.bin\npayload-000130.bin\npayload-000131.bin\npayload-000132.bin\npayload-000133.bin\npayload-000134.bin\npayload-000135.bin\npayload-000136.bin\npayload-000137.bin\npayload-000138.bin\npayload-000139.bin\npayload-000140.bin\npayload-000141.bin\npayload-000142.bin\npayload-000143.bin\npayload-000144.bin\npayload-000145.bin\npayload-000146.bin\npayload-000147.bin\npayload-000148.bin\npayload-000149.bin\npayload-000150.bin\npayload-000151.bin\npayload-000152.bin\npayload-000153.bin\npayload-000154.bin\npayload-000155.bin\npayload-000156.bin\npayload-000157.bin\npayload-000158.bin\npayload-000159.bin\npayload-000160.bin\npayload-000161.bin\npayload-000162.bin\npayload-000163.bin\npayload-000164.bin\npayload-000165.bin\npayload-000166.bin\npayload-000167.bin\npayload-000168.bin\npayload-000169.bin\npayload-000170.bin\npayload-000171.bin\npayload-000172.bin\npayload-000173.bin\npayload-000174.bin\npayload-000175.bin\npayload-000176.bin\npayload-000177.bin\npayload-000178.bin\npayload-000179.bin\npayload-000180.bin\npayload-000181.bin\npayload-000182.bin\npayload-000183.bin\npayload-000184.bin\npayload-000185.bin\npayload-000186.bin\npayload-000187.bin\npayload-000188.bin\npayload-000189.bin\npayload-000190.bin\npayload-000191.bin\npayload-000192.bin\npayload-000193.bin\npayload-000194.bin\npayload-000195.bin\npayload-000196.bin\npayload-000197.bin\npayload-000198.bin\npayload-000199.bin\npayload-000200.bin\npayload-000201.bin\npayload-000202.bin\npayload-000203.bin\npayload-000204.bin\npayload-000205.bin\npayload-000206.bin\npayload-000207.bin\npayload-000208.bin\npayload-000209.bin\npayload-000210.bin\npayload-000211.bin\npayload-000212.bin\npayload-000213.bin\npayload-000214.bin\npayload-000215.bin\npayload-000216.bin\npayload-000217.bin\npayload-000218.bin\npayload-000219.bin\npayload-000220.bin\npayload-000221.bin\npayload-000222.bin\npayload-000223.bin\npayload-000224.bin\npayload-000225.bin\npayload-000226.bin\npayload-000227.bin\npayload-000228.bin\npayload-000229.bin\npayload-000230.bin\npayload-000231.bin\npayload-000232.bin\npayload-000233.bin\npayload-000234.bin\npayload-000235.bin\npayload-000236.bin\npayload-000237.bin\npayload-000238.bin\npayload-000239.bin\npayload-000240.bin\npayload-000241.bin\npayload-000242.bin\npayload-000243.bin\npayload-000244.bin\npayload-000245.bin\npayload-000246.bin\npayload-000247.bin\npayload-000248.bin\npayload-000249.bin\npayload-000250.bin\npayload-000251.bin\npayload-000252.bin\npayload-000253.bin\npayload-000254.bin\npayload-000255.bin\n\nNumber of files: 257 (reg: 256, dir: 1)\nNumber of created files: 257 (reg: 256, dir: 1)\nNumber of deleted files: 0\nNumber of regular files transferred: 256\nTotal file size: 268,435,456 bytes\nTotal transferred file size: 268,435,456 bytes\nLiteral data: 268,435,456 bytes\nMatched data: 0 bytes\nFile list size: 0\nFile list generation time: 0.029 seconds\nFile list transfer time: 0.000 seconds\nTotal bytes sent: 42,913\nTotal bytes received: 4,883\n\nsent 42,913 bytes  received 4,883 bytes  31,864.00 bytes/sec\ntotal size is 268,435,456  speedup is 5,616.27\n",
+          "repetition": 4,
+          "method_order": 1,
+          "cache_state": "warm"
+        }
+      ],
+      "summary": {
+        "median_wall_seconds": 0.6503143749432638,
+        "mad_wall_seconds": 0.06626749993301928,
+        "median_wire_bytes": 42913,
+        "median_setup_seconds": 0.1561805410310626,
+        "peak_rss_bytes": 8978432,
+        "paired_speedup": 6.650249864712696,
+        "paired_speedup_mad": 1.6462293420684224
+      }
+    },
+    {
+      "name": "xsync-1",
+      "config": {
+        "transport": "native-xsync-framing-spike",
+        "streams": 1,
+        "compression": "none",
+        "baseline": "rsync-a"
+      },
+      "samples": [
+        {
+          "wall_seconds": 4.278437333996408,
+          "cpu_seconds": 0.8900509999999999,
+          "peak_rss_bytes": 89276416,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268482672,
+          "phases_seconds": {
+            "ssh_setup": 0.155998792,
+            "transfer": 3.704305125,
+            "teardown": 0.009352083,
+            "independent_verification": 0.20338633400388062
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "none",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 268482672,
+            "setup_seconds": 0.155998792,
+            "transfer_seconds": 3.704305125,
+            "teardown_seconds": 0.009352083,
+            "wall_seconds": 3.8696589169999998,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 268482676,
+                "compressed_frames": 0,
+                "raw_frames": 256
+              }
+            ]
+          },
+          "repetition": 0,
+          "method_order": 2,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 4.577409332967363,
+          "cpu_seconds": 0.8973210000000003,
+          "peak_rss_bytes": 89243648,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268482672,
+          "phases_seconds": {
+            "ssh_setup": 0.138591541,
+            "transfer": 3.854541,
+            "teardown": 0.016102833,
+            "independent_verification": 0.36839416704606265
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "none",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 268482672,
+            "setup_seconds": 0.138591541,
+            "transfer_seconds": 3.854541,
+            "teardown_seconds": 0.016102833,
+            "wall_seconds": 4.00923625,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 268482676,
+                "compressed_frames": 0,
+                "raw_frames": 256
+              }
+            ]
+          },
+          "repetition": 1,
+          "method_order": 2,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 4.170845416025259,
+          "cpu_seconds": 0.8756950000000003,
+          "peak_rss_bytes": 77742080,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268482672,
+          "phases_seconds": {
+            "ssh_setup": 0.150931208,
+            "transfer": 3.559212875,
+            "teardown": 0.01332375,
+            "independent_verification": 0.24424920801538974
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "none",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 268482672,
+            "setup_seconds": 0.150931208,
+            "transfer_seconds": 3.559212875,
+            "teardown_seconds": 0.01332375,
+            "wall_seconds": 3.723468667,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 268482676,
+                "compressed_frames": 0,
+                "raw_frames": 256
+              }
+            ]
+          },
+          "repetition": 2,
+          "method_order": 0,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 4.286268915981054,
+          "cpu_seconds": 0.8664100000000001,
+          "peak_rss_bytes": 77479936,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268482672,
+          "phases_seconds": {
+            "ssh_setup": 0.139860084,
+            "transfer": 3.718978709,
+            "teardown": 0.028611542,
+            "independent_verification": 0.20374241599347442
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "none",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 268482672,
+            "setup_seconds": 0.139860084,
+            "transfer_seconds": 3.718978709,
+            "teardown_seconds": 0.028611542,
+            "wall_seconds": 3.887451167,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 268482676,
+                "compressed_frames": 0,
+                "raw_frames": 256
+              }
+            ]
+          },
+          "repetition": 3,
+          "method_order": 0,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 6.322919499943964,
+          "cpu_seconds": 0.9037489999999995,
+          "peak_rss_bytes": 62603264,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 268482672,
+          "phases_seconds": {
+            "ssh_setup": 0.180088916,
+            "transfer": 5.605005167,
+            "teardown": 0.043993041,
+            "independent_verification": 0.29462870804127306
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "none",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 268482672,
+            "setup_seconds": 0.180088916,
+            "transfer_seconds": 5.605005167,
+            "teardown_seconds": 0.043993041,
+            "wall_seconds": 5.829088208,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 268482676,
+                "compressed_frames": 0,
+                "raw_frames": 256
+              }
+            ]
+          },
+          "repetition": 4,
+          "method_order": 2,
+          "cache_state": "warm"
+        }
+      ],
+      "summary": {
+        "median_wall_seconds": 4.286268915981054,
+        "mad_wall_seconds": 0.1154234999557957,
+        "median_wire_bytes": 268482672,
+        "median_setup_seconds": 0.150931208,
+        "peak_rss_bytes": 89276416,
+        "paired_speedup": 0.9688682803757327,
+        "paired_speedup_mad": 0.03208069797703006
+      }
+    },
+    {
+      "name": "xsync-adaptive-1",
+      "config": {
+        "transport": "native-xsync-framing-spike",
+        "streams": 1,
+        "compression": "adaptive-zstd-3 sample=65536",
+        "baseline": "rsync-az"
+      },
+      "samples": [
+        {
+          "wall_seconds": 0.9820641248952597,
+          "cpu_seconds": 0.4266050000000001,
+          "peak_rss_bytes": 9797632,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 83056,
+          "phases_seconds": {
+            "ssh_setup": 0.1461855,
+            "transfer": 0.218745333,
+            "teardown": 0.215754416,
+            "independent_verification": 0.20254687499254942
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "adaptive-zstd-3",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 83056,
+            "setup_seconds": 0.1461855,
+            "transfer_seconds": 0.218745333,
+            "teardown_seconds": 0.215754416,
+            "wall_seconds": 0.580686292,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 83060,
+                "compressed_frames": 256,
+                "raw_frames": 0
+              }
+            ]
+          },
+          "repetition": 0,
+          "method_order": 3,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 0.9810716670472175,
+          "cpu_seconds": 0.43398599999999976,
+          "peak_rss_bytes": 9715712,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 83056,
+          "phases_seconds": {
+            "ssh_setup": 0.146810708,
+            "transfer": 0.216112375,
+            "teardown": 0.2132435,
+            "independent_verification": 0.197881041909568
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "adaptive-zstd-3",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 83056,
+            "setup_seconds": 0.146810708,
+            "transfer_seconds": 0.216112375,
+            "teardown_seconds": 0.2132435,
+            "wall_seconds": 0.576167417,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 83060,
+                "compressed_frames": 256,
+                "raw_frames": 0
+              }
+            ]
+          },
+          "repetition": 1,
+          "method_order": 1,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 0.9710059590870515,
+          "cpu_seconds": 0.42656099999999997,
+          "peak_rss_bytes": 9781248,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 83056,
+          "phases_seconds": {
+            "ssh_setup": 0.143345041,
+            "transfer": 0.216522917,
+            "teardown": 0.206123084,
+            "independent_verification": 0.20439141592942178
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "adaptive-zstd-3",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 83056,
+            "setup_seconds": 0.143345041,
+            "transfer_seconds": 0.216522917,
+            "teardown_seconds": 0.206123084,
+            "wall_seconds": 0.565992125,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 83060,
+                "compressed_frames": 256,
+                "raw_frames": 0
+              }
+            ]
+          },
+          "repetition": 2,
+          "method_order": 1,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 1.4932812920305878,
+          "cpu_seconds": 0.42452800000000046,
+          "peak_rss_bytes": 9699328,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 83056,
+          "phases_seconds": {
+            "ssh_setup": 0.176625083,
+            "transfer": 0.218800916,
+            "teardown": 0.185544667,
+            "independent_verification": 0.7141514170216396
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "adaptive-zstd-3",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 83056,
+            "setup_seconds": 0.176625083,
+            "transfer_seconds": 0.218800916,
+            "teardown_seconds": 0.185544667,
+            "wall_seconds": 0.58097175,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 83060,
+                "compressed_frames": 256,
+                "raw_frames": 0
+              }
+            ]
+          },
+          "repetition": 3,
+          "method_order": 3,
+          "cache_state": "warm"
+        },
+        {
+          "wall_seconds": 1.6622476249467582,
+          "cpu_seconds": 0.4348099999999997,
+          "peak_rss_bytes": 10944512,
+          "item_count": 257,
+          "logical_bytes": 268435456,
+          "wire_bytes": 83056,
+          "phases_seconds": {
+            "ssh_setup": 0.760894958,
+            "transfer": 0.23372925,
+            "teardown": 0.225305167,
+            "independent_verification": 0.23660000006202608
+          },
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "actual_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "item_count": 257,
+            "logical_bytes": 268435456
+          },
+          "native": {
+            "schema": "xsync.remote-spike.send.v1",
+            "framing": "xsync-story-0.5-spike-v1; 14-byte bounded frame header; 1 MiB data payload",
+            "streams": 1,
+            "compression": "adaptive-zstd-3",
+            "sample_bytes": 65536,
+            "item_count": 257,
+            "logical_bytes": 268435456,
+            "wire_bytes": 83056,
+            "setup_seconds": 0.760894958,
+            "transfer_seconds": 0.23372925,
+            "teardown_seconds": 0.225305167,
+            "wall_seconds": 1.219934209,
+            "source_manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+            "receiver_summaries": [
+              {
+                "stream": 0,
+                "files": 256,
+                "logical_bytes": 268435456,
+                "wire_bytes": 83060,
+                "compressed_frames": 256,
+                "raw_frames": 0
+              }
+            ]
+          },
+          "repetition": 4,
+          "method_order": 3,
+          "cache_state": "warm"
+        }
+      ],
+      "summary": {
+        "median_wall_seconds": 0.9820641248952597,
+        "mad_wall_seconds": 0.011058165808208287,
+        "median_wire_bytes": 83056,
+        "median_setup_seconds": 0.146810708,
+        "peak_rss_bytes": 10944512,
+        "paired_speedup": 0.6014863961899581,
+        "paired_speedup_mad": 0.2102604649968885
+      }
+    }
+  ]
+}

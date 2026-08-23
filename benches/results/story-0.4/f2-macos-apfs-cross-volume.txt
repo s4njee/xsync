@@ -1,0 +1,25 @@
+Command:
+/Users/sanjee/projects/f2/bench/.build/release/f2bench bigcopy --src <story-0.4-one-large-file-regression>/source/large.bin --dst /Volumes/xsync-story-0-4 --reps 5 --sentinel /Volumes/xsync-story-0-4/sentinel.bin --sentinel-mb 256 --sentinel-reps 5
+
+Platform: Apple M1 Max, macOS, APFS source to a separate temporary APFS sparse volume
+Corpus: xsync.corpus.v1 one-large-file/regression, seed 404; 1 GiB
+
+strategy                         first pass   warm median   throughput   vs copyfile
+copyfile                        2.69 s       3.35 s       305.6 MiB/s   1.00x
+read/write F_NOCACHE 8 MiB      1.54 s       1.50 s       683.5 MiB/s   2.24x
+read/write F_NOCACHE 32 MiB     1.35 s       1.41 s       723.9 MiB/s   2.37x
+
+Sentinel cache-retention gate: median paired post-copy latency must be <= 2.00x baseline.
+
+method      median baseline   median post   median paired ratio   result
+copyfile    50.8 ms           46.5 ms       0.94x                 PASS
+nocache     69.4 ms           70.6 ms       0.89x                 PASS
+
+Per-repetition sentinel ratios:
+copyfile: 1.02x, 0.84x, 0.94x, 0.79x, 1.55x
+nocache:  0.89x, 0.73x, 0.81x, 1.33x, 0.89x
+
+Qualification: the inherited f2 probe groups throughput methods instead of rotating their order.
+The signal is promising and the cache-pressure gate passes, but it is exploratory evidence rather
+than the paired evidence required to ship an I/O hint. The temporary volume was detached and its
+sparse image deleted after the run.

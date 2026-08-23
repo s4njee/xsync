@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "benches",
+    "benches/engine",
+    "crates/xsync",
+    "crates/xsync-core",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.88"
+version = "0.1.0"
+authors = ["xsync contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/xsync" # placeholder until a real repo exists
+
+# Shared lints for every crate in the workspace.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Shared, tighter release profile (applies to the binary and all deps).
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

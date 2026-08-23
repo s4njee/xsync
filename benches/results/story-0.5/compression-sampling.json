@@ -1,0 +1,140 @@
+{
+  "schema": "xsync.compression-probe.report.v1",
+  "generated_unix_nanos": 1787489430020280000,
+  "zstd_version": "1.5.7",
+  "threshold": "select zstd level 3 when bounded sample output is <= 95% of input",
+  "observations": [
+    {
+      "corpus": "short-files",
+      "manifest_digest": "0466ae6196d3eb88edadd2202c56043d47fffc113c607779d7428c26766aa094",
+      "sample_bytes": 65536,
+      "item_count": 33,
+      "logical_bytes": 2097152,
+      "selected_files": 32,
+      "raw_wire_bytes": 2097600,
+      "adaptive_wire_bytes": 2144,
+      "adaptive_overhead_ratio": 0.0010221205186880244
+    },
+    {
+      "corpus": "short-files",
+      "manifest_digest": "0466ae6196d3eb88edadd2202c56043d47fffc113c607779d7428c26766aa094",
+      "sample_bytes": 262144,
+      "item_count": 33,
+      "logical_bytes": 2097152,
+      "selected_files": 32,
+      "raw_wire_bytes": 2097600,
+      "adaptive_wire_bytes": 2144,
+      "adaptive_overhead_ratio": 0.0010221205186880244
+    },
+    {
+      "corpus": "short-files",
+      "manifest_digest": "0466ae6196d3eb88edadd2202c56043d47fffc113c607779d7428c26766aa094",
+      "sample_bytes": 1048576,
+      "item_count": 33,
+      "logical_bytes": 2097152,
+      "selected_files": 32,
+      "raw_wire_bytes": 2097600,
+      "adaptive_wire_bytes": 2144,
+      "adaptive_overhead_ratio": 0.0010221205186880244
+    },
+    {
+      "corpus": "compressible",
+      "manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+      "sample_bytes": 65536,
+      "item_count": 257,
+      "logical_bytes": 268435456,
+      "selected_files": 256,
+      "raw_wire_bytes": 268439040,
+      "adaptive_wire_bytes": 39424,
+      "adaptive_overhead_ratio": 0.00014686388388216557
+    },
+    {
+      "corpus": "compressible",
+      "manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+      "sample_bytes": 262144,
+      "item_count": 257,
+      "logical_bytes": 268435456,
+      "selected_files": 256,
+      "raw_wire_bytes": 268439040,
+      "adaptive_wire_bytes": 39424,
+      "adaptive_overhead_ratio": 0.00014686388388216557
+    },
+    {
+      "corpus": "compressible",
+      "manifest_digest": "cdb0aa7bb26638d0d957a165317be65cc4e1f934bd4f75a86de129a139daa52c",
+      "sample_bytes": 1048576,
+      "item_count": 257,
+      "logical_bytes": 268435456,
+      "selected_files": 256,
+      "raw_wire_bytes": 268439040,
+      "adaptive_wire_bytes": 39424,
+      "adaptive_overhead_ratio": 0.00014686388388216557
+    },
+    {
+      "corpus": "incompressible",
+      "manifest_digest": "c211a30a72e305e2ba51b327282680459782a0aed26f7d5b1e0fb36b49083cd6",
+      "sample_bytes": 65536,
+      "item_count": 257,
+      "logical_bytes": 268435456,
+      "selected_files": 0,
+      "raw_wire_bytes": 268439040,
+      "adaptive_wire_bytes": 268439040,
+      "adaptive_overhead_ratio": 1.0
+    },
+    {
+      "corpus": "incompressible",
+      "manifest_digest": "c211a30a72e305e2ba51b327282680459782a0aed26f7d5b1e0fb36b49083cd6",
+      "sample_bytes": 262144,
+      "item_count": 257,
+      "logical_bytes": 268435456,
+      "selected_files": 0,
+      "raw_wire_bytes": 268439040,
+      "adaptive_wire_bytes": 268439040,
+      "adaptive_overhead_ratio": 1.0
+    },
+    {
+      "corpus": "incompressible",
+      "manifest_digest": "c211a30a72e305e2ba51b327282680459782a0aed26f7d5b1e0fb36b49083cd6",
+      "sample_bytes": 1048576,
+      "item_count": 257,
+      "logical_bytes": 268435456,
+      "selected_files": 0,
+      "raw_wire_bytes": 268439040,
+      "adaptive_wire_bytes": 268439040,
+      "adaptive_overhead_ratio": 1.0
+    },
+    {
+      "corpus": "mixed",
+      "manifest_digest": "13b6cb0707b2d84fb987f297a669a8341471996b29271f3289dd8cf194daa4fe",
+      "sample_bytes": 65536,
+      "item_count": 10001,
+      "logical_bytes": 35361530,
+      "selected_files": 4102,
+      "raw_wire_bytes": 35476386,
+      "adaptive_wire_bytes": 18255325,
+      "adaptive_overhead_ratio": 0.5145767948291012
+    },
+    {
+      "corpus": "mixed",
+      "manifest_digest": "13b6cb0707b2d84fb987f297a669a8341471996b29271f3289dd8cf194daa4fe",
+      "sample_bytes": 262144,
+      "item_count": 10001,
+      "logical_bytes": 35361530,
+      "selected_files": 4102,
+      "raw_wire_bytes": 35476386,
+      "adaptive_wire_bytes": 18255325,
+      "adaptive_overhead_ratio": 0.5145767948291012
+    },
+    {
+      "corpus": "mixed",
+      "manifest_digest": "13b6cb0707b2d84fb987f297a669a8341471996b29271f3289dd8cf194daa4fe",
+      "sample_bytes": 1048576,
+      "item_count": 10001,
+      "logical_bytes": 35361530,
+      "selected_files": 4102,
+      "raw_wire_bytes": 35476386,
+      "adaptive_wire_bytes": 18255325,
+      "adaptive_overhead_ratio": 0.5145767948291012
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+Command:
+/Users/sanjee/projects/f2/bench/.build/release/f2bench copy --src <story-0.4-mixed-regression>/source --dst /private/tmp/xsync-story-0-4-f2-tree --reps 5 --widths 4
+
+Platform: Apple M1 Max, macOS, same APFS volume
+Corpus: xsync.corpus.v1 mixed/regression, seed 404; 9,025 files, 501 directories, 33.9 MiB
+
+strategy                         first pass   warm median   throughput   vs sequential
+cp -R                           3.61 s       3.60 s         9.4 MiB/s    0.80x
+ditto                           3.54 s       3.54 s         9.6 MiB/s    0.81x
+copyfile sequential             2.92 s       2.88 s        11.8 MiB/s    1.00x
+copyfile parallel x4            1.90 s       1.87 s        18.1 MiB/s    1.54x
+copyfile COPYFILE_CLONE         1.66 s       2.54 s        13.4 MiB/s    1.14x
+clonefile(2) tree             163.8 ms     147.4 ms       229.8 MiB/s   19.56x
+
+Qualification: this inherited f2 probe groups methods and reports the first observation plus
+the median of the remaining four. It establishes native directory-clone potential, but the
+rotated xsync report is authoritative for the current staged shell prototype and independent
+verification. The native call must be integrated through a safe platform wrapper before shipping.
