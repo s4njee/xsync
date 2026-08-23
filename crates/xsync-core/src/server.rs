@@ -70,6 +70,9 @@ pub enum ServerError {
     /// A source read error occurred.
     #[error("source read error: {0}")]
     SourceRead(#[from] SourceReadError),
+    /// A resume checkpoint journal error occurred.
+    #[error("resume journal error: {0}")]
+    Journal(#[from] crate::journal::JournalError),
     /// The destination path is invalid or attempts to escape the root.
     #[error("invalid destination path '{0}'")]
     InvalidPath(String),
@@ -231,6 +234,7 @@ pub struct Server {
     next_message_id: u64,
     decoder: FrameDecoder,
     seen_destinations: HashSet<String>,
+    journal: Option<crate::journal::ResumeJournal>,
 }
 
 impl Server {
@@ -242,6 +246,7 @@ impl Server {
             next_message_id: 1000,
             decoder: FrameDecoder::new(),
             seen_destinations: HashSet::new(),
+            journal: None,
         }
     }
 
@@ -275,6 +280,9 @@ impl Server {
                 )))
             }
         };
+
+        // Establish the durable resume journal for this session's job ID.
+        self.journal = Some(crate::journal::ResumeJournal::new(&job_id)?);
 
         // Determine server's role.
         let server_role = match client_role {
@@ -413,6 +421,8 @@ impl Server {
         // Map of upcoming file_id -> EntryRecord for small/medium and large files.
         let mut active_files: HashMap<u64, EntryRecord> = HashMap::new();
         let mut large_files: HashMap<u64, FileEntry> = HashMap::new();
+        // Verified large-file ranges per file_id, for durable checkpointing.
+        let mut large_ranges: HashMap<u64, Vec<ByteRange>> = HashMap::new();
 
         // Process incoming transfer operations.
         loop {
@@ -613,6 +623,23 @@ impl Server {
                             |_attempt| Ok(data.clone()),
                         )?;
 
+                        // Durably checkpoint this verified range before the ack
+                        // that makes it "durably acknowledged".
+                        let range = ByteRange { offset, length };
+                        let track = large_ranges
+                            .get_mut(&file_id)
+                            .expect("large file range tracker is initialized");
+                        track.push(range);
+                        let journal = self
+                            .journal
+                            .as_ref()
+                            .expect("journal is initialized during handshake");
+                        let identity = crate::journal::ResumeIdentity {
+                            path: file_entry.path.clone().into_bytes(),
+                            fingerprint: file_entry.fingerprint,
+                        };
+                        journal.checkpoint(&identity, track)?;
+
                         let ack = Message::Ack {
                             acknowledged_id: frame.message_id,
                             acknowledged_type: 4, // FileSegment
@@ -650,22 +677,60 @@ impl Server {
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
                     let file =
                         u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
+                    let mtime = nanos_to_system_time(mtime_ns);
                     let entry = FileEntry {
-                        path: rel_path,
+                        path: rel_path.clone(),
                         kind: ScanEntryKind::File,
                         size,
-                        mtime: nanos_to_system_time(mtime_ns),
+                        mtime,
                         mode,
                         fingerprint: SourceFingerprint {
                             identity: FileIdentity { device, file },
                             kind: ScanEntryKind::File,
                             size,
-                            mtime: nanos_to_system_time(mtime_ns),
+                            mtime,
                             ctime: None,
                         },
                     };
-                    sink.prepare_large(&entry)?;
-                    large_files.insert(file_id, entry);
+
+                    // Durable resume: load prior verified ranges for this exact
+                    // file identity from the receiver-side journal.
+                    let identity = crate::journal::ResumeIdentity {
+                        path: rel_path.clone().into_bytes(),
+                        fingerprint: entry.fingerprint,
+                    };
+                    let loaded = self
+                        .journal
+                        .as_ref()
+                        .expect("journal is initialized during handshake")
+                        .load(&identity)?;
+                    let existing_ranges: Vec<ByteRange> = loaded
+                        .as_ref()
+                        .map(|record| record.ranges.clone())
+                        .unwrap_or_default();
+
+                    let temp_path = sink.temporary_path(&rel_path)?;
+                    let temp_present = temp_path.exists();
+                    let busy_ranges;
+                    if !existing_ranges.is_empty() && temp_present {
+                        // Keep the surviving staging file; the previously
+                        // verified ranges are already written to it. Do not
+                        // recreate the temp, which would wipe that progress.
+                        busy_ranges = existing_ranges;
+                    } else {
+                        // Fresh or invalidated file: discard stale ranges and
+                        // (re)create the staging file.
+                        if !existing_ranges.is_empty() {
+                            self.journal
+                                .as_ref()
+                                .expect("journal is initialized during handshake")
+                                .invalidate(&identity)?;
+                        }
+                        busy_ranges = Vec::new();
+                        sink.prepare_large(&entry)?;
+                    }
+                    large_files.insert(file_id, entry.clone());
+                    large_ranges.insert(file_id, busy_ranges.clone());
 
                     let ack = Message::Ack {
                         acknowledged_id: frame.message_id,
@@ -675,6 +740,30 @@ impl Server {
                     let bytes = encode_frame(msg_id, &ack)?;
                     writer.write_all(&bytes)?;
                     writer.flush()?;
+
+                    // Send the verified-range resume pages the client uses to
+                    // skip already-acknowledged chunks. Always at least one
+                    // (possibly empty) final page.
+                    let all = busy_ranges.clone();
+                    let total_pages = (all.len().div_ceil(MAX_COLLECTION_COUNT)).max(1);
+                    let mut p = 0usize;
+                    while p < total_pages {
+                        let start = p * MAX_COLLECTION_COUNT;
+                        let end = (start + MAX_COLLECTION_COUNT).min(all.len());
+                        let is_final = p + 1 == total_pages;
+                        let ranges = all[start..end].to_vec();
+                        let rp = Message::ResumePage {
+                            file_id,
+                            page: p as u32,
+                            final_page: is_final,
+                            ranges,
+                        };
+                        let msg_id = self.next_id();
+                        let bytes = encode_frame(msg_id, &rp)?;
+                        writer.write_all(&bytes)?;
+                        writer.flush()?;
+                        p += 1;
+                    }
                 }
                 Message::LargeFileRange {
                     file_id: _,
@@ -692,6 +781,17 @@ impl Server {
                 Message::LargeFileFinish { file_id, digest } => {
                     if let Some(entry) = large_files.remove(&file_id) {
                         sink.finish_large(&entry)?;
+                        // The file is committed; discard its resume record.
+                        let journal = self
+                            .journal
+                            .as_ref()
+                            .expect("journal is initialized during handshake");
+                        let identity = crate::journal::ResumeIdentity {
+                            path: entry.path.clone().into_bytes(),
+                            fingerprint: entry.fingerprint,
+                        };
+                        journal.clear(&identity)?;
+                        large_ranges.remove(&file_id);
                         if paranoid {
                             let committed_path = sink.path_for(&entry.path)?;
                             let readback = fs::read(&committed_path)?;
@@ -1092,7 +1192,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         max_payload: MAX_COMPLETE_PAYLOAD as u32,
         max_segment: MAX_DATA_SEGMENT as u32,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-        job_id: [0u8; 16],
+        job_id: session_job_id(
+            source_path.to_string_lossy().as_ref(),
+            dest_path,
+        ),
         compression: CompressionMode::None,
     };
     let hs_id = alloc_id();
@@ -1235,6 +1338,11 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         ..LocalSyncReport::default()
     };
     report.skipped_files = plan.files.unchanged.len();
+    // Resume accounting across all transferred files.
+    let mut resumed_bytes_total = 0u64;
+    let mut restarted_files_total = 0usize;
+    let mut retransmitted_bytes_total = 0u64;
+    let mut checkpoint_bytes_total = 0u64;
 
     let total_plan_files = plan.files.new.len() + plan.files.changed.len();
     let total_plan_bytes: u64 = plan
@@ -1414,14 +1522,54 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     )));
                 }
 
-                // Send chunks in 8 MiB segments.
-                let chunk_size = 8 * 1024 * 1024usize;
-                for (chunk_idx, chunk_slice) in stable.bytes.chunks(chunk_size).enumerate() {
-                    let offset = (chunk_idx * chunk_size) as u64;
-                    let length = chunk_slice.len() as u64;
+                // Receive resume pages describing already-verified ranges.
+                let verified_ranges: Vec<ByteRange> = {
+                    let mut all = Vec::new();
+                    let mut final_page = false;
+                    while !final_page {
+                        let frame =
+                            decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                        match frame.message {
+                            Message::ResumePage {
+                                final_page: fp,
+                                ranges,
+                                ..
+                            } => {
+                                all.extend(ranges);
+                                final_page = fp;
+                            }
+                            other => {
+                                return Err(ServerError::UnexpectedMessage(format!(
+                                    "expected ResumePage after LargeFilePrepare, got {other:?}"
+                                )));
+                            }
+                        }
+                    }
+                    all
+                };
+                let resumed_bytes: u64 = verified_ranges.iter().map(|range| range.length).sum();
+                resumed_bytes_total = resumed_bytes_total.saturating_add(resumed_bytes);
+                if resumed_bytes > 0 {
+                    restarted_files_total += 1;
+                }
+
+                // Send only the chunks that are not yet durably verified.
+                let missing = crate::journal::missing_chunks(
+                    file.size,
+                    8 * 1024 * 1024,
+                    &verified_ranges,
+                );
+                let mut sent_bytes = 0u64;
+                for range in missing {
+                    let start = usize::try_from(range.offset).unwrap_or(0);
+                    let len = usize::try_from(range.length).unwrap_or(0);
+                    sent_bytes = sent_bytes.saturating_add(range.length);
                     let range_msg = Message::LargeFileRange {
                         file_id,
-                        range: ByteRange { offset, length },
+                        range: ByteRange {
+                            offset: range.offset,
+                            length: range.length,
+                        },
                     };
                     let msg_id = alloc_id();
                     let b = encode_frame(msg_id, &range_msg)?;
@@ -1429,16 +1577,18 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
 
                     let seg_msg = Message::FileSegment {
                         file_id,
-                        offset,
-                        data: chunk_slice.to_vec(),
+                        offset: range.offset,
+                        data: stable.bytes[start..(start + len)].to_vec(),
                     };
                     let msg_id = alloc_id();
                     let b = encode_frame(msg_id, &seg_msg)?;
                     writer.write_all(&b)?;
                     writer.flush()?;
 
-                    let ack1 = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
-                    let ack2 = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                    let ack1 =
+                        decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                    let ack2 =
+                        decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
                     if !matches!(ack1.message, Message::Ack { .. })
                         || !matches!(ack2.message, Message::Ack { .. })
                     {
@@ -1447,6 +1597,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                         ));
                     }
                 }
+                retransmitted_bytes_total =
+                    retransmitted_bytes_total.saturating_add(sent_bytes);
+                checkpoint_bytes_total = checkpoint_bytes_total
+                    .saturating_add(resumed_bytes.saturating_add(sent_bytes));
 
                 let finish_msg = Message::LargeFileFinish {
                     file_id,
@@ -1467,13 +1621,13 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
 
                 report.transferred_files = report.transferred_files.saturating_add(1);
                 report.transferred_bytes = report.transferred_bytes.saturating_add(file.size);
-                report.physical_bytes = report.physical_bytes.saturating_add(file.size);
+                report.physical_bytes = report.physical_bytes.saturating_add(sent_bytes);
                 report.byte_copies = report.byte_copies.saturating_add(1);
 
                 emit(LocalEvent::Transferred {
                     path: file.path.clone(),
                     bytes: file.size,
-                    physical_bytes: file.size,
+                    physical_bytes: sent_bytes,
                     method: TransferMethod::ByteCopy,
                 });
             }
@@ -1590,7 +1744,15 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             ack.message
         )));
     }
-    let _server_stats = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let server_stats = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
+    let _ = server_stats;
+
+    report.resumed_bytes = resumed_bytes_total;
+    report.restarted_files = restarted_files_total;
+    report.retransmitted_bytes = retransmitted_bytes_total;
+    report.checkpoint_bytes = checkpoint_bytes_total;
 
     emit(LocalEvent::Finished {
         transferred_files: report.transferred_files,
@@ -1605,6 +1767,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         directory_clones: 0,
         file_clones: 0,
         byte_copies: report.byte_copies,
+        restarted_files: report.restarted_files,
+        resumed_bytes: report.resumed_bytes,
+        retransmitted_bytes: report.retransmitted_bytes,
+        checkpoint_bytes: report.checkpoint_bytes,
     });
 
     Ok(report)
@@ -1639,13 +1805,16 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     });
 
     // 1. Send Handshake (Client is Sink).
+    let job_id =
+        session_job_id(src_path, dest_path.to_string_lossy().as_ref());
+    let resume_journal = crate::journal::ResumeJournal::new(&job_id)?;
     let handshake = Message::Handshake {
         role: Role::Sink,
         capabilities: 0,
         max_payload: MAX_COMPLETE_PAYLOAD as u32,
         max_segment: MAX_DATA_SEGMENT as u32,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-        job_id: [0u8; 16],
+        job_id,
         compression: CompressionMode::None,
     };
     let hs_id = alloc_id();
@@ -1789,6 +1958,11 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         ..LocalSyncReport::default()
     };
     report.skipped_files = plan.files.unchanged.len();
+    // Resume accounting across all transferred files.
+    let mut resumed_bytes_total = 0u64;
+    let mut restarted_files_total = 0usize;
+    let mut retransmitted_bytes_total = 0u64;
+    let mut checkpoint_bytes_total = 0u64;
 
     let total_plan_files = plan.files.new.len() + plan.files.changed.len();
     let total_plan_bytes: u64 = plan
@@ -1934,7 +2108,32 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     method: TransferMethod::ByteCopy,
                 });
             } else {
-                sink.prepare_large(file)?;
+                // Durable resume: load locally-verified ranges for this file
+                // from the receiver-side journal so already-committed chunks
+                // are not retransmitted after a crash.
+                let identity = crate::journal::ResumeIdentity {
+                    path: file.path.as_bytes().to_vec(),
+                    fingerprint: file.fingerprint,
+                };
+                let loaded = resume_journal.load(&identity)?;
+                let verified_ranges: Vec<ByteRange> = loaded
+                    .as_ref()
+                    .map(|record| record.ranges.clone())
+                    .unwrap_or_default();
+                let temp_path = sink.temporary_path(&file.path)?;
+                if verified_ranges.is_empty() || !temp_path.exists() {
+                    if !verified_ranges.is_empty() {
+                        resume_journal.invalidate(&identity)?;
+                    }
+                    sink.prepare_large(file)?;
+                }
+                let mut track = verified_ranges.clone();
+                let resumed_bytes: u64 =
+                    verified_ranges.iter().map(|r| r.length).sum();
+                resumed_bytes_total = resumed_bytes_total.saturating_add(resumed_bytes);
+                if resumed_bytes > 0 {
+                    restarted_files_total += 1;
+                }
 
                 let mut rec = entry_record_from_file_entry(file);
                 rec.path = raw_path.into_bytes();
@@ -1960,10 +2159,14 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     )));
                 }
 
-                let chunk_size = 8 * 1024 * 1024u64;
-                let mut offset = 0u64;
-                while offset < file.size {
-                    let length = std::cmp::min(chunk_size, file.size - offset);
+                // Request and receive only the still-missing chunks.
+                let missing =
+                    crate::journal::missing_chunks(file.size, 8 * 1024 * 1024, &verified_ranges);
+                let mut sent_bytes = 0u64;
+                for range in missing {
+                    let offset = range.offset;
+                    let length = range.length;
+                    sent_bytes = sent_bytes.saturating_add(length);
                     let range_msg = Message::LargeFileRange {
                         file_id,
                         range: ByteRange { offset, length },
@@ -1973,7 +2176,8 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     writer.write_all(&b)?;
                     writer.flush()?;
 
-                    let seg_frame = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                    let seg_frame =
+                        decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
                     let data = match seg_frame.message {
                         Message::FileSegment { data, .. } => data,
                         other => {
@@ -1984,13 +2188,13 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     };
 
                     let hash = blake3::hash(&data);
-                    sink.write_chunk_with_retry(
-                        file,
-                        offset,
-                        length,
-                        &hash,
-                        |_attempt| Ok(data.clone()),
-                    )?;
+                    sink.write_chunk_with_retry(file, offset, length, &hash, |_attempt| {
+                        Ok(data.clone())
+                    })?;
+
+                    // Durably checkpoint this verified range before its ack.
+                    track.push(ByteRange { offset, length });
+                    resume_journal.checkpoint(&identity, &track)?;
 
                     // Send Ack for segment.
                     let ack = Message::Ack {
@@ -2003,18 +2207,21 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     writer.flush()?;
 
                     // Read range Ack.
-                    let range_ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                    let range_ack =
+                        decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
                     if !matches!(range_ack.message, Message::Ack { .. }) {
                         return Err(ServerError::UnexpectedMessage(format!(
                             "expected Ack for LargeFileRange, got {:?}",
                             range_ack.message
                         )));
                     }
-
-                    offset += length;
                 }
+                retransmitted_bytes_total = retransmitted_bytes_total.saturating_add(sent_bytes);
+                checkpoint_bytes_total = checkpoint_bytes_total
+                    .saturating_add(resumed_bytes.saturating_add(sent_bytes));
 
                 sink.finish_large(file)?;
+                resume_journal.clear(&identity)?;
 
                 if options.paranoid {
                     let committed_path = sink.path_for(&file.path)?;
@@ -2041,13 +2248,13 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
 
                 report.transferred_files = report.transferred_files.saturating_add(1);
                 report.transferred_bytes = report.transferred_bytes.saturating_add(file.size);
-                report.physical_bytes = report.physical_bytes.saturating_add(file.size);
+                report.physical_bytes = report.physical_bytes.saturating_add(sent_bytes);
                 report.byte_copies = report.byte_copies.saturating_add(1);
 
                 emit(LocalEvent::Transferred {
                     path: file.path.clone(),
                     bytes: file.size,
-                    physical_bytes: file.size,
+                    physical_bytes: sent_bytes,
                     method: TransferMethod::ByteCopy,
                 });
             }
@@ -2115,6 +2322,11 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     }
     let _server_stats = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
 
+    report.resumed_bytes = resumed_bytes_total;
+    report.restarted_files = restarted_files_total;
+    report.retransmitted_bytes = retransmitted_bytes_total;
+    report.checkpoint_bytes = checkpoint_bytes_total;
+
     emit(LocalEvent::Finished {
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
@@ -2128,9 +2340,24 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         directory_clones: 0,
         file_clones: 0,
         byte_copies: report.byte_copies,
+        restarted_files: report.restarted_files,
+        resumed_bytes: report.resumed_bytes,
+        retransmitted_bytes: report.retransmitted_bytes,
+        checkpoint_bytes: report.checkpoint_bytes,
     });
 
     Ok(report)
+}
+
+/// Derive a stable 16-byte job ID from the remote invocation so a retried job
+/// (after a killed sender, receiver, or transport) reuses the same resume
+/// journal, while distinct invocations use distinct journals.
+#[must_use]
+pub fn session_job_id(left: &str, right: &str) -> [u8; 16] {
+    let digest = blake3::hash(format!("{left}\u{0}{right}").as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    out
 }
 
 fn map_transport_error(err: ProtocolError, stream: usize) -> ServerError {

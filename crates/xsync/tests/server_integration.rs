@@ -57,6 +57,23 @@ fn write_fake_rsh(script_dir: &Path, mode: &str) -> PathBuf {
                 "#!/bin/sh\n\"{xs}\" \"$3\" \"$4\" &\nPID=$!\nsleep 0.05\nkill -9 $PID\nwait $PID\n"
             )
         }
+        // Start the server and SIGKILL it once the receiver has durably staged
+        // the first 8 MiB chunk, so the resume journal survives with that range
+        // verified and a subsequent run skips it.
+        "crash_after_chunk" => {
+            let xs = xsync_bin();
+            format!(
+                "#!/bin/sh\n\"{xs}\" \"$3\" \"$4\" &\nPID=$!\n\
+                 for i in $(seq 1 400); do\n\
+                 \x20 f=$(ls \"$4\"/.xsync.tmp.* 2>/dev/null | head -n1)\n\
+                 \x20 if [ -n \"$f\" ] && [ \"$(wc -c < \"$f\" 2>/dev/null || echo 0)\" -ge 8388608 ]; then\n\
+                 \x20   kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null; exit 0\n\
+                 \x20 fi\n\
+                 \x20 sleep 0.005\n\
+                 done\n\
+                 kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null\n"
+            )
+        }
         _ => unreachable!(),
     };
     fs::write(&script, body).unwrap();
@@ -285,6 +302,84 @@ fn test_missing_remote_binary_reports_clear_error() {
         stderr.contains("xsync not found on remote host — install it or check PATH"),
         "missing remote binary must not surface as a raw broken-pipe error; got: {stderr}"
     );
+}
+
+#[test]
+fn test_durable_resume_skips_verified_ranges() {
+    let src = tempdir().unwrap();
+    // 24 MiB file -> three 8 MiB chunks so a crash after the first leaves two
+    // chunks still to transmit on the resumed run.
+    fs::write(src.path().join("big.bin"), vec![0xEE; 24 * 1024 * 1024]).unwrap();
+
+    let dst = tempdir().unwrap();
+    let script_dir = tempdir().unwrap();
+    let crash_rsh = write_fake_rsh(script_dir.path(), "crash_after_chunk");
+
+    // First run is killed by the receiver-side fake transport once the first
+    // 8 MiB chunk is durably staged+checkpointed.
+    let first = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&crash_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(!first.status.success());
+    assert!(
+        !dst.path().join("big.bin").exists(),
+        "interrupted transfer must not publish the file"
+    );
+
+    // A clean re-run resumes from the durable journal: it does not retransmit
+    // the verified first chunk, completes the file, and reports nonzero resume
+    // accounting.
+    let good_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let second = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&good_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "resumed re-run failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    // Final content is byte-identical despite only part of it being sent this run.
+    let written = fs::read(dst.path().join("big.bin")).unwrap();
+    assert_eq!(written, vec![0xEE; 24 * 1024 * 1024]);
+
+    // The Finished event must report nonzero resumed bytes / restarted file and
+    // physical bytes that are less than the full logical size.
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains("resume:") && !stdout.contains(", 0 restarted,") ,
+        "expected nonzero resume accounting, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("resumed") && stdout.contains("checkpointed"),
+        "resume event must name resumed/checkpointed bytes, got: {stdout}"
+    );
+
+    // Successful finish clears the per-file journal record; this job's journal
+    // root must contain no leftover `.js` record.
+    let src_str = src.path().to_string_lossy().to_string();
+    let dst_str = dst.path().to_string_lossy().to_string();
+    let job_id = xsync_core::server::session_job_id(&src_str, &dst_str);
+    let job_dir = xsync_core::journal::ResumeJournal::root_for(&job_id);
+    if job_dir.exists() {
+        let leftover_records = std::fs::read_dir(&job_dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(".js"));
+        assert!(
+            !leftover_records,
+            "successful resume left an orphan journal record in {}",
+            job_dir.display()
+        );
+    }
 }
 
 #[test]

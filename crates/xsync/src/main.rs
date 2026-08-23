@@ -217,9 +217,12 @@ fn render_event(event: xsync_core::local::LocalEvent, progress_json: bool, quiet
             failed_entries,
             local_workers,
             partial_failure,
+            restarted_files,
+            resumed_bytes,
+            checkpoint_bytes,
             ..
         } => println!(
-            "finished: {transferred_files} transferred ({transferred_bytes} logical, {physical_bytes} physical bytes), {skipped_files} skipped, {failed_entries} failed, workers {local_workers}{}",
+            "finished: {transferred_files} transferred ({transferred_bytes} logical, {physical_bytes} physical bytes), {skipped_files} skipped, {failed_entries} failed, workers {local_workers}, resume: {restarted_files} restarted, {resumed_bytes} resumed, {checkpoint_bytes} checkpointed{}",
             if partial_failure {
                 ", partial failure"
             } else {
@@ -297,6 +300,10 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             directory_clones,
             file_clones,
             byte_copies,
+            restarted_files,
+            resumed_bytes,
+            retransmitted_bytes,
+            checkpoint_bytes,
         } => serde_json::json!({
             "event": "finished",
             "transferred_files": transferred_files,
@@ -311,6 +318,10 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "directory_clones": directory_clones,
             "file_clones": file_clones,
             "byte_copies": byte_copies,
+            "restarted_files": restarted_files,
+            "resumed_bytes": resumed_bytes,
+            "retransmitted_bytes": retransmitted_bytes,
+            "checkpoint_bytes": checkpoint_bytes,
         }),
     }
 }

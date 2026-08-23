@@ -118,6 +118,14 @@ pub enum LocalEvent {
         streams: usize,
         /// Whether the result maps to [`PARTIAL_FAILURE_EXIT_CODE`].
         partial_failure: bool,
+        /// Number of large files resumed from a durable checkpoint.
+        restarted_files: usize,
+        /// Bytes skipped because they were durably verified before the crash.
+        resumed_bytes: u64,
+        /// Bytes actually retransmitted this run.
+        retransmitted_bytes: u64,
+        /// Bytes durably checkpointed to the receiver journal this run.
+        checkpoint_bytes: u64,
     },
 }
 
@@ -182,6 +190,14 @@ pub struct LocalSyncReport {
     pub local_workers: usize,
     /// Requested remote stream count, ignored on this route.
     pub streams: usize,
+    /// Number of large files resumed from a durable checkpoint.
+    pub restarted_files: usize,
+    /// Bytes skipped because they were durably verified before the crash.
+    pub resumed_bytes: u64,
+    /// Bytes actually retransmitted this run.
+    pub retransmitted_bytes: u64,
+    /// Bytes durably checkpointed to the receiver journal this run.
+    pub checkpoint_bytes: u64,
 }
 
 impl LocalSyncReport {
@@ -372,6 +388,10 @@ where
         local_workers: report.local_workers,
         streams: report.streams,
         partial_failure: report.partial_failure(),
+        restarted_files: report.restarted_files,
+        resumed_bytes: report.resumed_bytes,
+        retransmitted_bytes: report.retransmitted_bytes,
+        checkpoint_bytes: report.checkpoint_bytes,
     });
     Ok(report)
 }
@@ -462,6 +482,10 @@ fn try_directory_fast_path(
         local_workers: report.local_workers,
         streams: report.streams,
         partial_failure: report.partial_failure(),
+        restarted_files: report.restarted_files,
+        resumed_bytes: report.resumed_bytes,
+        retransmitted_bytes: report.retransmitted_bytes,
+        checkpoint_bytes: report.checkpoint_bytes,
     });
     Ok(Some(report))
 }

@@ -12,6 +12,7 @@
 
 //! xsync-core's public modules.
 pub mod clone;
+pub mod journal;
 pub mod local;
 pub mod path;
 pub mod planner;

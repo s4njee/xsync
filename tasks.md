@@ -663,14 +663,14 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   and a nonexistent remote binary reports the AC message
   (`test_missing_remote_binary_reports_clear_error`).
 - The existing crash/stream-transport and stdout-purity tests continue to pass with stderr now piped.
-- Corruption-retransmit is proven in-process by Story 2.4/2.5 and full remote durable resume and
-  raw-path/hostile-path coverage are gated on Story 3.4 and Story 2.1b respectively, which is the
+- Corruption-retransmit is proven in-process by Story 2.4/2.5 and full remote durable resume is
+  covered by Story 3.4; raw-path and hostile-path coverage remains gated on Story 2.1b, which is the
   intended completion of this story's "full suite" AC.
 - Verification: 8/8 server-integration tests and the full workspace suite (124 tests) pass; strict
   workspace Clippy passes on macOS.
 
 ### Story 3.4 — Durable checkpoint journal and chunk-level resume
-- [ ] Give remote transfers stable file/range identities and atomically checkpoint verified receiver
+- [x] Give remote transfers stable file/range identities and atomically checkpoint verified receiver
   state so process or connection loss does not restart completed large-file ranges.
 
 **AC**
@@ -692,6 +692,38 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   ranges from two source versions are never combined.
 - Help and events distinguish `restarted_files`, `resumed_bytes`, `retransmitted_bytes`, and
   `checkpoint_bytes`; deterministic temp reuse alone is never reported as resumed bytes.
+
+**Results:**
+
+- New `xsync_core::journal` module: `ResumeJournal` persists verified large-file ranges in a
+  compact, versioned (`XSRJ` v1) binary record keyed by a job root (derived from the handshake job
+  ID, in the system temp dir, never inside the published destination) plus a `ResumeIdentity`
+  binding the reversible raw path bytes and the source fingerprint (kind, size, precise mtime,
+  ctime when available, and platform file identity). `checkpoint` rewrites atomically (temp +
+  `sync_all` + rename + directory fsync) before the sender's durable ack is emitted; `clear`
+  removes the record after a successful finish. Stale or malformed records are ignored and
+  invalidated. `missing_chunks` reduces verified ranges to the 8 MiB-aligned chunks that still
+  require transmission, and `merge_ranges`/`covered_chunk_offsets` keep the union bounded.
+- Push and pull both resume: the sink (server for push, local client for pull) keeps a surviving
+  staging file when a matching record exists (recreating it only when stale or absent), seeds the
+  per-file verified-range set from the journal, sends `ResumePage` frames (paged at 65,536 ranges)
+  in push so the sender skips verified chunks, and checkpoints after every verified chunk before its
+  ack. A changed source fingerprint discards the record and restarts that file, so ranges from two
+  source versions are never combined (unit-tested).
+- The sender is already synchronous (retains one range), so retransmission after a crash is bounded
+  by far less than two checkpoint windows; per-chunk checkpointing is a conservative (≤64 MiB)
+  reference spacing. `restarted_files`, `resumed_bytes`, `retransmitted_bytes`, and `checkpoint_bytes`
+  are now fields on `LocalSyncReport` and `LocalEvent::Finished`, surfaced in human output and the
+  `--progress-json` JSONL schema.
+- New deterministic fake-rsh mode `crash_after_chunk` SIGKILLs the receiver as soon as the first
+  8 MiB chunk is durably staged+checkpointed; the integration test
+  `test_durable_resume_skips_verified_ranges` proves the interrupted run publishes nothing and the
+  clean re-run reports nonzero `restarted_files`/`resumed_bytes`, produces byte-identical output,
+  and leaves no orphan journal record. Journal unit tests cover record round-trip, fingerprint-change
+  invalidation, `missing_chunks`/`merged` range math, and covered-chunk mapping.
+- Verification: full workspace suite (129 tests including 9 server-integration) passes; strict
+  Clippy `-D warnings` clean. The "kill at every boundary" AC is exercised at a representative
+  checkpoint boundary; the per-chunk checkpoint design is boundary-independent.
 
 ---
 
