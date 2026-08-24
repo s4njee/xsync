@@ -771,7 +771,7 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   strict Clippy `-D warnings` is clean.
 
 ### Story 4.2 — Multi-stream striping
-- [ ] `--streams N` opens one persistent control session plus N persistent data sessions. Batches
+- [~] `--streams N` opens one persistent control session plus N persistent data sessions. Batches
   and whole files are partitioned across data sessions; large files use disjoint ranges. Control
   owns prepare/finalize and durable checkpoint coordination. Data workers have no in-memory IPC but
   share the receiver's staged file and journal.
@@ -788,6 +788,36 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
 - Omitted `--streams` follows the Story 0.5 decision. Documentation and CLI help do not claim
   `min(cpus, 8)`; provisional four-stream behavior ships only if its cross-host gate passes.
 - User-specified stream count is always honored within 1..=16 even if the automatic policy differs.
+
+**Status: architectural blocker found (protocol v2 required).**
+- The frozen v1 protocol is per-session self-contained: the receiver's sink needs
+  `LargeFilePrepare`/scan/metadata on the *same* session that delivers that file's segments, and it
+  owns one resume journal. So a data session cannot write disjoint ranges into a stage it did not
+  prepare, and it cannot merge into a shared control-side union journal. `protocol.md` mandates a new
+  version for any new message type, and a new version must not reinterpret v1 fields.
+- Correct multi-stream therefore requires **protocol v2**, adding at minimum: (1) a way to mark a
+  session as `control` vs `data` (data sessions skip the destination scan and accept range/segment
+  traffic against a stage and identity handed over by control), and (2) a `CheckpointRanges` message
+  so the control session — the sole durable journal owner — records the union of ranges written by
+  all data sessions before the corresponding durable acknowledgement. A naive
+  last-writer-wins-per-session journal keeps content correct but reintroduces retransmission on
+  resume, and per-session planning races on symlink/directory-metadata/delete ownership.
+- **Shipped now:** `Sink::prepare_large` is now idempotent (a matching-size stage is preserved
+  rather than wiped), which is the exact stage contract every control/data writer must agree on and
+  is independently unit-tested. `--streams N` parsing (1..=16) and Story 0.5's default of one stream
+  are unchanged and already tested; extra sessions are not yet opened, so nothing is claimed that the
+  cross-host gate has not passed.
+- **Design decision:** range-striping multi-stream is left `[~]` with `--streams` still resolving to
+  one session (fully tested) until the protocol-v2 data/control split below is implemented as a
+  dedicated effort. This is intentional: it matches "provisional multi-stream ships only if the gate
+  passes" and keeps every shipped path verified.
+- **Proposed v2 design (not yet built):** control session drives handshake/scan/plan, creates
+  directories/symlinks, is the only writer of the resume journal, and owns `LargeFilePrepare`/finish;
+  N data sessions are marked data-only, receive `LargeFilePrepare` as a non-destructive
+  ensure-stage handoff, write disjoint 8 MiB ranges, and never contact the journal directly. The
+  client relays each data-range completion to control as `CheckpointRanges`, and control durably
+  checkpoints the union before the durable ack. Failure of a data stream cancels/drains peers using
+  the existing FrameDecoder/session boundaries and resumes through Story 3.4.
 
 ### Story 4.3 — SSH startup and connection-model decision
 - [ ] Measure and document fresh SSH sessions, user-provided ControlMaster reuse, and persistent

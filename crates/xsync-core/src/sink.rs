@@ -208,17 +208,31 @@ impl Sink {
         })
     }
 
-    /// Create and preallocate the deterministic temp file for chunked writes.
+    /// Ensure the deterministic temp file for chunked writes exists at the
+    /// declared size.
+    ///
+    /// Idempotent: if a temp file already exists for this relative path at the
+    /// correct size it is preserved, so a surviving stage (from a prior run or
+    /// another stream) is not destroyed. Otherwise any stale temp is removed and
+    /// the file is recreated and preallocated to `entry.size`. This is the
+    /// contract shared by resume (Story 3.4) and future multi-stream striping
+    /// (Story 4.2): all writers agree on the same stage path and only overwrite
+    /// the ranges they own.
     ///
     /// # Errors
     ///
     /// Returns an error for a non-file entry, unsafe path, or filesystem
-    /// failure. A prior temp file for this relative path is replaced.
+    /// failure.
     pub fn prepare_large(&self, entry: &FileEntry) -> Result<(), SinkError> {
         require_kind(entry, EntryKind::File, "file")?;
         let final_path = self.destination_path(&entry.path)?;
         let temp_path = self.temporary_path(&entry.path)?;
         create_parent(&final_path)?;
+        if let Ok(metadata) = fs::metadata(&temp_path) {
+            if metadata.len() == entry.size && !metadata.file_type().is_symlink() {
+                return Ok(());
+            }
+        }
         remove_existing(&temp_path)?;
         let file = File::create(&temp_path)
             .map_err(|source| io_error("create temp file", &temp_path, source))?;
@@ -692,6 +706,47 @@ mod tests {
 
         assert_eq!(attempts, 2);
         assert_eq!(fs::read(temp.path().join("large")).unwrap(), b"helloworld");
+    }
+
+    #[test]
+    fn prepare_large_is_idempotent_and_preserves_a_matching_stage() {
+        let temp = tempdir().unwrap();
+        let sink = Sink::new(temp.path()).unwrap();
+        let file = entry("large", EntryKind::File, 10, 0o600, 100);
+        sink.prepare_large(&file).unwrap();
+
+        // Write a range into the stage, then call prepare again: an identical
+        // idempotent prepare must NOT wipe the already-written data (the
+        // contract shared by resume and multi-stream writers).
+        sink.write_chunk_with_retry(&file, 0, 5, &blake3::hash(b"hello"), |_| {
+            Ok(b"hello".to_vec())
+        })
+        .unwrap();
+        sink.prepare_large(&file).unwrap();
+        sink.write_chunk_with_retry(&file, 5, 5, &blake3::hash(b"world"), |_| {
+            Ok(b"world".to_vec())
+        })
+        .unwrap();
+        sink.finish_large(&file).unwrap();
+        assert_eq!(
+            fs::read(temp.path().join("large")).unwrap(),
+            b"helloworld"
+        );
+
+        // A differently-sized entry collapses the stage to the new size.
+        let other = entry("large", EntryKind::File, 4, 0o600, 200);
+        sink.prepare_large(&other).unwrap();
+        assert_eq!(
+            fs::metadata(sink.temporary_path("large").unwrap())
+                .unwrap()
+                .len(),
+            4
+        );
+        // The committed final file is unaffected by a later prepare.
+        assert_eq!(
+            fs::read(temp.path().join("large")).unwrap(),
+            b"helloworld"
+        );
     }
 
     #[cfg(unix)]
