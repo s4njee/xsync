@@ -1,5 +1,6 @@
 [package]
 name = "xsync"
+build = "build.rs"
 description = "High-performance rsync replacement built on a parallel pipeline and BLAKE3"
 version.workspace = true
 edition.workspace = true

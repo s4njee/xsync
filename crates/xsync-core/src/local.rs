@@ -75,6 +75,13 @@ pub enum LocalEvent {
         /// Requested remote stream count, ignored for this local route.
         streams: usize,
     },
+    /// Compression was negotiated for the remote session.
+    Negotiated {
+        /// Selected wire compression algorithm, or `none`.
+        compression_algorithm: &'static str,
+        /// Human-readable reason for the selected mode.
+        compression_reason: &'static str,
+    },
     /// Metadata planning has completed.
     Planned {
         /// Number of regular files requiring transfer.
@@ -1882,9 +1889,13 @@ mod tests {
         fs::create_dir(&source).unwrap();
         let mtime = filetime::FileTime::from_unix_time(1_600_000_000, 123);
         filetime::set_file_mtime(&source, mtime).unwrap();
+        // Windows stores file times at 100 ns precision, so compare with the
+        // value the source filesystem actually retained.
+        let expected =
+            filetime::FileTime::from_last_modification_time(&fs::metadata(&source).unwrap());
         sync(&source, true, &destination, false, &options(), |_| {}).unwrap();
         let actual =
             filetime::FileTime::from_last_modification_time(&fs::metadata(&destination).unwrap());
-        assert_eq!(actual, mtime);
+        assert_eq!(actual, expected);
     }
 }

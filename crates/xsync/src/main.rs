@@ -188,7 +188,7 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
                     .to_owned(),
             ));
         }
-        let selection = native_selection(
+        let mut selection = native_selection(
             if cli.transport == TransportArg::Xsync {
                 "explicit --transport=xsync"
             } else {
@@ -205,7 +205,15 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
             &options,
             cli.rsh.as_deref(),
             src_authority.as_deref(),
-            |event| render_event(&mut progress, event, progress_json, quiet, Some(&selection)),
+            |event| {
+                render_event(
+                    &mut progress,
+                    event,
+                    progress_json,
+                    quiet,
+                    Some(&mut selection),
+                )
+            },
         )?
     } else if dest.is_remote() {
         let host = dest_authority
@@ -213,7 +221,8 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
             .expect("remote destination has authority");
         match cli.transport {
             TransportArg::Xsync => {
-                let selection = native_selection("explicit --transport=xsync", !cli.no_compress);
+                let mut selection =
+                    native_selection("explicit --transport=xsync", !cli.no_compress);
                 render_selection(&selection, progress_json, quiet);
                 xsync_core::server::sync_push_server(
                     std::path::Path::new(&src.path),
@@ -224,13 +233,19 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
                     cli.rsh.as_deref(),
                     Some(host),
                     |event| {
-                        render_event(&mut progress, event, progress_json, quiet, Some(&selection));
+                        render_event(
+                            &mut progress,
+                            event,
+                            progress_json,
+                            quiet,
+                            Some(&mut selection),
+                        );
                     },
                 )?
             }
             TransportArg::Rsync => run_rsync_push(cli, &src, &dest, &options, host)?,
             TransportArg::Auto => {
-                let selection = native_selection("native receiver available", !cli.no_compress);
+                let mut selection = native_selection("native receiver available", !cli.no_compress);
                 let mut selection_emitted = false;
                 let native = xsync_core::server::sync_push_server(
                     std::path::Path::new(&src.path),
@@ -245,7 +260,13 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
                             render_selection(&selection, progress_json, quiet);
                             selection_emitted = true;
                         }
-                        render_event(&mut progress, event, progress_json, quiet, Some(&selection));
+                        render_event(
+                            &mut progress,
+                            event,
+                            progress_json,
+                            quiet,
+                            Some(&mut selection),
+                        );
                     },
                 );
                 match native {
@@ -266,7 +287,7 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
                 "--transport=rsync is inapplicable to local-to-local sync".to_owned(),
             ));
         }
-        let selection = local_selection();
+        let mut selection = local_selection();
         render_selection(&selection, progress_json, quiet);
         xsync_core::local::sync(
             &src.path,
@@ -274,7 +295,15 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
             &dest.path,
             dest.trailing_slash,
             &options,
-            |event| render_event(&mut progress, event, progress_json, quiet, Some(&selection)),
+            |event| {
+                render_event(
+                    &mut progress,
+                    event,
+                    progress_json,
+                    quiet,
+                    Some(&mut selection),
+                )
+            },
         )?
     };
 
@@ -312,7 +341,7 @@ fn run_rsync_push(
     } else {
         "explicit --transport=rsync"
     };
-    let selection = peer.selection(reason);
+    let mut selection = peer.selection(reason);
     render_selection(&selection, cli.progress_json, cli.quiet);
     xsync_core::rsync::sync_push(
         std::path::Path::new(&src.path),
@@ -329,7 +358,7 @@ fn run_rsync_push(
                 event,
                 cli.progress_json,
                 cli.quiet,
-                Some(&selection),
+                Some(&mut selection),
             );
         },
     )
@@ -606,13 +635,24 @@ impl ProgressRenderer {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn render_event(
     progress: &mut ProgressRenderer,
     mut event: xsync_core::local::LocalEvent,
     progress_json: bool,
     quiet: bool,
-    selection: Option<&xsync_core::transport::TransportSelection>,
+    mut selection: Option<&mut xsync_core::transport::TransportSelection>,
 ) {
+    if let xsync_core::local::LocalEvent::Negotiated {
+        compression_algorithm,
+        compression_reason,
+    } = &event
+    {
+        if let Some(selection) = selection.as_deref_mut() {
+            selection.compression_algorithm = (*compression_algorithm == "zstd").then_some("zstd");
+            selection.reason = format!("{}; compression: {}", selection.reason, compression_reason);
+        }
+    }
     if let xsync_core::local::LocalEvent::Finished { transport, .. } = &mut event {
         *transport = selection.cloned();
     }
@@ -667,7 +707,8 @@ fn render_event(
         _ => {}
     }
     match event {
-        xsync_core::local::LocalEvent::Phase { .. }
+        xsync_core::local::LocalEvent::Negotiated { .. }
+        | xsync_core::local::LocalEvent::Phase { .. }
         | xsync_core::local::LocalEvent::Started { .. }
         | xsync_core::local::LocalEvent::Planned { .. }
         | xsync_core::local::LocalEvent::Transferred { .. }
@@ -720,6 +761,7 @@ fn event_type(event: &xsync_core::local::LocalEvent) -> &'static str {
     match event {
         LocalEvent::Phase { .. } => "phase",
         LocalEvent::Started { .. } => "started",
+        LocalEvent::Negotiated { .. } => "negotiated",
         LocalEvent::Planned { .. } => "planned",
         LocalEvent::CloudPlaceholders { .. } => "cloud_placeholders",
         LocalEvent::Transferred { .. } => "transferred",
@@ -758,6 +800,14 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "event": "started",
             "local_workers": local_workers,
             "streams": streams,
+        }),
+        LocalEvent::Negotiated {
+            compression_algorithm,
+            compression_reason,
+        } => serde_json::json!({
+            "event": "negotiated",
+            "compression_algorithm": compression_algorithm,
+            "compression_reason": compression_reason,
         }),
         LocalEvent::Planned { files, bytes } => serde_json::json!({
             "event": "planned",

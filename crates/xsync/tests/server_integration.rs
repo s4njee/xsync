@@ -37,6 +37,44 @@ fn populate_test_tree(root: &Path) {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn test_windows_drive_and_backslash_paths_are_local() {
+    let drive = xsync_core::path::parse(r"C:\xsync\destination").unwrap();
+    assert!(!drive.is_remote());
+    assert_eq!(drive.path, r"C:\xsync\destination");
+
+    let forward = xsync_core::path::parse("C:/xsync/destination").unwrap();
+    assert!(!forward.is_remote());
+    assert_eq!(forward.path, "C:/xsync/destination");
+}
+
+#[cfg(windows)]
+#[test]
+fn test_windows_case_insensitive_destination_is_not_duplicated() {
+    let source = tempdir().unwrap();
+    let destination = tempdir().unwrap();
+    fs::write(source.path().join("case.txt"), b"source").unwrap();
+    fs::write(destination.path().join("CASE.TXT"), b"old").unwrap();
+
+    let output = Command::new(xsync_bin())
+        .arg(format!("{}\\", source.path().display()))
+        .arg(destination.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let entries = fs::read_dir(destination.path()).unwrap().count();
+    assert_eq!(entries, 1);
+    assert_eq!(
+        fs::read(destination.path().join("case.txt")).unwrap(),
+        b"source"
+    );
+}
+
 /// Write an executable fake-rsh script that ignores the host and the literal
 /// `xsync` command word, then execs the local server binary: `xsync --server <path>`.
 ///

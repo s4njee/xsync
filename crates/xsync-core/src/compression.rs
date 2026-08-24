@@ -36,7 +36,6 @@ pub const fn sample_size(total_bytes: usize) -> usize {
 ///
 /// # Errors
 /// Returns an I/O error if the zstd encoder cannot evaluate the bounded sample.
-#[cfg(not(target_os = "windows"))]
 pub fn decide<'a, I>(payloads: I, level: i32) -> io::Result<CompressionDecision>
 where
     I: IntoIterator<Item = &'a [u8]>,
@@ -62,22 +61,6 @@ where
     })
 }
 
-/// Windows builds retain the protocol surface but do not provide zstd in v1.
-///
-/// # Errors
-/// Always returns [`io::ErrorKind::Unsupported`]. Enabling zstd on Windows
-/// is story D0.2.
-#[cfg(target_os = "windows")]
-pub fn decide<'a, I>(_payloads: I, _level: i32) -> io::Result<CompressionDecision>
-where
-    I: IntoIterator<Item = &'a [u8]>,
-{
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "zstd compression is unavailable on Windows",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,7 +73,6 @@ mod tests {
         assert_eq!(sample_size(256 * 1024 + 1), 1024 * 1024);
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn detects_compressible_and_incompressible_batches() {
         let text = vec![b'a'; 300 * 1024];
@@ -108,7 +90,6 @@ mod tests {
         assert!(mixed_decision.sampled_bytes > text.len());
     }
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn large_concurrent_style_batch_keeps_sampling_bounded() {
         let payloads: Vec<Vec<u8>> = (0..32)

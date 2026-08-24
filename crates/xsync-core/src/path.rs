@@ -205,6 +205,14 @@ mod tests {
     }
 
     #[test]
+    fn windows_long_drive_paths_are_not_truncated() {
+        let path = format!("C:\\{}", "x".repeat(300));
+        let parsed = parse(&path).unwrap();
+        assert!(!parsed.is_remote());
+        assert_eq!(parsed.path, path);
+    }
+
+    #[test]
     fn relative_and_single_file_are_local() {
         let rel = parse("./relative").unwrap();
         assert_eq!(rel.location, Location::Local);

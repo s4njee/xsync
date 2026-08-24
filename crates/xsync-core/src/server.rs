@@ -35,9 +35,9 @@ use crate::planner::{
     try_plan, try_plan_with_fingerprint, DestinationIndex, IndexConfig, PlannerError,
 };
 use crate::protocol::{
-    encode_frame, encode_frame_with_compression, ByteRange, CompressionMode, EntryRecord,
-    FrameDecoder, Message, MetadataOperation, ProtocolError, Role, DEFAULT_UNACKNOWLEDGED_WINDOW,
-    MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
+    encode_frame, encode_frame_with_compression, negotiate_compression, ByteRange, CompressionMode,
+    EntryRecord, FrameDecoder, Message, MetadataOperation, ProtocolError, Role, CAP_ZSTD,
+    DEFAULT_UNACKNOWLEDGED_WINDOW, MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
 };
 use crate::scanner::{
     permission_mode, scan, EntryKind as ScanEntryKind, FileEntry, FileIdentity, ScanError,
@@ -248,6 +248,7 @@ pub struct Server {
     journal: Option<crate::journal::ResumeJournal>,
     compression: CompressionMode,
     compression_level: i32,
+    capabilities: u32,
 }
 
 impl Server {
@@ -262,7 +263,19 @@ impl Server {
             journal: None,
             compression: CompressionMode::None,
             compression_level: 3,
+            capabilities: CAP_ZSTD,
         }
+    }
+
+    /// Create a server with an explicit capability set.
+    ///
+    /// This is also used to exercise interoperability with older or
+    /// feature-reduced peers that do not advertise compression.
+    #[must_use]
+    pub fn new_with_capabilities(root: impl AsRef<Path>, capabilities: u32) -> Self {
+        let mut server = Self::new(root);
+        server.capabilities = capabilities;
+        server
     }
 
     fn next_id(&mut self) -> u64 {
@@ -298,7 +311,8 @@ impl Server {
                     )))
                 }
             };
-        self.compression = compression;
+        self.compression =
+            negotiate_compression(compression, self.capabilities, client_capabilities);
         self.compression_level = compression_level;
 
         // Establish the durable resume journal for this session's job ID.
@@ -318,12 +332,12 @@ impl Server {
         // Send Server Handshake and Ack.
         let server_handshake = Message::Handshake {
             role: server_role,
-            capabilities: 0,
+            capabilities: self.capabilities,
             max_payload: MAX_COMPLETE_PAYLOAD as u32,
             max_segment: MAX_DATA_SEGMENT as u32,
             window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
             job_id,
-            compression,
+            compression: self.compression,
             compression_level,
         };
         let msg_id = self.next_id();
@@ -1458,7 +1472,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     // 1. Send Handshake (Client is Source).
     let handshake = Message::Handshake {
         role: Role::Source,
-        capabilities: 0,
+        capabilities: CAP_ZSTD,
         max_payload: MAX_COMPLETE_PAYLOAD as u32,
         max_segment: MAX_DATA_SEGMENT as u32,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
@@ -1479,12 +1493,19 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     let frame1 = decoder
         .read(&mut reader)
         .map_err(|e| map_transport_error(e, 0))?;
-    if !matches!(frame1.message, Message::Handshake { .. }) {
-        return Err(ServerError::UnexpectedMessage(format!(
-            "expected Server Handshake, got {:?}",
-            frame1.message
-        )));
-    }
+    let (negotiated_compression, negotiated_level, remote_capabilities) = match frame1.message {
+        Message::Handshake {
+            compression,
+            compression_level,
+            capabilities,
+            ..
+        } => (compression, compression_level, capabilities),
+        other => {
+            return Err(ServerError::UnexpectedMessage(format!(
+                "expected Server Handshake, got {other:?}"
+            )))
+        }
+    };
     let frame2 = decoder
         .read(&mut reader)
         .map_err(|e| map_transport_error(e, 0))?;
@@ -1494,6 +1515,20 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             frame2.message
         )));
     }
+    emit(LocalEvent::Negotiated {
+        compression_algorithm: if negotiated_compression == CompressionMode::Zstd {
+            "zstd"
+        } else {
+            "none"
+        },
+        compression_reason: if !options.compress {
+            "compression disabled by user"
+        } else if remote_capabilities & CAP_ZSTD == 0 {
+            "remote peer does not advertise zstd"
+        } else {
+            "both peers advertise zstd"
+        },
+    });
 
     // 2. Send SessionConfig.
     let session_config = Message::SessionConfig {
@@ -1846,8 +1881,8 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     &mut writer,
                     msg_id,
                     &seg_msg,
-                    options.compress,
-                    options.compress_level,
+                    negotiated_compression == CompressionMode::Zstd,
+                    negotiated_level,
                 )?;
                 report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
                 outstanding += 1;
@@ -1938,8 +1973,8 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     &mut writer,
                     msg_id,
                     &seg_msg,
-                    options.compress,
-                    options.compress_level,
+                    negotiated_compression == CompressionMode::Zstd,
+                    negotiated_level,
                 )?;
                 report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
 
@@ -2053,8 +2088,8 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                         &mut writer,
                         msg_id,
                         &seg_msg,
-                        options.compress,
-                        options.compress_level,
+                        negotiated_compression == CompressionMode::Zstd,
+                        negotiated_level,
                     )?;
                     report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
 
@@ -2322,7 +2357,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     let resume_journal = crate::journal::ResumeJournal::new(&job_id)?;
     let handshake = Message::Handshake {
         role: Role::Sink,
-        capabilities: 0,
+        capabilities: CAP_ZSTD,
         max_payload: MAX_COMPLETE_PAYLOAD as u32,
         max_segment: MAX_DATA_SEGMENT as u32,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
@@ -2343,12 +2378,18 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     let frame1 = decoder
         .read(&mut reader)
         .map_err(|e| map_transport_error(e, 0))?;
-    if !matches!(frame1.message, Message::Handshake { .. }) {
-        return Err(ServerError::UnexpectedMessage(format!(
-            "expected Server Handshake, got {:?}",
-            frame1.message
-        )));
-    }
+    let (negotiated_compression, remote_capabilities) = match frame1.message {
+        Message::Handshake {
+            compression,
+            capabilities,
+            ..
+        } => (compression, capabilities),
+        other => {
+            return Err(ServerError::UnexpectedMessage(format!(
+                "expected Server Handshake, got {other:?}"
+            )))
+        }
+    };
     let frame2 = decoder
         .read(&mut reader)
         .map_err(|e| map_transport_error(e, 0))?;
@@ -2358,6 +2399,20 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
             frame2.message
         )));
     }
+    emit(LocalEvent::Negotiated {
+        compression_algorithm: if negotiated_compression == CompressionMode::Zstd {
+            "zstd"
+        } else {
+            "none"
+        },
+        compression_reason: if !options.compress {
+            "compression disabled by user"
+        } else if remote_capabilities & CAP_ZSTD == 0 {
+            "remote peer does not advertise zstd"
+        } else {
+            "both peers advertise zstd"
+        },
+    });
 
     // 2. Send SessionConfig.
     let session_config = Message::SessionConfig {
@@ -3470,7 +3525,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     let mut control_large_ids: Vec<(u64, FileEntry)> = Vec::new();
     for file in &large_files {
         let file_id = calloc();
-        let rec = entry_record_from_file_entry(file);
+        let record = entry_record_from_file_entry(file);
         write_frame(
             &mut cwriter,
             calloc(),
@@ -3478,9 +3533,9 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                 file_id,
                 path: file.path.as_bytes().to_vec(),
                 size: file.size,
-                mtime_ns: rec.mtime_ns,
+                mtime_ns: record.mtime_ns,
                 mode: file.mode,
-                fingerprint: rec.fingerprint,
+                fingerprint: record.fingerprint,
             },
         )?;
         expect_ack(&mut cdec, &mut creader)?;
@@ -3921,7 +3976,7 @@ fn run_data_inner(
         alloc(),
         &Message::Handshake {
             role: Role::Source,
-            capabilities: crate::protocol::CAP_DATA_ONLY,
+            capabilities: crate::protocol::CAP_DATA_ONLY | CAP_ZSTD,
             max_payload: MAX_COMPLETE_PAYLOAD as u32,
             max_segment: MAX_DATA_SEGMENT as u32,
             window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
@@ -3978,7 +4033,7 @@ fn run_data_inner(
         file_to_read.path = rel;
         let stable = source_reader.read(&file_to_read)?;
 
-        let rec = entry_record_from_file_entry(file);
+        let record = entry_record_from_file_entry(file);
         let file_id = alloc();
         write_frame(
             &mut writer,
@@ -3987,9 +4042,9 @@ fn run_data_inner(
                 file_id,
                 path: file.path.as_bytes().to_vec(),
                 size: file.size,
-                mtime_ns: rec.mtime_ns,
+                mtime_ns: record.mtime_ns,
                 mode: file.mode,
-                fingerprint: rec.fingerprint,
+                fingerprint: record.fingerprint,
             },
         )?;
         expect_ack(&mut decoder, &mut reader)?;
@@ -4516,7 +4571,7 @@ mod tests {
 
         let dst_path = dst_dir.path().to_path_buf();
         let server_thread = std::thread::spawn(move || {
-            let mut server = Server::new(dst_path);
+            let mut server = Server::new_with_capabilities(dst_path, 0);
             let reader = ChannelReader {
                 rx: server_rx,
                 buffer: Vec::new(),
@@ -4555,6 +4610,13 @@ mod tests {
 
         assert_eq!(report.transferred_files, 2);
         assert!(!report.partial_failure());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LocalEvent::Negotiated {
+                compression_algorithm: "none",
+                compression_reason: "remote peer does not advertise zstd"
+            }
+        )));
 
         // Verify destination matches
         let hello = fs::read(dst_dir.path().join("sub/hello.txt")).unwrap();
@@ -4614,7 +4676,7 @@ mod tests {
 
         let src_path = src_dir.path().to_path_buf();
         let server_thread = std::thread::spawn(move || {
-            let mut server = Server::new(src_path);
+            let mut server = Server::new_with_capabilities(src_path, 0);
             let reader = ChannelReader {
                 rx: server_rx,
                 buffer: Vec::new(),
@@ -4650,6 +4712,14 @@ mod tests {
         .unwrap();
 
         server_thread.join().unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            LocalEvent::Negotiated {
+                compression_algorithm: "none",
+                compression_reason: "remote peer does not advertise zstd"
+            }
+        )));
 
         assert_eq!(report.transferred_files, 1);
         let pull_data = fs::read(dst_dir.path().join("nested/dir/data.bin")).unwrap();

@@ -43,6 +43,9 @@ pub const MAX_TRACKED_MESSAGE_IDS: usize = 1_048_576;
 /// un-masked capability bits, so using one is not a wire change.
 pub const CAP_DATA_ONLY: u32 = 1 << 0;
 
+/// Endpoint supports zstd-compressed data frames.
+pub const CAP_ZSTD: u32 = 1 << 1;
+
 /// Envelope flag indicating that the payload uses zstd compression.
 pub const FRAME_FLAG_ZSTD: u8 = 0x01;
 const MAX_HANDSHAKE_PAYLOAD: usize = 128;
@@ -604,24 +607,32 @@ fn parse_header(header: &[u8]) -> Result<ParsedHeader, ProtocolError> {
     })
 }
 
-#[cfg(not(target_os = "windows"))]
 fn compress_zstd(payload: &[u8], level: i32) -> Result<Vec<u8>, ProtocolError> {
     zstd::bulk::compress(payload, level).map_err(ProtocolError::Compression)
 }
 
-#[cfg(target_os = "windows")]
-fn compress_zstd(_payload: &[u8], _level: i32) -> Result<Vec<u8>, ProtocolError> {
-    Err(ProtocolError::CompressionUnavailable)
+/// Select a compression mode supported by both endpoints.
+///
+/// The requested mode is only a preference; capabilities are authoritative so
+/// an older or feature-reduced peer safely falls back to uncompressed frames.
+#[must_use]
+pub const fn negotiate_compression(
+    requested: CompressionMode,
+    local_capabilities: u32,
+    remote_capabilities: u32,
+) -> CompressionMode {
+    match requested {
+        CompressionMode::Zstd
+            if local_capabilities & CAP_ZSTD != 0 && remote_capabilities & CAP_ZSTD != 0 =>
+        {
+            CompressionMode::Zstd
+        }
+        CompressionMode::Zstd | CompressionMode::None => CompressionMode::None,
+    }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn decompress_zstd(payload: &[u8], decoded_len: usize) -> Result<Vec<u8>, ProtocolError> {
     zstd::bulk::decompress(payload, decoded_len).map_err(ProtocolError::Decompression)
-}
-
-#[cfg(target_os = "windows")]
-fn decompress_zstd(_payload: &[u8], _decoded_len: usize) -> Result<Vec<u8>, ProtocolError> {
-    Err(ProtocolError::CompressionUnavailable)
 }
 
 fn decode_parts(header: ParsedHeader, wire_payload: &[u8]) -> Result<Frame, ProtocolError> {
@@ -1728,9 +1739,6 @@ pub enum ProtocolError {
     /// zstd decompression failed or exceeded its declared output size.
     #[error("decompress protocol payload: {0}")]
     Decompression(#[source] io::Error),
-    /// This target was built without the native zstd implementation.
-    #[error("zstd compression is unavailable on this target")]
-    CompressionUnavailable,
 }
 
 /// Tracks received large-file ranges without permitting duplicates or overlap.
@@ -2069,6 +2077,22 @@ mod tests {
             decode_frame(&bomb),
             Err(ProtocolError::DecompressedTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn compression_negotiation_intersects_endpoint_capabilities() {
+        assert_eq!(
+            negotiate_compression(CompressionMode::Zstd, CAP_ZSTD, CAP_ZSTD),
+            CompressionMode::Zstd
+        );
+        assert_eq!(
+            negotiate_compression(CompressionMode::Zstd, CAP_ZSTD, 0),
+            CompressionMode::None
+        );
+        assert_eq!(
+            negotiate_compression(CompressionMode::None, CAP_ZSTD, CAP_ZSTD),
+            CompressionMode::None
+        );
     }
 
     #[test]

@@ -102,6 +102,11 @@ stage. A server that does not understand the bit still answers as an ordinary
 single-session sink, so an old peer against a new client degrades to single
 stream rather than failing.
 
+`CAP_ZSTD = 1 << 1` advertises zstd support. The negotiated compression mode is
+the intersection of the requested mode and both peers' capability bits. If
+either peer lacks `CAP_ZSTD`, the session uses `None`, and this choice is made
+during the handshake before any data frame is sent.
+
 Malformed compression, a compressed output larger than the declared bounded
 length, or a declared decompressed length over 16 MiB is rejected before any
 filesystem publication. Protocol decoding does not write destination files;

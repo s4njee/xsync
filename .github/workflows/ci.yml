@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  target:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            tool: cargo
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            tool: cargo
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            tool: cargo
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            tool: cross
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            tool: cargo
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            tool: cross
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            tool: cargo
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux musl toolchain
+        if: runner.os == 'Linux' && endsWith(matrix.target, '-musl')
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - name: Install cross
+        if: matrix.tool == 'cross'
+        uses: taiki-e/install-action@cross
+      - name: Build
+        run: ${{ matrix.tool }} build --workspace --locked --target ${{ matrix.target }}
+      - name: Test
+        run: ${{ matrix.tool }} test --workspace --locked --target ${{ matrix.target }}
+      - name: Clippy
+        run: ${{ matrix.tool }} clippy --workspace --locked --all-targets --target ${{ matrix.target }} -- -D warnings
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - run: cargo check --workspace --locked

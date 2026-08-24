@@ -21,7 +21,7 @@ Measured against the working tree, not assumed:
 | macOS (aarch64) | Builds, 124 tests pass, clippy clean at `-D warnings` |
 | Linux | Builds natively on `mars` (Arch, x86_64); never built in CI |
 | **Windows** | Compiles (`cargo check` / `clippy -D warnings` for `x86_64-pc-windows-msvc`). Linking/tests need MSVC (`link.exe`); see D0.1 |
-| Compression on Windows | Deliberately excluded — no compress *and no decompress* |
+| Compression on Windows | zstd enabled for compression and decompression |
 | Code signing | None on any platform |
 | Packaging | None. No tarball, installer, package, or tap |
 | Service integration | None. No systemd unit, launchd plist, or Windows service |
@@ -30,8 +30,8 @@ Measured against the working tree, not assumed:
 | Supply chain | `unsafe_code = "deny"` workspace-wide; no audit tooling wired up |
 | Repo hygiene | 715 MB / 22,650 untracked files under `benches/results/tuning/` |
 
-The single most important consequence: **there is no CI, and the Windows build has rotted
-behind a `cfg` gate.** Every story in D1 exists so that cannot recur.
+The single most important consequence: **there is no CI.** Every story in D1 exists so that
+platform-specific build and test regressions cannot recur.
 
 ---
 
@@ -40,7 +40,7 @@ behind a `cfg` gate.** Every story in D1 exists so that cannot recur.
 Blocking. Nothing downstream matters until all three platforms compile.
 
 ### Story D0.1 — Fix the Windows build
-- [x] `cargo check -p xsync --target x86_64-pc-windows-msvc` currently fails.
+- [x] `cargo check -p xsync --target x86_64-pc-windows-msvc` passed after fixing the cfg-gated build paths.
 
 **AC**
 - The break is an arity mismatch behind a `cfg`: `compress_zstd` at
@@ -56,22 +56,20 @@ Blocking. Nothing downstream matters until all three platforms compile.
   11 in `rsync.rs`, 9 in `scanner.rs`, 4 each in `source.rs` and `protocol.rs`.
 
 ### Story D0.2 — Decide the Windows compression story
-- [ ] `zstd` is excluded on Windows (`crates/xsync-core/Cargo.toml`), so a Windows peer can
-  neither compress nor decompress.
+- [x] `zstd` is enabled on all platforms, including Windows.
 
 **AC**
-- A decision is recorded with its reasoning. The likely cause is avoiding a C toolchain in
-  the build; CI on a Windows runner with MSVC removes that constraint, so the default
-  recommendation is to **enable `zstd` on all platforms** and delete the gate.
-- If it stays excluded, the fallback must be a pure-Rust decoder rather than an error, so a
-  Windows peer can still *receive* compressed data.
-- Either way, `ProtocolError::CompressionUnavailable` must become unreachable in normal
-  operation.
+- Decision: enable `zstd` on all platforms and delete the Windows gate. The project targets
+  `x86_64-pc-windows-msvc`, whose supported MSVC build environment supplies the native C
+  toolchain required by `zstd-sys`; avoiding that toolchain is not a release constraint.
+- This keeps compression and decompression wire-compatible across peers and makes the
+  platform-specific `CompressionUnavailable` path unnecessary.
+- `ProtocolError::CompressionUnavailable` was removed because zstd is now available in normal
+  operation on every supported target.
 
 ### Story D0.3 — Compression negotiation degrades safely
-- [ ] Today a Unix sender with compression on (the default) talking to a Windows receiver
-  produces `CompressionUnavailable` at the receiver. That is an interop failure, not a
-  missing feature.
+- [x] A peer without compression support talking to a peer with compression enabled
+  negotiates uncompressed frames safely instead of failing the transfer.
 
 **AC**
 - The handshake already carries a `compression` field; the negotiated mode is the
@@ -82,7 +80,9 @@ Blocking. Nothing downstream matters until all three platforms compile.
   was chosen, so a silent downgrade is observable.
 
 ### Story D0.4 — Define the target matrix
-- [ ] Name which triples are supported, which are best-effort, and which are not built.
+- [x] The supported, best-effort, and excluded target triples are defined in
+  [docs/TARGET-MATRIX.md](docs/TARGET-MATRIX.md), with Linux builder images for the
+  glibc floor and musl bootstrap binaries.
 
 **AC**
 - Tier 1 (built, tested, signed, released every tag): `aarch64-apple-darwin`,
@@ -102,7 +102,7 @@ Blocking. Nothing downstream matters until all three platforms compile.
 The project has none. This epic is what makes every other guarantee in this file durable.
 
 ### Story D1.1 — Build, test, and lint on every Tier 1 target
-- [ ] CI on push and pull request.
+- [x] CI runs on push and pull request via `.github/workflows/ci.yml`.
 
 **AC**
 - Matrix covers macOS (aarch64 and x86_64), Linux (glibc and musl, x86_64 and aarch64), and
@@ -114,8 +114,8 @@ The project has none. This epic is what makes every other guarantee in this file
 - A red build blocks merge. The Windows job must be able to fail — it currently would.
 
 ### Story D1.2 — Cross-platform integration coverage
-- [ ] The existing integration suite runs against a spawned child server via `--rsh`, so it
-  needs no sshd and is portable.
+- [~] The integration harness now has a Windows PowerShell-backed `--rsh` helper; full
+  cross-platform CI execution and filesystem edge-case coverage are in progress.
 
 **AC**
 - `crates/xsync/tests/server_integration.rs` passes on all three operating systems, not just
