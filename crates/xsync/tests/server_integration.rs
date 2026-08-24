@@ -94,6 +94,8 @@ fn test_push_matches_local_sync_identically() {
 
     let dst_local = tempdir().unwrap();
     let dst_push = tempdir().unwrap();
+    let script_dir = tempdir().unwrap();
+    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
 
     // 1. Run local-to-local sync
     let status_local = Command::new(xsync_bin())
@@ -103,8 +105,12 @@ fn test_push_matches_local_sync_identically() {
         .unwrap();
     assert!(status_local.success());
 
-    // 2. Run remote push sync (fakehost:dest)
+    // 2. Run remote push sync (fakehost:dest) through a fake-rsh: over real
+    //    transport the default remote shell is `ssh`, but for the pipe suite we
+    //    point `-e` at an exec'ing fake-rsh so no sshd is needed.
     let status_push = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&fake_rsh)
         .arg(format!("{}/", src.path().display()))
         .arg(format!("fakehost:{}", dst_push.path().display()))
         .status()
@@ -125,17 +131,23 @@ fn test_pull_matches_push_identically() {
 
     let dst_push = tempdir().unwrap();
     let dst_pull = tempdir().unwrap();
+    let script_dir = tempdir().unwrap();
+    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
 
-    // 1. Run remote push sync (fakehost:dest)
+    // 1. Run remote push sync (fakehost:dest) through a fake-rsh.
     let status_push = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&fake_rsh)
         .arg(format!("{}/", src.path().display()))
         .arg(format!("fakehost:{}", dst_push.path().display()))
         .status()
         .unwrap();
     assert!(status_push.success());
 
-    // 2. Run remote pull sync (fakehost:src dest)
+    // 2. Run remote pull sync (fakehost:src dest) through a fake-rsh.
     let status_pull = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&fake_rsh)
         .arg(format!("fakehost:{}/", src.path().display()))
         .arg(format!("{}", dst_pull.path().display()))
         .status()
@@ -380,6 +392,46 @@ fn test_durable_resume_skips_verified_ranges() {
             job_dir.display()
         );
     }
+}
+
+#[test]
+fn test_ssh_default_transport_reports_remote_stderr_on_failure() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file.txt"), b"data").unwrap();
+
+    let dst = tempdir().unwrap();
+    let script_dir = tempdir().unwrap();
+
+    // Pretend the default remote shell (`ssh`) is a failing ssh that writes an
+    // authentication/connect error to stderr and exits non-zero. We insert it
+    // into PATH so the default transport picks it up without `-e`.
+    let fake_ssh = script_dir.path().join("ssh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&fake_ssh, "#!/bin/sh\necho 'ssh: connect to host fakehost port 22: Connection refused' >&2\nexit 255\n")
+            .unwrap();
+        let mut perms = fs::metadata(&fake_ssh).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fake_ssh, perms).unwrap();
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    let new_path = format!("{}:{}", script_dir.path().display(), path);
+
+    let output = Command::new(xsync_bin())
+        .env("PATH", &new_path)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}", dst.path().display()))
+        .output()
+        .unwrap();
+
+    // SSH failure: the job must exit non-zero and relay ssh's stderr to the user.
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Connection refused"),
+        "default ssh transport must surface the remote shell's stderr, got: {stderr}"
+    );
 }
 
 #[test]

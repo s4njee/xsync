@@ -2437,6 +2437,9 @@ fn parse_rsh_command(rsh: &str) -> Vec<String> {
     shlex::split(rsh).unwrap_or_else(|| vec![rsh.to_owned()])
 }
 
+/// Default remote shell; replaced only by an explicit `-e/--rsh`.
+const DEFAULT_RSH: &str = "ssh";
+
 fn is_missing_xsync_stderr(stderr: &str, exit_code: Option<i32>) -> bool {
     let lower = stderr.to_lowercase();
     lower.contains("xsync: command not found")
@@ -2446,34 +2449,63 @@ fn is_missing_xsync_stderr(stderr: &str, exit_code: Option<i32>) -> bool {
         || exit_code == Some(127)
 }
 
+/// Compute `(program, args)` used to launch the remote `xsync --server`.
+///
+/// - Explicit `-e CMD`: shell request parsed (shlex), then `{host}` and
+///   `xsync --server {path}` are appended.
+/// - No `-e` but a host: the default `ssh {host} xsync --server {path}`.
+/// - No host and no `-e`: an in-process/local child server via `current_exe`.
+#[must_use]
+fn remote_server_command(
+    remote_path: &str,
+    rsh: Option<&str>,
+    host: Option<&str>,
+) -> (String, Vec<String>) {
+    if let Some(rsh_cmd) = rsh {
+        let parts = parse_rsh_command(rsh_cmd);
+        let program = parts.first().cloned().unwrap_or_else(|| rsh_cmd.to_owned());
+        let mut args = if parts.is_empty() {
+            Vec::new()
+        } else {
+            parts[1..].to_vec()
+        };
+        if let Some(h) = host {
+            args.push(h.to_owned());
+        }
+        args.push("xsync".to_owned());
+        args.push("--server".to_owned());
+        args.push(remote_path.to_owned());
+        (program, args)
+    } else if let Some(h) = host {
+        (
+            DEFAULT_RSH.to_owned(),
+            vec![
+                h.to_owned(),
+                "xsync".to_owned(),
+                "--server".to_owned(),
+                remote_path.to_owned(),
+            ],
+        )
+    } else {
+        let exe = std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("xsync"))
+            .to_string_lossy()
+            .into_owned();
+        (
+            exe,
+            vec!["--server".to_owned(), remote_path.to_owned()],
+        )
+    }
+}
+
 fn spawn_server_child(
     remote_path: &str,
     rsh: Option<&str>,
     host: Option<&str>,
 ) -> Result<Child, ServerError> {
-    let mut cmd = if let Some(rsh_cmd) = rsh {
-        let parts = parse_rsh_command(rsh_cmd);
-        if parts.is_empty() {
-            return Err(ServerError::Transport {
-                stream: 0,
-                message: "empty --rsh command".to_owned(),
-            });
-        }
-        let mut c = Command::new(&parts[0]);
-        for arg in &parts[1..] {
-            c.arg(arg);
-        }
-        if let Some(h) = host {
-            c.arg(h);
-        }
-        c.arg("xsync").arg("--server").arg(remote_path);
-        c
-    } else {
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("xsync"));
-        let mut c = Command::new(exe);
-        c.arg("--server").arg(remote_path);
-        c
-    };
+    let (program, args) = remote_server_command(remote_path, rsh, host);
+    let mut cmd = Command::new(program);
+    cmd.args(args);
 
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
@@ -2534,6 +2566,15 @@ where
     let stderr_text = stderr_handle
         .map(|h| h.join().unwrap_or_default())
         .unwrap_or_default();
+
+    // Relay the remote/ssh stderr so authentication, host-key, and other
+    // diagnostics remain visible to the user (required for SSH UX). It is
+    // empty for a clean in-process/fake-rsh session, so this adds no noise.
+    let trimmed = stderr_text.trim_end().to_owned();
+    if !trimmed.is_empty() {
+        eprintln!("{trimmed}");
+    }
+
     let exit_code = status.and_then(|s| s.code());
 
     if is_missing_xsync_stderr(&stderr_text, exit_code) {
@@ -2551,6 +2592,30 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use tempfile::tempdir;
+
+    #[test]
+    fn default_remote_shell_is_ssh_over_host() {
+        let (program, args) = remote_server_command("/dest", None, Some("user@mars"));
+        assert_eq!(program, "ssh");
+        assert_eq!(
+            args,
+            ["user@mars", "xsync", "--server", "/dest"]
+        );
+    }
+
+    #[test]
+    fn explicit_rsh_replaces_the_shell_but_preserves_host_and_args() {
+        let (program, args) = remote_server_command("/dest", Some("myrsh -oK=1"), Some("host"));
+        assert_eq!(program, "myrsh");
+        assert_eq!(args, ["-oK=1", "host", "xsync", "--server", "/dest"]);
+    }
+
+    #[test]
+    fn no_host_runs_an_in_process_local_server() {
+        let (program, args) = remote_server_command("/dest", None, None);
+        assert_ne!(program, "ssh");
+        assert_eq!(args, ["--server", "/dest"]);
+    }
 
     #[test]
     fn server_sink_and_client_push_round_trip() {

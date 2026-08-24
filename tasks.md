@@ -730,7 +730,7 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
 ## Epic 4 — SSH transport & multi-stream parallelism
 
 ### Story 4.1 — SSH transport
-- [ ] `xsync src host:dest` first runs the complete protocol over one persistent
+- [x] `xsync src host:dest` first runs the complete protocol over one persistent
   `ssh host xsync --server` session; `user@host` and `-e/--rsh` are supported, and SSH stderr
   remains visible for authentication/host-key UX.
 
@@ -743,6 +743,32 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   separate timings in benchmark events.
 - The remote executable and negotiated capabilities/version are probed once per job, not once per
   file or request.
+
+**Results:**
+- The remote spawn is now `ssh {host} xsync --server {path}` by default: when no `-e/--rsh` is
+  given and the destination is a remote host, the transport runs the complete v1 protocol over one
+  persistent SSH session. An explicit `-e` (shell-word-split via `shlex`) replaces the shell while
+  preserving the `{host}` and `xsync --server {path}` argument tail; a host-less invocation still
+  spawns the in-process/local child server.
+- `remote_server_command` isolates the `(program, args)` mapping and is unit-tested (default ssh
+  over host, `-e` replacement, and the local-child fallback).
+- SSH stderr stays visible: `run_server_child_session` now relays any captured child stderr to the
+  process's stderr instead of discarding it, so authentication and host-key diagnostics surface.
+  A non-zero ssh exit therefore reports the remote shell's stderr and exits non-zero (`EXIT_FAILURE`).
+  Verified by a fake `ssh` on PATH that emits `Connection refused` and exits 255
+  (`test_ssh_default_transport_reports_remote_stderr_on_failure`).
+- Interactive password/host-key prompts still work because OpenSSH reads them from the controlling
+  tty (`/dev/tty`) rather than the piped stdin; the manual real-host gate remains (cannot be exercised
+  in an sshd-less CI), covering `host:path`, `user@host:path`, and `-e`.
+- The remote binary and negotiated capabilities/version are probed once per job: one `ssh` child and
+  one `Handshake` per transfer, never per file/request.
+- The full PipeTransport correctness and durable-resume suite passes over the pipe transport
+  (10 server-integration tests, including push/pull equality, skip-on-rerun, crash/restart safety,
+  and the `crash_after_chunk` durable resume).
+- Per-phase setup/scan/transfer/verify/teardown benchmark timings are owned by the Epic 8
+  benchmark/documentation pass; the transport already separates the phases it emits
+  (`Started`/`Planned`/`Transferred`/`Finished` events). Verification: 133 workspace tests pass and
+  strict Clippy `-D warnings` is clean.
 
 ### Story 4.2 — Multi-stream striping
 - [ ] `--streams N` opens one persistent control session plus N persistent data sessions. Batches
