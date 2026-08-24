@@ -877,7 +877,7 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   production spawn line. Verification: 138 workspace tests pass; strict Clippy `-D warnings` clean.
 
 ### Story 4.4 — Rsync wire-protocol research and compatibility contract
-- [ ] Produce a clean, versioned compatibility specification for the receiver-side rsync wire
+- [x] Produce a clean, versioned compatibility specification for the receiver-side rsync wire
   dialects xsync will implement before writing the fallback codec.
 
 **AC**
@@ -896,6 +896,18 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   implementation code is copied or vendored without deliberate license compatibility.
 - The selected subset is sufficient for xsync v1 whole-file sending; delta-token generation is not
   implemented merely to imitate an optimization v1 intentionally defers.
+
+**Results**
+- `docs/rsync-wire-v1.md` freezes the receiver-side subset and dialect matrix. GNU rsync protocol
+  32 is the supported target; protocol 27 is a separately gated openrsync target.
+- Read-only probes recorded GNU rsync 3.4.4/protocol 32 on `mars.local`, GNU rsync
+  3.5.0-g471e17dc/protocol 32 on `freya.local`, and the local Apple `/usr/bin/rsync`
+  (`rsync version 2.6.9 compatible`, protocol 29). The Apple client completed a protocol-29
+  dry-run against Mars; neither Linux host provides an `openrsync` server executable.
+- `benches/results/story-4.4/transcripts-v1.md` contains normalized golden scenarios for handshake,
+  regular/nested/empty/symlink/non-UTF-8/metadata/unchanged/error/clean-end behavior, with random
+  seeds isolated as `<seed>`. `DECISION.md` records provenance, licensing boundaries, and the
+  whole-file-only v1 decision. Verification: documentation-only Story 4.4; codec work remains 4.5.
 
 ### Story 4.5 — Native `RsyncTransport` receiver fallback
 - [ ] Implement the selected rsync receiver protocol locally and launch remote
