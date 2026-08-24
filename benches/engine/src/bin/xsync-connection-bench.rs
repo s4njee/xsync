@@ -108,8 +108,7 @@ fn main() -> Result<(), BenchError> {
 
     // If launched as a server child, serve over stdio and exit.
     if let Some(root) = &cli.server {
-        xsync_core::server::run_server_stdio(root.clone())
-            .map_err(BenchError::Serve)?;
+        xsync_core::server::run_server_stdio(root.clone()).map_err(BenchError::Serve)?;
         return Ok(());
     }
     if cli.repetitions == 0 {
@@ -118,10 +117,7 @@ fn main() -> Result<(), BenchError> {
 
     // A root the servers never need to materialize (handshake stops before the
     // destination scan); it is also the dest for the reference transfer.
-    let scratch = std::env::temp_dir().join(format!(
-        "xsync-conn-bench-{}",
-        std::process::id()
-    ));
+    let scratch = std::env::temp_dir().join(format!("xsync-conn-bench-{}", std::process::id()));
     let _ = fs::remove_dir_all(&scratch);
     fs::create_dir_all(&scratch).map_err(BenchError::Scratch)?;
 
@@ -205,12 +201,14 @@ fn measure_setup(root: &Path, streams: usize) -> Result<f64, BenchError> {
         .into_iter()
         .map(|mut child| {
             thread::spawn(move || -> Result<(), BenchError> {
-                let stdin = child.stdin.take().ok_or_else(|| {
-                    BenchError::Handshake(std::io::Error::other("no stdin"))
-                })?;
-                let stdout = child.stdout.take().ok_or_else(|| {
-                    BenchError::Handshake(std::io::Error::other("no stdout"))
-                })?;
+                let stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| BenchError::Handshake(std::io::Error::other("no stdin")))?;
+                let stdout = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| BenchError::Handshake(std::io::Error::other("no stdout")))?;
                 let mut writer = BufWriter::new(stdin);
                 let mut reader = BufReader::new(stdout);
                 let mut decoder = FrameDecoder::new();
@@ -232,19 +230,22 @@ fn handshake_session<R: Read, W: Write>(
 ) -> Result<(), BenchError> {
     // Client is Source; measure only up to the SessionConfig ack.
     writer
-        .write_all(&encode_frame(
-            1,
-            &Message::Handshake {
-                role: Role::Source,
-                capabilities: 0,
-                max_payload: MAX_COMPLETE_PAYLOAD as u32,
-                max_segment: MAX_DATA_SEGMENT as u32,
-                window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-                job_id: [0u8; 16],
-                compression: CompressionMode::None,
-            },
+        .write_all(
+            &encode_frame(
+                1,
+                &Message::Handshake {
+                    role: Role::Source,
+                    capabilities: 0,
+                    max_payload: MAX_COMPLETE_PAYLOAD as u32,
+                    max_segment: MAX_DATA_SEGMENT as u32,
+                    window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+                    job_id: [0u8; 16],
+                    compression: CompressionMode::None,
+                    compression_level: 3,
+                },
+            )
+            .map_err(|e| BenchError::Handshake(std::io::Error::other(e)))?,
         )
-        .map_err(|e| BenchError::Handshake(std::io::Error::other(e)))?)
         .map_err(BenchError::Handshake)?;
     writer.flush().map_err(BenchError::Handshake)?;
 
@@ -261,19 +262,23 @@ fn handshake_session<R: Read, W: Write>(
         .map_err(|e| BenchError::Handshake(std::io::Error::other(e)))?;
 
     writer
-        .write_all(&encode_frame(
-            2,
-            &Message::SessionConfig {
-                streams: 1,
-                batch_bytes: 32 * 1024 * 1024,
-                chunk_bytes: 16 * 1024 * 1024,
-                window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-                delete: false,
-                checksum: false,
-                paranoid: false,
-            },
+        .write_all(
+            &encode_frame(
+                2,
+                &Message::SessionConfig {
+                    streams: 1,
+                    batch_bytes: 32 * 1024 * 1024,
+                    chunk_bytes: 16 * 1024 * 1024,
+                    window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+                    delete: false,
+                    checksum: false,
+                    paranoid: false,
+                    dry_run: false,
+                    exclude_patterns: Vec::new(),
+                },
+            )
+            .map_err(|e| BenchError::Handshake(std::io::Error::other(e)))?,
         )
-        .map_err(|e| BenchError::Handshake(std::io::Error::other(e)))?)
         .map_err(BenchError::Handshake)?;
     writer.flush().map_err(BenchError::Handshake)?;
     let _config_ack = decoder
@@ -296,8 +301,7 @@ fn measure_reference_transfer(
         fs::write(src.join(format!("f{i:04}.bin")), vec![0xAB; 4096])
             .map_err(BenchError::Scratch)?;
     }
-    fs::write(src.join("large.bin"), vec![0x5A; 1024 * 1024])
-        .map_err(BenchError::Scratch)?;
+    fs::write(src.join("large.bin"), vec![0x5A; 1024 * 1024]).map_err(BenchError::Scratch)?;
     let files = 201u64;
     let bytes = 200 * 4096 + 1024 * 1024;
 
@@ -310,8 +314,17 @@ fn measure_reference_transfer(
         };
         let start = Instant::now();
         // host=None -> in-process/local child server (no ssh).
-        xsync_core::server::sync_push_server(&src, true, &dest.to_string_lossy(), true, &options, None, None, |_| {})
-            .map_err(BenchError::Transfer)?;
+        xsync_core::server::sync_push_server(
+            &src,
+            true,
+            &dest.to_string_lossy(),
+            true,
+            &options,
+            None,
+            None,
+            |_| {},
+        )
+        .map_err(BenchError::Transfer)?;
         totals.push(start.elapsed().as_secs_f64() * 1000.0);
     }
     let mut sorted = totals.clone();
@@ -331,11 +344,7 @@ fn report_markdown(report: &Report) -> String {
     let _ = writeln!(out, "# Story 4.3 — SSH connection-model benchmark\n");
     let _ = writeln!(out, "- schema: `{}`", report.schema);
     let _ = writeln!(out, "- repetitions: {}", report.repetitions);
-    let _ = writeln!(
-        out,
-        "- setup kind: {}",
-        report.setup_kind
-    );
+    let _ = writeln!(out, "- setup kind: {}", report.setup_kind);
     let _ = writeln!(
         out,
         "- reference transfer: {} files, {} bytes, {:.2} ms",
@@ -346,7 +355,10 @@ fn report_markdown(report: &Report) -> String {
         "- per-session setup (streams=1): {:.2} ms",
         report.per_session_setup_ms_1
     );
-    let _ = writeln!(out, "\n| streams | setup median (ms) | MAD (ms) | delta vs prev (ms) | transfer/setup |");
+    let _ = writeln!(
+        out,
+        "\n| streams | setup median (ms) | MAD (ms) | delta vs prev (ms) | transfer/setup |"
+    );
     let _ = writeln!(out, "|---:|---:|---:|---:|---:|");
     for r in &report.results {
         let _ = writeln!(

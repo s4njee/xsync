@@ -12,16 +12,20 @@
 
 //! xsync-core's public modules.
 pub mod clone;
+pub mod compression;
+pub mod hash_cache;
 pub mod journal;
 pub mod local;
 pub mod path;
 pub mod planner;
 pub mod protocol;
+pub mod rsync;
 pub mod scanner;
 pub mod server;
 pub mod sink;
 pub mod source;
 pub mod strategy;
+pub mod transport;
 
 /// The version of the xsync wire protocol. Bumped on any incompatible change;
 /// `--server` peers reject a mismatch (see plan.md Story 3.1).

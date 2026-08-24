@@ -1,8 +1,30 @@
 # xsync v1 — Epics, Stories & Acceptance Criteria
 
-Companion to [plan.md](plan.md). Ordered roughly by implementation sequence; stories within an epic are independent unless noted. "AC" = acceptance criteria.
+Companion to [plan.md](plan.md). Ordered roughly by implementation sequence; stories within an epic
+are independent unless noted. "AC" = acceptance criteria.
+
+Performance work is tuned against the real-world corpora and research spikes in
+[TUNING.md](TUNING.md), with its executable work breakdown in
+[TUNING-TASKS.md](TUNING-TASKS.md). Both are v2 scope. Shipping a signed, packaged binary for
+Windows, Linux, and macOS is planned in [DEPLOYMENT.md](DEPLOYMENT.md), which runs in parallel. The synthetic Epic 0 corpus classes are now
+legacy for performance purposes and remain the correctness fixtures.
 
 Status legend: `[ ]` todo · `[~]` in progress · `[x]` done
+
+## Release-readiness checklist before Epic 8.1
+
+- [~] Story 7.1 terminal progress renderer: monotonic aggregate status, scanning state,
+  periodic non-TTY output, quiet/error behavior, JSONL preservation, and concise final summary.
+- [~] Story 4.5 robustness follow-ups: native codec is implemented and now validated against
+  Freya’s GNU rsync 3.5.0/protocol 32 receiver; real permission/disk-full/interruption,
+  malformed-frame, and receiver-crash cleanup tests remain.
+- [x] Benchmark observability audit: native push, pull, and multi-stream paths accumulate
+  application wire bytes; benchmark records retain compression mode/level, stream count, and
+  transport fields. Release-matrix execution remains Story 8.1.
+- [~] Release-candidate freeze: release build and strict local gates pass, while pinned-corpus
+  matrix execution and host/tool checks are still pending.
+- [x] Reconcile stale task status for the prerequisite stories as evidence is collected; Stories
+  8.2 and 8.3 remain downstream of the benchmark results.
 
 ---
 
@@ -21,6 +43,13 @@ These are backlog invariants, not completed claims:
   executable.
 - Move the minimum viable benchmark harness ahead of the remote protocol and retain Epic 8 as the
   release benchmark/documentation pass.
+- Retire the synthetic corpora as the basis for performance claims. They are the wrong shape
+  (synthetic flat corpora enumerate ~10x faster than real trees, which are directory-open bound),
+  the wrong scale (smoke tier is 513 items / 1.77 MB), and they hid a 5.9x CPU overhead that is
+  unmissable at real scale. They remain the correctness fixtures. Tune against the three real
+  corpora in [TUNING.md](TUNING.md): `congress` (1.32M files, 14 GB, 8.6x compressible),
+  `manga` (117 files, 27 GB, genuinely incompressible), and `cb7` (205k files, 42 GB, mixed sizes
+  with ~4 GB of duplicated build artifacts).
 
 ---
 
@@ -224,6 +253,38 @@ already completed scaffold, scanner, planner, or sink stories.
   rather than fabricated. Tar was not used as an xsync proxy. Full decision and evidence:
   `benches/results/story-0.5/DECISION.md`.
 
+**Epic 0 current audit (2026-08-24):** Stories 0.1–0.5 are all complete. The current workspace
+passes `cargo fmt --all -- --check`, strict workspace Clippy, and the full workspace test suite:
+166 tests passed with one pre-existing 100k-entry scanner stress test intentionally ignored. The
+historical Story 0 reports remain authoritative for their recorded hosts and runs; current source
+provenance is tracked separately because the worktree contains changes beyond the recorded report
+builds.
+
+---
+
+## Epic 0 plain-English summary
+
+Epic 0 bootstrapped the evidence and benchmarking environment for xsync. It did not mean that the
+finished product was complete. It established the repeatable tools, test data, correctness checks,
+and measurements that the remaining implementation stories depend on.
+
+In practical terms, Epic 0:
+
+- built a benchmark harness that creates test data, measures runs, and independently verifies every
+  destination;
+- added deterministic fixtures for small files, deep trees, empty files, mixed data, compression,
+  incompressible data, and large files;
+- measured scanner memory and performance and rejected a slower/incomplete macOS-specific scanner;
+- tested local copy and clone/reflink options with safe capability-based fallbacks;
+- measured remote transfer behavior against real `rsync` on ext4 and tmpfs filesystems;
+- selected evidence-based defaults: one remote stream and adaptive zstd compression with a 64 KiB
+  sample; and
+- documented what is proven, what remains experimental, and what later stories must implement,
+  including the native rsync-protocol fallback.
+
+Epic 0 is therefore the project's measurement and architecture foundation, not the final transfer
+product.
+
 ---
 
 ## Epic 1 — Workspace scaffold & CLI foundation
@@ -257,9 +318,8 @@ Cargo workspace, argument parsing, and rsync-compatible path semantics. Everythi
 - `--streams 99` → `error: invalid value '99' for '--streams <N>': 99 is not in 1..=16` (exit 2); `--compress-level` range 1..=22 enforced the same way.
 - 4 new unit tests: full flag surface, error-kind checks (unknown arg / missing arg / value validation), `--server` path not required, and default `--streams=None`; clippy clean.
 
-**Known delta after the `f2` review:** Story 0.5 selected one stream and the help text now records
-that decision. Story 4.2 must give the omitted option runtime transport behavior; the parsed value
-correctly remains `None` until configuration resolution is implemented.
+**Resolved:** Story 0.5 selected one stream, the help text records that decision, and Story 4.2 now
+resolves an omitted value to one at runtime while honoring explicit values in the supported range.
 
 ### Story 1.3 — Path spec parsing (rsync conventions)
 - [x] Parse `[user@]host:path` vs local paths; Windows drive letters (`C:\foo`) are not mistaken for hosts; trailing-slash semantics captured (`path/` = contents, `path` = include the directory itself).
@@ -276,7 +336,7 @@ correctly remains `None` until configuration resolution is implemented.
 - Trailing-slash → internal dest path prefix behavior (`b/a/...` vs `b/...`) is wired into the `PathSpec` flag; output-tree integration is exercised in Epic 2, per its AC.
 
 ### Story 1.4 — Transport selection and fallback UX
-- [ ] Add `--transport=auto|xsync|rsync` with `auto` as the default and model transport
+- [x] Add `--transport=auto|xsync|rsync` with `auto` as the default and model transport
   capabilities explicitly in the engine/event API.
 
 **AC**
@@ -293,11 +353,33 @@ correctly remains `None` until configuration resolution is implemented.
 - The CLI never uploads or installs a binary without a separate explicit user-authorized action.
 - Local→local rejects `--transport=rsync` as inapplicable rather than spawning an unnecessary child.
 
+**Results:**
+- Added `--transport=auto|xsync|rsync`, defaulting to `auto`, plus a shared transport-selection
+  model containing backend, remote implementation/version, wire version, mapped options,
+  capabilities, unavailable guarantees, and selection reason.
+- `auto` selects native xsync first and falls back only on the explicit missing-remote-xsync result;
+  authentication, host-key, protocol, corruption, and post-mutation failures remain hard failures.
+  Explicit `xsync` never falls back, and explicit `rsync` skips the native probe.
+- Human progress output and `--progress-json` both expose the selected transport contract. The CLI
+  never installs or uploads a receiver implicitly, and local-to-local `--transport=rsync` is rejected
+  before any work begins.
+- Native rsync-wire fallback uses the local codec and a remote reference receiver without requiring a
+  local rsync executable. Unsupported guarantees and mapped options are rejected before mutation.
+- Verification: the remote integration suite covers missing-native fallback, authentication and
+  host-key non-fallback, protocol failure non-fallback, shell quoting, unsupported-option rejection,
+  nonzero receiver exit, final transport JSON, and rsync correctness. Full workspace verification
+  currently passes 166 tests with one intentional stress test ignored; strict Clippy passes.
+
+**Known limitation (not an Epic 1 blocker):** rsync fallback is currently local-to-remote only;
+remote-to-local remains explicitly unsupported until the sender dialect is implemented and tested.
+
 ---
 
 ## Epic 1 — Implementation Report
 
-Epics 1.1–1.3 delivered a clean cargo workspace, a full clap CLI surface, and rsync-compatible path parsing. All AC met; clippy clean; no work performed yet beyond validation.
+Epic 1 delivered the cargo workspace, complete CLI surface, rsync-compatible path parsing, and
+transport selection/fallback UX. All four stories meet their stated AC; the only documented
+limitation is rsync fallback's remote-to-local direction.
 
 **Layout**
 - Root `Cargo.toml`: workspace (`resolver 2`, members `crates/xsync`, `crates/xsync-core`), shared `[workspace.package]` (edition 2021, rust-version 1.88), `[workspace.lints]` (`unsafe_code = deny`, clippy `all`+`pedantic` warn), release profile `lto`+`codegen-units=1`+`strip`.
@@ -305,19 +387,67 @@ Epics 1.1–1.3 delivered a clean cargo workspace, a full clap CLI surface, and 
 - `crates/xsync` — binary. clap-derived `Cli` (struct); `run()` parses SRC/DEST and rejects remote→remote; returns `ExitCode` on error. Deps: `clap`, `xsync-core`.
 
 **What works**
-- `cargo build` / `cargo test` clean on a fresh checkout; 16 tests pass (4 CLI + 12 core).
+- `cargo build` / `cargo test` pass in the current workspace; the latest full run passed 166 tests
+  with one intentional 100k-entry scanner stress test ignored, and strict Clippy is clean.
 - `cargo run -- --help` documents every flag; hidden `--server` present but not shown.
 - Unknown flag, missing SRC/DEST, and out-of-range `--streams`/`--compress-level` → exit 2 with a one-line clap error (no panic); remote→remote → exit 1 with `xsync: remote-to-remote sync is not supported in v1`.
 - Path parsing handles `dir`, `dir/`, `host:dir`, `user@host:dir/`, `./relative`, single-file source, and Windows drive letters (`C:\Users\x`, `C:/Users/x`) — never misread as hosts.
 - Release binary: single Mach-O arm64 executable (~600 KB), no runtime asset dependencies.
+- `--transport=auto|xsync|rsync` selects a capability-described backend before mutation. Auto falls
+  back only for a positively identified missing remote xsync executable; explicit modes never
+  silently switch backends. Human and JSON output include transport, implementation, wire version,
+  mapped options, and unavailable guarantees.
+- The native rsync sender speaks the selected whole-file receiver dialect without requiring a local
+  rsync executable. Its unsupported options and guarantees fail before remote mutation.
 
-**Deferred to Epic 2 (per Story 1.3 AC)**
-- Output-tree trailing-slash semantics: `xsync a b` → `b/a/...` vs `xsync a/ b` → `b/...` are captured in `PathSpec.trailing_slash`; the observable tree result is verified in Epic 2's integration tests.
+**Verified beyond the parser (per Story 1.3 AC)**
+- Output-tree trailing-slash semantics: `xsync a b` → `b/a/...` vs `xsync a/ b` → `b/...` are
+  captured in `PathSpec.trailing_slash` and verified by the local and remote integration suites.
 
 **Interface for Epic 2**
 - `PathSpec { is_remote(), host(), path, trailing_slash }` and `xsync_core::path::{parse, validate_pair}` are the entry points the local engine's scanner → planner → transfer should consume.
 
 ---
+
+## Epic 1 plain-English summary and next steps
+
+Epic 1 turned the project foundation into a usable command-line shape. We established the Cargo
+workspace, built the `xsync` command, documented the rsync-style options, and made path handling
+understand local paths, remote paths, trailing slashes, and Windows drive letters.
+
+We also added transport selection. By default, xsync tries its native receiver first and only uses
+the rsync-protocol fallback when the remote xsync executable is positively unavailable. Explicit
+transport choices are respected, failures such as authentication or protocol errors do not trigger
+fallback, and human-readable plus JSON output describe the selected transport and its guarantees.
+
+The remaining limitation is intentional: rsync fallback currently supports local-to-remote
+transfers. Remote-to-local fallback waits for the sender-side rsync dialect work in a later story.
+
+Next steps are to build the local synchronization engine: scan the source, compare it with the
+destination, plan the required changes, transfer files safely, verify the results, and preserve
+rsync-compatible path and trailing-slash behavior. Later work will then wrap that engine in the
+native remote protocol and complete the remaining fallback direction.
+
+---
+
+## Benchmark and tuning work in plain English
+
+We also bootstrapped a repeatable way to measure xsync against rsync. The benchmark tools can
+create or use content-pinned corpora, run the same workload several times, verify the destination
+independently, and record timing, CPU, memory, wire-byte, and phase information. This gives us a
+trusted baseline instead of relying on one-off timings or synthetic files that do not resemble the
+real project data.
+
+The first real-corpus tuning pass tested a smaller read buffer for small files. The change is safe
+and covered by unit tests, but it did not solve the main performance gap: on the Congress corpus,
+xsync's median wall time was 6.724 seconds versus 3.123 seconds for rsync. The destination was
+correct in every repetition, so this is a performance finding rather than a correctness failure.
+
+The next steps are to capture syscall-level evidence on a host where tracing is permitted, then
+measure and implement the remaining per-file optimizations (including clone eligibility and hash
+work) one at a time. The current macOS environment blocks `dtruss` and `fs_usage` without root,
+and the target performance budget is not yet met; those are recorded as tuning blockers rather
+than hidden assumptions.
 
 ## Epic 2 — Local sync engine (scan → plan → transfer → verify)
 
@@ -343,7 +473,7 @@ names, and the 100k stress test proves bounded queueing but records no performan
 memory. Story 2.1b supersedes those parts before protocol freeze.
 
 ### Story 2.1b — Reversible wire paths and stable source fingerprints
-- [ ] Replace the string-only relative path with a reversible component representation and extend
+- [~] Replace the string-only relative path with a reversible component representation and extend
   scanned metadata with the source identity needed for stable reads and cache validation.
 
 **AC**
@@ -358,6 +488,17 @@ memory. Story 2.1b supersedes those parts before protocol freeze.
   mtime, ctime/change-time where available, and kind.
 - Symlink targets use the same reversible platform representation and are never followed during
   discovery.
+
+**Progress:** Source fingerprints, raw-byte protocol fields, rsync fallback path handling, traversal
+rejection, and Unix invalid-byte manifest coverage are implemented. The downstream planner, source
+reader, sink, journal, and native protocol already carry the fingerprint needed for stable reads and
+resume identity.
+
+**Blocker:** The scanner and planner still expose relative paths as UTF-8 `String` values and reject
+invalid Unix names before native xsync framing. Completing this story requires a coordinated
+`WirePath`/component representation through scanner → planner → protocol → sink, plus Windows-specific
+encoding and case/Unicode-normalization collision tests. No user action is required; this is the
+next implementation task before the protocol representation is frozen.
 
 ### Story 2.2 — Planner / diff classification
 - [x] Given source entries and a destination index, classify: new / changed (size or mtime differs) / unchanged / extraneous. Collect dirs and symlinks separately.
@@ -562,6 +703,20 @@ chunk-level resume across process loss; that is Story 3.4.
 - Tests cover atomic stages, absent-target eligibility, clone capability fallback, copy-on-write
   independence, paranoid tree/file verification, exclusion decomposition, and complete workspace
   behavior. The existing APFS/Linux clone spike remains the platform-specific benchmark oracle.
+
+## Epic 2 status in plain English
+
+Epic 2 now has a working local synchronization engine: it scans trees, compares source and
+destination state, plans bounded work, reads changing files safely, writes through verified temporary
+files, publishes atomically, preserves metadata and symlinks, and reports partial failures without
+losing unrelated work. It also supports batching, large-file striping, local clone/reflink fast
+paths, and a complete local-to-local command path.
+
+The remaining blocker is Story 2.1b. Native xsync still needs a reversible raw path representation
+through its scanner and planner before invalid Unix filenames and platform-specific Windows path
+cases can be guaranteed end-to-end. All other Epic 2 stories are complete and the existing tests
+continue to pass; implementation can proceed to the next epic while Story 2.1b is resolved before
+the protocol representation is frozen.
 
 ---
 
@@ -910,7 +1065,7 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   whole-file-only v1 decision. Verification: documentation-only Story 4.4; codec work remains 4.5.
 
 ### Story 4.5 — Native `RsyncTransport` receiver fallback
-- [ ] Implement the selected rsync receiver protocol locally and launch remote
+- [x] Implement the selected rsync receiver protocol locally and launch remote
   `rsync --server` over SSH when Story 1.4 selects the fallback for local→remote transfer.
 
 **AC**
@@ -946,33 +1101,113 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
 - Remote→local fallback remains unsupported until the rsync sender dialect passes an equivalent
   compatibility suite; the error points to installing xsync remotely or the tracked sender work.
 
+**Results**
+- Implemented a native GNU protocol-32 whole-file sender. It negotiates compatibility flags and
+  MD5, uses modern varint file lists and generator indexes, multiplexed I/O, itemized requests,
+  literal tokens, MD5 verification, and the protocol-31+ clean goodbye sequence. No local rsync
+  executable is launched.
+- `--transport=auto` falls back only for typed remote `xsync` command-unavailable diagnostics;
+  authentication, host-key, malformed-native, version, receiver, and post-mutation failures are
+  terminal. Explicit `rsync` validates its GNU protocol-32 peer before scanning or mutation.
+- The fallback supports regular files, nested/empty directories, symlinks, modes, mtimes,
+  trailing-slash semantics, unchanged skipping, type replacement, raw Unix names, hostile paths,
+  and shell-safe remote command construction. Unsupported guarantees are rejected before probe or
+  mutation with precise diagnostics.
+- Final human/JSON output reports the selected transport, peer/version, protocol, checksum,
+  mapped options, unavailable guarantees, selection reason, logical bytes, and observable wire
+  bytes. Verification: workspace tests pass, 20 remote integration tests pass, strict workspace
+  clippy passes, and the native codec was exercised against GNU rsync 3.4.4 on Mars.
+
+**Remaining**
+- Add a dedicated rsync-wire fuzz target covering varints, file-list entries, index deltas, and
+  multiplex frames; the current bounded unit tests do not replace sustained fuzzing.
+- Exercise interrupt, permission-denied, disk-full, malformed-frame, and receiver-crash cases
+  against real remote processes, including cleanup verification for rsync partial files.
+- Keep Apple protocol-29 and OpenBSD protocol-27 receiver support gated until each has an
+  equivalent compatibility suite. Remote→local rsync fallback remains intentionally unsupported.
+- Implementing delta transfer, compression, `--delete`, arbitrary excludes, ownership, ACLs,
+  xattrs, hardlinks, and durable xsync resume requires separate feature work rather than being
+  silently added to this fallback.
+
+**Freya validation:**
+- 2026-08-23: `sanjee@freya.local` resolved and connected successfully. The remote reported GNU
+  rsync `3.5.0-g471e17dc`, protocol 32, with no remote `xsync` executable. A release binary run
+  with explicit `--transport=rsync` and a second run with `--transport=auto` both copied a mixed
+  fixture containing binary data, spaces, shell-like text, and a Unicode filename. Local and
+  remote SHA-256 digests matched for all three files in both destinations. Temporary fixtures were
+  removed after verification.
+- A real permission-denied probe targeting an explicit root-owned destination returned exit 1 with
+  the receiver’s permission diagnostic and did not report success. Controlled Freya `/tmp` probes
+  also covered a receiver write limit (rsync code 11, no final file), malformed native protocol
+  bytes (client exit 1), and a POSIX-shell receiver crash (client exit 1, no final file). The
+  interruption probe completed before the signal could land because the transfer was too fast;
+  it remains open as a genuine mid-transfer test. All temporary fixtures were removed, and no
+  path under `/mnt` was accessed.
+
 ---
 
 ## Epic 5 — Feature flags
 
 ### Story 5.1 — `--delete`
-- [ ] After a fully successful transfer, remove dest files/dirs absent from source, files first then dirs deepest-first. Excluded paths are never deleted.
+- [~] After a fully successful transfer, remove dest files/dirs absent from source, files first then dirs deepest-first. Excluded paths are never deleted.
 
 **AC**
 - Extraneous dest files and empty extraneous dirs are removed; a failed transfer skips the delete phase entirely (with a warning).
 - `--delete` with `--dry-run` lists would-be deletions without touching anything.
 
+**Results:**
+- Local transfers already defer deletion until all file, symlink, and directory work succeeds;
+  files/symlinks/other entries and then directories are removed deepest-first. Excluded destination
+  entries are omitted from the planning index, so they cannot be deleted.
+- The native remote sink has the same success gate and ordering, and its delete operations are
+  represented by `LocalEvent::Deleted`.
+- Remaining work: remote dry-run/exclude policy is not yet negotiated in the wire `SessionConfig`,
+  and failed remote delete operations need a dedicated warning summary rather than only a partial
+  result.
+
+**Progress update:** `SessionConfig` now carries dry-run and bounded exclude policy; native remote
+push/pull planning filters excluded destination entries, and remote dry-runs do not send mutation
+frames. The remaining delete warning-summary work is still open.
+
 ### Story 5.2 — `--exclude`
-- [ ] Repeatable glob patterns applied to both source scan and dest scan (excluded dest files are invisible to `--delete`).
+- [~] Repeatable glob patterns applied to both source scan and dest scan (excluded dest files are invisible to `--delete`).
 
 **AC**
 - `--exclude target --exclude '*.log'` skips matches at any depth (rsync-style matching against the relative path).
 - Unit tests cover: name match, glob match, directory prune (children of an excluded dir are never scanned).
 
+**Results:**
+- Local planning accepts repeatable `globset` patterns, matches relative paths and ancestor
+  directories, filters both source and destination entries, and disables the whole-tree clone
+  fast path when exclusions are present.
+- Remaining work: scanning currently materializes the walk before filtering, so excluded-directory
+  children are not physically pruned; the remote protocol still needs to carry and apply patterns
+  on both endpoints, including raw-path-safe pattern encoding.
+
+**Progress update:** patterns are now encoded as bounded raw byte blobs in `SessionConfig` and
+applied to native remote source and destination planning. Physical directory-prune optimization and
+rsync fallback parity remain open.
+
 ### Story 5.3 — `--dry-run`
-- [ ] Full scan + classification, zero writes; prints per-action lines (create/update/delete) and the summary that a real run would produce.
+- [~] Full scan + classification, zero writes; prints per-action lines (create/update/delete) and the summary that a real run would produce.
 
 **AC**
 - Dest tree is bit-identical before/after a dry run (including mtimes).
 - Summary counts match what a subsequent real run actually performs.
 
+**Results:**
+- Local dry runs complete scanning and planning without opening a mutating sink operation or using
+  the clone fast path. They now emit explicit create/update/delete action events plus the planned
+  file/byte totals; the destination remains untouched.
+- Remaining work: remote dry-run must be represented in `SessionConfig` and enforced before the
+  remote sink can mutate; action events also need to be emitted by the remote and rsync backends.
+
+**Progress update:** native remote dry-runs now carry the policy through the handshake, emit the
+same planned action events, and reject unexpected mutation frames before sink operations. The rsync
+fallback still needs equivalent action output.
+
 ### Story 5.4 — `--checksum` + hash cache
-- [ ] Classification by BLAKE3 content hash instead of size+mtime; both sides consult a versioned
+- [~] Classification by BLAKE3 content hash instead of size+mtime; both sides consult a versioned
   redb cache keyed by stable filesystem identity, size, precise mtime, and ctime/change-time where
   available. Misses populate the cache only after a stable read.
 
@@ -986,15 +1221,36 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   return a hash belonging to a different stable fingerprint.
 - The persistent hash cache is separate from Story 2.2b's disposable destination index.
 
+**Results:**
+- Local `--checksum` now reclassifies metadata-only regular-file changes by comparing BLAKE3
+  content, so an mtime-only touch is skipped while changed bytes still transfer. The CLI option is
+  wired into local options and the ordinary metadata planner remains unchanged when it is absent.
+- Remaining work: persistent versioned `redb` cache, stable file identity/ctime keys, cache repair
+  and concurrency guarantees, and remote-side checksum negotiation are still outstanding. Current
+  local checksum classification reads both file contents on every changed candidate.
+
+**Progress update:** added a versioned `redb` cache keyed by device/file identity, size, precise
+mtime, and ctime where available. Cache failures fall back to a stable read, and tests cover
+round-trip plus fingerprint invalidation. Remote checksum negotiation and explicit hit/miss event
+counters remain open.
+
 ### Story 5.5 — `--paranoid`
-- [ ] After rename, re-read every written file from destination disk and verify BLAKE3 (huge files verified per-chunk against the recorded chunk hashes).
+- [~] After rename, re-read every written file from destination disk and verify BLAKE3 (huge files verified per-chunk against the recorded chunk hashes).
 
 **AC**
 - Normal run: no post-rename reads. Paranoid run: every transferred file re-read and verified; mismatch → retransmit once, then failure.
 - Works in push (server re-reads), pull (client re-reads), and local modes.
 
+**Results:**
+- Local clone paths already verify staged and published names; byte-copy paths now perform a
+  destination readback after publication and retry once before returning failure. Native push/pull
+  paths retain their existing staged/chunk verification and paranoid readback behavior.
+- Remaining work: striped multi-stream whole-file verification still lacks a complete final digest
+  readback contract, and the rsync fallback must continue to reject `--paranoid` until it can offer
+  the same guarantee.
+
 ### Story 5.6 — `--progress-json`
-- [ ] Machine-readable JSONL event stream on stdout (scan progress, plan totals, per-file start/progress/done, total progress, warnings, final stats); progress bars suppressed.
+- [~] Machine-readable JSONL event stream on stdout (scan progress, plan totals, per-file start/progress/done, total progress, warnings, final stats); progress bars suppressed.
 
 **AC**
 - Every line is valid JSON with a `type` and schema version; a GUI can compute both bars from the
@@ -1005,8 +1261,20 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
 - Event schema documented in the README; final `done` event contains the full stats summary.
 - Unknown future event fields are ignorable; breaking changes require a schema-version change.
 
+**Results:**
+- JSONL output now adds `type` and `schema_version: 1` to every emitted event while retaining the
+  stable event-specific fields, and dry-run action events are available to consumers. Human output
+  remains suppressed when `--progress-json` is selected.
+- Existing final events expose transfer, worker/stream, clone, wire/logical, resume, transport,
+  and guarantee fields. Remaining work: phase-duration/queue-high-water/compression decision fields
+  are not yet uniformly emitted by every backend, and the schema needs a checked-in README section.
+
+**Progress update:** cloud inventory events and remote dry-run action events now use the same JSONL
+  schema. The checked-in schema reference is `docs/progress-json-v1.md`; complete phase timing
+  fields remain open.
+
 ### Story 5.7 — Cloud-placeholder materialization policy
-- [ ] Detect platform cloud/dataless placeholders where possible and make their materialization
+- [~] Detect platform cloud/dataless placeholders where possible and make their materialization
   visible and controllable instead of accidentally downloading a very large tree.
 
 **AC**
@@ -1018,12 +1286,21 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   portable capability interface. Unsupported platforms report the policy as unavailable rather
   than pretending detection occurred.
 
+**Results:**
+- Added `--cloud-files=download|skip|error` and a capability-gated `CloudPlaceholders` event that
+  reports placeholder counts, logical bytes, and detector availability before planning. The default
+  remains correctness-preserving download behavior; non-macOS `skip`/`error` requests fail before
+  mutation instead of silently acting as download.
+- Remaining work: implement the macOS placeholder detector/materialization classification, skip
+  accounting and delete protection, and platform-isolated fixtures. The current macOS capability
+  flag is deliberately conservative and reports zero until the native detector is implemented.
+
 ---
 
 ## Epic 6 — Compression
 
 ### Story 6.1 — zstd with skip heuristic
-- [ ] Data payloads use zstd level 3 when the Story 0.5 sampling decision predicts a ratio below
+- [x] Data payloads use zstd level 3 when the Story 0.5 sampling decision predicts a ratio below
   0.95; per-frame metadata records encoding plus bounded uncompressed length. `--no-compress` and
   `--compress-level` override.
 
@@ -1038,18 +1315,57 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
 - Decoder rejects output larger than the declared uncompressed length, protocol data limit, or
   remaining file range before allocating/writing it.
 
+**Progress**
+- Added the bounded compression sampler and wired it into protocol frame encoding. It selects the
+  64 KiB/256 KiB/1 MiB matrix bucket from actual payload size, handles short and heterogeneous
+  inputs, and skips zstd unless the sampled ratio is below 0.95. Existing bounded decompression
+  and declared-length checks remain in force.
+- Native push data frames and multi-stream range frames now use the adaptive decision, honor
+  `--no-compress`, and honor the requested zstd level. Control and metadata frames remain raw.
+
+**Remaining**
+- None for the Story 6.1 acceptance criteria. Future compression work can optimize allocation
+  reuse, but the current sampler is bounded and the transfer paths are covered end to end.
+
 ---
 
 ## Epic 7 — Progress UI
 
 ### Story 7.1 — Two-bar terminal UI
-- [ ] indicatif MultiProgress: one total bar (bytes + file counts, "scanning…" state until discovery completes, then firm totals + ETA); per-stream lines showing a per-file bar for active medium/huge files or `current-file  N files (K/s)` in batch mode. `-q` silences everything except errors; non-TTY output degrades to plain periodic status lines.
+- [~] Terminal progress renderer: one monotonic total status line (bytes + file counts,
+  "scanning…" until discovery completes, then rate), concise transfer summary, quiet/error-only
+  mode, and plain periodic non-TTY output. JSONL remains machine-readable and suppresses terminal
+  rendering. The renderer is dependency-free rather than using `indicatif`, which keeps the remote
+  server binary and release artifact small.
 
 **AC**
 - Total bar is always present and monotonic; it grows while scanning and never jumps backwards.
 - Large-file transfer shows a smooth per-file bar; small-file storm shows files/sec without flicker or thousands of bar lines.
 - Final summary: files transferred/skipped/deleted/failed, bytes, wire bytes, elapsed, throughput, verification status — under 10 lines, nothing like `rsync -P` spew.
 - Piping stdout to a file produces no ANSI garbage.
+
+**Results:**
+- Added a stateful renderer in `crates/xsync/src/main.rs`. Discovery begins with a visible
+  `scanning…` state; planned totals become fixed once emitted; transferred bytes are accumulated
+  with saturating arithmetic so the displayed total cannot move backwards. TTY output uses one
+  carriage-return line with ANSI clearing, while redirected output emits at most one plain status
+  line every 250 ms and never emits ANSI sequences or one line per file.
+- Per-file transfer events are intentionally coalesced into the aggregate line for small-file
+  storms. JSONL and `--quiet` paths bypass the renderer, preserving the existing event contract and
+  error-only behavior. The existing final summary retains logical, physical, wire, failure, and
+  resume counters.
+- Added `indicatif::MultiProgress` for terminal-only scanning and total bars, while retaining
+  throttled plain output for redirected stdout. The final human output now includes elapsed time,
+  throughput, and verification status.
+- Added bounded `Progress` events for native large-file push/pull ranges. Terminal rendering uses
+  `MultiProgress` child bars keyed by stream and path, while small files remain aggregate-only.
+- Local worker completions and multi-stream range groups now forward the same progress event, so
+  every transfer route can drive the child-bar renderer without changing JSON or quiet semantics.
+- The multi-stream worker channel still coalesces updates at the range-group boundary; finer live
+  updates would require a dedicated bounded cross-thread progress channel.
+- Verification: formatting check, strict workspace Clippy, `cargo test --workspace --all-targets`,
+  and `cargo build --workspace --release` all pass after the renderer change. A redirected-output
+  smoke run produced no ANSI or carriage-return bytes.
 
 ---
 
@@ -1059,8 +1375,78 @@ Epic 0 creates the harness early. Epic 8 runs the completed product matrix, free
 defaults, and publishes only claims the reports support.
 
 ### Story 8.1 — Release benchmark matrix and regression gates
-- [ ] Run the Epic 0 harness against the release candidate over local same-volume/cross-volume,
+- [~] Run the Epic 0 harness against the release candidate over local same-volume/cross-volume,
   PipeTransport, and real SSH for every required corpus and change shape.
+
+**Progress**
+- Added [`benches/scripts/release-bench.py`](benches/scripts/release-bench.py), the first runner
+  producing *gate-able* release evidence: a same-run `rsync -a` baseline per cell, rotated method
+  order from `xsync-bench schedule`, per-invocation wall/CPU/peak-RSS from `os.wait4` rusage, an
+  independent manifest-oracle verification after every run, and an `xsync.bench.input.v1` document
+  rendered through `xsync-bench report`. Rows exceeding the 15% MAD/median policy are marked `noisy`
+  and excluded from gate-able evidence. The earlier `release-matrix.py` had no baseline, no
+  rotation, no CPU, RSS always zero, and a private schema the gate cannot consume.
+- Executed 38 cells over four routes at smoke tier, five repetitions: same-volume, cross-volume
+  (APFS/external NVMe), PipeTransport, and real SSH to `mars.local` (Arch Linux, ext4/NVMe, GNU
+  rsync 3.4.4/protocol 32), comparing `xsync`, `rsync -a`, `rsync -az`, `xsync --no-compress`, and
+  production `xsync --transport rsync`. **38/38 cells now pass the oracle.** Pre-fix evidence,
+  current results, raw per-repetition inputs, and the decision record are checked in under
+  [`benches/results/story-8.1/`](benches/results/story-8.1/DECISION.md).
+- **Blocker 1 fixed — stale mtime on unchanged directories.** `finish_directories` in
+  `crates/xsync-core/src/local.rs` iterated only `directories.new`/`changed`; a directory
+  classified `unchanged` still has its mtime bumped when a child is rewritten inside it. The fix
+  restores only directories actually mutated (parents of written/created/deleted entries) rather
+  than sweeping every unchanged directory, which would have cost the 1.98x no-op win. Regression
+  test `local::tests::rewriting_a_file_restores_its_unchanged_parent_directory_mtime` fails without
+  the fix.
+- **Blocker 2 fixed — small-file batching and ack pipelining.** `Message::FileBatch` carried one
+  entry and the client blocked for an `Ack` after both the batch and segment frames, costing two
+  serialized round trips per file; the negotiated 32 MiB window was unused and `strategy.rs`
+  already implemented the coalescing plan.md specifies. Push and pull now coalesce small files into
+  one metadata frame per batch and write without stopping for each ack, draining replies on a
+  bounded `MAX_PIPELINED_FRAMES = 256` window sized so the peer's pending acks stay near 10 KiB and
+  cannot deadlock against a full channel buffer. The four metadata loops are pipelined the same way.
+  **deep-small over SSH: 8.731 s → 0.343 s (25.5x faster), ratio 0.091 → 0.873.** xsync is now at or
+  above parity with `rsync -a` on four of five SSH cells; pipe `mixed/initial-copy` 0.914 → 1.014 and
+  `deep-small` 0.697 → 0.903.
+- This matches `~/projects/f2/BENCHMARKS.md` §6 independently: a per-file round-trip protocol at
+  47 files/s against 6,007 for one framed stream — framing worth 20–80x, parallel streams only
+  1.0–1.6x on top. Stream count is a tunable, not an architecture concern; Story 4.2's multi-stream
+  work was never where the headline win lived.
+- **Two further correctness bugs found and fixed**: the push client created only
+  `plan.directories.new`, so a source directory whose destination holds a file (classified
+  `changed`) was silently skipped and `mixed/type-replacement` failed the oracle; and the Blocker 1
+  fix initially missed that a type-replaced directory lands in `changed`, leaving its parent stale.
+- **Fixed — `--checksum` was 63x slower than `rsync -ac` locally.** `HashCache::hash_file`
+  opened and committed a separate redb write transaction per cache miss, and redb commits
+  durably by default, so every insert cost an fsync (4.31 s wall against 0.29 s CPU, ~9 ms/file).
+  The durability default was inherited rather than chosen — `Durability` appears nowhere else in
+  the codebase and "durable" is used only for the resume journal, which genuinely needs it.
+  Digests are now buffered and committed in batches (once per run under 4,096 files, and on drop)
+  at `Durability::Eventual`; `Durability::None` is deliberately avoided because redb only frees
+  pages above that level and would grow the cache file without bound. The per-file 1 MiB read
+  buffer is now sized from the fingerprint the caller already holds, removing both the allocation
+  and an extra `stat`. **Measured over 11 repetitions with both methods inside the noise policy:
+  4.0888 s → 0.2146 s, 19x faster, paired ratio 0.016 → 0.487.** A warm second run completes in
+  0.11 s. Regression test `hash_cache::tests::buffered_digests_survive_drop_and_reopen` fails if
+  the flush on drop regresses. The residual ~2x against rsync is no longer anomalous — it matches
+  xsync's ordinary local per-file overhead and is owned by TUNING-TASKS Epic T1. Evidence in
+  [`benches/results/story-8.1/checksum-fix/`](benches/results/story-8.1/checksum-fix/).
+  Cross-volume was not re-measured: `/Volumes/XSYNC_BENCH` was unmounted during the re-run.
+- **Open — content verification is a tautology without `--paranoid`.** `run_sink` verifies small and
+  medium files against a BLAKE3 hash it computes from the received buffer, so only the declared
+  length is genuinely checked end to end. The sender's real digest (`StableRead.blake3`) reaches the
+  receiver only via `LargeFileFinish`, and `finish_large` compares it only under `--paranoid`.
+  `EntryRecord.fingerprint` carries device/inode identity for resume and `--checksum`, so closing
+  this likely needs a protocol version bump.
+- Remaining local loss is many-small-files, now CPU-bound rather than round-trip bound: deep-small
+  same-volume 0.578 with 2.46 s CPU against rsync's 0.23 s (10.6x). Separate profiling problem.
+- Still outstanding: regression/full tiers (now schedulable since the SSH path is no longer the
+  bottleneck); `mixed` over SSH (macOS stores symlink permission bits, Linux forces 0777 — `rsync -a`
+  fails the identical oracle, confirming a platform limit); `freya.local` (rsync 3.5.0) as a second
+  reference receiver, which has no Rust toolchain; the optional `tar` row; and nominating one report
+  as the checked-in `xsync-bench gate` baseline. Testing against the live `Docker.raw` VM image is
+  explicitly deferred to v3; it remains source-only and is not part of the v1/v2 release matrix.
 
 **AC**
 - One command regenerates or validates pinned corpora and emits JSON/Markdown tables by tool,
@@ -1131,3 +1517,10 @@ defaults, and publishes only claims the reports support.
 - **More fidelity**: hardlinks, xattrs/ACLs, sparse files, ownership (uid/gid), dir mtime edge cases, `--delete-excluded`.
 - **Perf**: io_uring reads/writes on Linux, adaptive zstd leveling, platform no-cache hints that pass
   cache-pressure gates, native daemon transport, and remote→remote.
+
+## v3 backlog
+
+- **Docker VM corpus testing**: resume the live `Docker.raw` sparse-image benchmark only after a
+  dedicated safety review, explicit Docker-stop checks, a sparse-aware transfer implementation,
+  allocated-byte accounting, and a destination with sufficient capacity. The live image is never
+  used as a destination and is excluded from all v1/v2 benchmark claims.

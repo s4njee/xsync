@@ -131,8 +131,13 @@ fn input() -> ReportInput {
         actual_manifest_digest: digest.clone(),
         item_count: 10,
         logical_bytes: 100,
+        allocated_bytes: 100,
         mismatch_count: 0,
         mismatches: Vec::new(),
+        mode: "full".to_owned(),
+        sample_fraction: None,
+        sample_seed: None,
+        hashed_file_count: 1,
     };
     let sample = |repetition: u32, method_order: u32, wall_seconds: f64| Sample {
         repetition,
@@ -142,8 +147,12 @@ fn input() -> ReportInput {
         peak_rss_bytes: 1024,
         item_count: 10,
         logical_bytes: 100,
+        source_allocated_bytes: 100,
+        destination_allocated_bytes: 100,
         wire_bytes: 80,
         phases_seconds: BTreeMap::from([("transfer".to_owned(), wall_seconds)]),
+        seed_destination_seconds: 0.0,
+        verify_oracle_seconds: 0.0,
         cache_state: if repetition == 0 {
             CacheState::FirstPass
         } else {
@@ -151,6 +160,8 @@ fn input() -> ReportInput {
         },
         cache_eviction_method: None,
         oracle: verification.clone(),
+        source_manifest_digest: None,
+        mutation_selection: Vec::new(),
     };
     ReportInput {
         schema: REPORT_INPUT_SCHEMA.to_owned(),
@@ -166,6 +177,7 @@ fn input() -> ReportInput {
             filesystem: "test-fs".to_owned(),
             transport: "local".to_owned(),
             route: "local".to_owned(),
+            shaping: "none".to_owned(),
         },
         session: SessionConfig {
             streams: 1,

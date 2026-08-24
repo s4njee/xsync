@@ -40,6 +40,18 @@ impl PathSpec {
             Location::Local => None,
         }
     }
+
+    /// SSH authority including an optional user (`user@host`).
+    #[must_use]
+    pub fn authority(&self) -> Option<String> {
+        match &self.location {
+            Location::Remote { user, host } => Some(
+                user.as_ref()
+                    .map_or_else(|| host.clone(), |user| format!("{user}@{host}")),
+            ),
+            Location::Local => None,
+        }
+    }
 }
 
 /// Errors produced when parsing or validating path specifications.

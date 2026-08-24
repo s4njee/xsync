@@ -225,7 +225,8 @@ impl SourceReader {
 
         let mut hasher = blake3::Hasher::new();
         let mut bytes = Vec::new();
-        let mut buffer = vec![0u8; READ_BUFFER_BYTES];
+        let buffer_bytes = Self::read_buffer_capacity(entry.fingerprint.size);
+        let mut buffer = vec![0u8; buffer_bytes];
         loop {
             let read = (&file).read(&mut buffer).map_err(|source| {
                 AttemptFailure::Io(SourceReadError::Read {
@@ -263,6 +264,12 @@ impl SourceReader {
             return Err(AttemptFailure::Changed);
         }
         Ok((bytes, hasher.finalize()))
+    }
+
+    fn read_buffer_capacity(file_size: u64) -> usize {
+        usize::try_from(file_size)
+            .unwrap_or(READ_BUFFER_BYTES)
+            .clamp(1, READ_BUFFER_BYTES)
     }
 
     fn refresh_entry(path: &Path, previous: &FileEntry) -> Result<RefreshResult, SourceReadError> {
@@ -437,6 +444,24 @@ mod tests {
         assert_eq!(result.bytes, b"stable bytes");
         assert_eq!(result.blake3, blake3::hash(b"stable bytes"));
         assert_eq!(result.attempts, 1);
+    }
+
+    #[test]
+    fn read_buffer_is_bounded_by_file_size() {
+        assert_eq!(SourceReader::read_buffer_capacity(0), 1);
+        assert_eq!(SourceReader::read_buffer_capacity(1), 1);
+        assert_eq!(
+            SourceReader::read_buffer_capacity(READ_BUFFER_BYTES as u64 / 2),
+            READ_BUFFER_BYTES / 2
+        );
+        assert_eq!(
+            SourceReader::read_buffer_capacity(READ_BUFFER_BYTES as u64),
+            READ_BUFFER_BYTES
+        );
+        assert_eq!(
+            SourceReader::read_buffer_capacity(u64::MAX),
+            READ_BUFFER_BYTES
+        );
     }
 
     #[test]

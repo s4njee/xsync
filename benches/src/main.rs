@@ -9,7 +9,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use xsync_bench::corpus::{create_corpus, CorpusClass, CorpusRequest, Tier, Workload};
 use xsync_bench::gate::evaluate_gate;
-use xsync_bench::manifest::{build_manifest, verify_manifest, Manifest};
+use xsync_bench::manifest::{build_manifest, verify_manifest, verify_manifest_sampled, Manifest};
 use xsync_bench::report::{rotated_schedule, Report, ReportInput};
 use xsync_bench::scratch::{clean_owned, OwnedScratch};
 
@@ -62,6 +62,12 @@ enum Command {
         manifest: PathBuf,
         #[arg(long)]
         json: Option<PathBuf>,
+        /// Fraction of regular-file contents to hash; metadata is always checked.
+        #[arg(long)]
+        sample: Option<f64>,
+        /// Seed for deterministic sampled content selection.
+        #[arg(long, default_value_t = 0)]
+        sample_seed: u64,
     },
     /// Validate raw samples and emit versioned JSON plus Markdown.
     Report {
@@ -148,7 +154,9 @@ fn run(cli: Cli) -> Result<bool, CliError> {
             root,
             manifest,
             json,
-        } => verify_tree(&root, &manifest, json.as_deref()),
+            sample,
+            sample_seed,
+        } => verify_tree(&root, &manifest, json.as_deref(), sample, sample_seed),
         Command::Report {
             input,
             json,
@@ -208,9 +216,18 @@ fn create_and_print_corpus(base: &Path, request: &CorpusRequest) -> Result<bool,
     Ok(true)
 }
 
-fn verify_tree(root: &Path, manifest: &Path, json: Option<&Path>) -> Result<bool, CliError> {
+fn verify_tree(
+    root: &Path,
+    manifest: &Path,
+    json: Option<&Path>,
+    sample: Option<f64>,
+    sample_seed: u64,
+) -> Result<bool, CliError> {
     let expected: Manifest = read_json(manifest)?;
-    let verification = verify_manifest(root, &expected)?;
+    let verification = match sample {
+        Some(fraction) => verify_manifest_sampled(root, &expected, fraction, sample_seed)?,
+        None => verify_manifest(root, &expected)?,
+    };
     if let Some(path) = json {
         write_json(path, &verification)?;
     }

@@ -66,7 +66,10 @@ enum BenchError {
 struct Cli {
     #[arg(long, default_value_t = 5)]
     repetitions: usize,
-    #[arg(long, default_value = "benches/results/story-4.3/stripe-crossover.json")]
+    #[arg(
+        long,
+        default_value = "benches/results/story-4.3/stripe-crossover.json"
+    )]
     json: PathBuf,
     #[arg(long, default_value = "benches/results/story-4.3/stripe-crossover.md")]
     markdown: PathBuf,
@@ -104,13 +107,22 @@ fn main() -> Result<(), BenchError> {
             path: corpus.clone(),
             source,
         })?;
-        fs::write(corpus.join("big.bin"), vec![0x5A; (mib as usize) * 1024 * 1024])
-            .map_err(|source| BenchError::Scratch {
-                path: corpus.clone(),
-                source,
-            })?;
+        fs::write(
+            corpus.join("big.bin"),
+            vec![0x5A; (mib as usize) * 1024 * 1024],
+        )
+        .map_err(|source| BenchError::Scratch {
+            path: corpus.clone(),
+            source,
+        })?;
         for &streams in &STREAM_COUNTS {
-            results.push(measure(&scratch, format!("large-{mib}M").leak(), streams, &corpus, cli.repetitions)?);
+            results.push(measure(
+                &scratch,
+                format!("large-{mib}M").leak(),
+                streams,
+                &corpus,
+                cli.repetitions,
+            )?);
         }
     }
     // Many-small-files corpus.
@@ -120,14 +132,23 @@ fn main() -> Result<(), BenchError> {
         source,
     })?;
     for i in 0u32..400 {
-        fs::write(many.join(format!("f{i:03}.bin")), vec![0x33 + (i % 64) as u8; 4096])
-            .map_err(|source| BenchError::Scratch {
-                path: many.clone(),
-                source,
-            })?;
+        fs::write(
+            many.join(format!("f{i:03}.bin")),
+            vec![0x33 + (i % 64) as u8; 4096],
+        )
+        .map_err(|source| BenchError::Scratch {
+            path: many.clone(),
+            source,
+        })?;
     }
     for &streams in &STREAM_COUNTS {
-        results.push(measure(&scratch, "many-small".to_owned().leak(), streams, &many, cli.repetitions)?);
+        results.push(measure(
+            &scratch,
+            "many-small".to_owned().leak(),
+            streams,
+            &many,
+            cli.repetitions,
+        )?);
     }
 
     let report = Report {

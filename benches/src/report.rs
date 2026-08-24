@@ -30,6 +30,8 @@ pub struct Environment {
     pub filesystem: String,
     pub transport: String,
     pub route: String,
+    #[serde(default)]
+    pub shaping: String,
 }
 
 /// Transfer/session choices which affect results.
@@ -74,11 +76,29 @@ pub struct Sample {
     pub peak_rss_bytes: u64,
     pub item_count: u64,
     pub logical_bytes: u64,
+    /// Logical source allocation basis for this sample.
+    #[serde(default)]
+    pub source_allocated_bytes: u64,
+    /// Physical destination allocation measured by the independent oracle.
+    #[serde(default)]
+    pub destination_allocated_bytes: u64,
     pub wire_bytes: u64,
     pub phases_seconds: BTreeMap<String, f64>,
+    /// Time spent preparing the destination, outside the transfer phase budget.
+    #[serde(default)]
+    pub seed_destination_seconds: f64,
+    /// Time spent in the independent destination oracle, outside transfer timing.
+    #[serde(default)]
+    pub verify_oracle_seconds: f64,
     pub cache_state: CacheState,
     pub cache_eviction_method: Option<String>,
     pub oracle: Verification,
+    /// Source manifest digest observed for this repetition, when using a real corpus.
+    #[serde(default)]
+    pub source_manifest_digest: Option<String>,
+    /// Deterministic destination entries changed for a real-corpus mutation.
+    #[serde(default)]
+    pub mutation_selection: Vec<String>,
 }
 
 /// Raw measurements for one method/result.
@@ -122,6 +142,9 @@ pub struct BenchResult {
     pub peak_rss_bytes: u64,
     pub item_count: u64,
     pub logical_bytes: u64,
+    pub median_source_allocated_bytes: u64,
+    pub median_destination_allocated_bytes: u64,
+    pub allocated_throughput_bytes_per_second: f64,
     pub median_wire_bytes: u64,
     pub phase_medians_seconds: BTreeMap<String, f64>,
     pub paired_observations: Vec<PairedObservation>,
@@ -214,6 +237,11 @@ impl Report {
             .collect();
         let mut results = Vec::with_capacity(input.results.len());
         for result in &input.results {
+            let samples = result
+                .samples
+                .iter()
+                .map(sample_with_unaccounted_phase)
+                .collect::<Vec<_>>();
             let paired_observations = result
                 .baseline
                 .as_ref()
@@ -237,12 +265,23 @@ impl Report {
                 .iter()
                 .map(|sample| sample.wire_bytes)
                 .collect::<Vec<_>>();
+            let source_allocated = result
+                .samples
+                .iter()
+                .map(|sample| sample.source_allocated_bytes)
+                .collect::<Vec<_>>();
+            let destination_allocated = result
+                .samples
+                .iter()
+                .map(|sample| sample.destination_allocated_bytes)
+                .collect::<Vec<_>>();
             let wall_median = median_f64(&walls);
             let ratio_median = (!ratios.is_empty()).then(|| median_f64(&ratios));
+            let phase_medians_seconds = phase_medians(&samples);
             results.push(BenchResult {
                 name: result.name.clone(),
                 baseline: result.baseline.clone(),
-                samples: result.samples.clone(),
+                samples,
                 median_wall_seconds: wall_median,
                 mad_wall_seconds: mad_f64(&walls, wall_median),
                 median_cpu_seconds: median_f64(&cpu),
@@ -254,8 +293,14 @@ impl Report {
                     .unwrap_or(0),
                 item_count: result.samples[0].item_count,
                 logical_bytes: result.samples[0].logical_bytes,
+                median_source_allocated_bytes: median_u64(&source_allocated),
+                median_destination_allocated_bytes: median_u64(&destination_allocated),
+                allocated_throughput_bytes_per_second: allocated_throughput(
+                    median_u64(&source_allocated),
+                    wall_median,
+                ),
                 median_wire_bytes: median_u64(&wire),
-                phase_medians_seconds: phase_medians(&result.samples),
+                phase_medians_seconds,
                 paired_ratio_median: ratio_median,
                 paired_ratio_mad: ratio_median.map(|median| mad_f64(&ratios, median)),
                 paired_observations,
@@ -277,6 +322,7 @@ impl Report {
     }
 
     /// Render a compact but auditable Markdown report.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
@@ -294,13 +340,14 @@ impl Report {
         out.push_str("## Environment\n\n");
         write!(
             &mut out,
-            "- Hardware: `{}`\n- OS: `{}`\n- Kernel: `{}`\n- Filesystem: `{}`\n- Transport: `{}`\n- Route: `{}`\n- Streams: `{}`\n- Compression: `{}`\n\n",
+            "- Hardware: `{}`\n- OS: `{}`\n- Kernel: `{}`\n- Filesystem: `{}`\n- Transport: `{}`\n- Route: `{}`\n- Shaping: `{}`\n- Streams: `{}`\n- Compression: `{}`\n\n",
             md(&self.environment.hardware),
             md(&self.environment.os),
             md(&self.environment.kernel),
             md(&self.environment.filesystem),
             md(&self.environment.transport),
             md(&self.environment.route),
+            md(&self.environment.shaping),
             self.session.streams,
             md(&self.session.compression)
         )
@@ -326,20 +373,28 @@ impl Report {
             .expect("writing to String cannot fail");
         }
         out.push_str("\n## Results\n\n");
-        out.push_str("| method | median wall | MAD | CPU | peak RSS | items | logical bytes | wire bytes | paired speedup | reps | oracle |\n");
-        out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        out.push_str("| method | median wall | MAD | CPU | peak RSS | items | logical bytes | allocated throughput | wire bytes | paired speedup | reps | oracle |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
         for result in &self.results {
             let paired = result
                 .paired_ratio_median
                 .map_or_else(|| "-".to_owned(), |value| format!("{value:.3}x"));
             let oracle = if result.samples.iter().all(|sample| sample.oracle.passed) {
-                "pass"
+                if result
+                    .samples
+                    .iter()
+                    .any(|sample| sample.oracle.mode == "sampled")
+                {
+                    "pass (includes sampled)"
+                } else {
+                    "pass"
+                }
             } else {
                 "FAIL"
             };
             writeln!(
                 &mut out,
-                "| {} | {:.6}s | {:.6}s | {:.6}s | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {:.6}s | {:.6}s | {:.6}s | {} | {} | {} | {:.3} B/s | {} | {} | {} | {} |",
                 md(&result.name),
                 result.median_wall_seconds,
                 result.mad_wall_seconds,
@@ -347,6 +402,7 @@ impl Report {
                 result.peak_rss_bytes,
                 result.item_count,
                 result.logical_bytes,
+                result.allocated_throughput_bytes_per_second,
                 result.median_wire_bytes,
                 paired,
                 result.samples.len(),
@@ -355,13 +411,13 @@ impl Report {
             .expect("writing to String cannot fail");
         }
         out.push_str("\n## Repetitions\n\n");
-        out.push_str("| method | rep | order | cache | wall | CPU | RSS | items | logical | wire | oracle |\n");
-        out.push_str("|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---|\n");
+        out.push_str("| method | rep | order | cache | wall | CPU | RSS | items | logical | source allocated | destination allocated | wire | oracle |\n");
+        out.push_str("|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
         for result in &self.results {
             for sample in &result.samples {
                 writeln!(
                     &mut out,
-                    "| {} | {} | {} | {} | {:.6}s | {:.6}s | {} | {} | {} | {} | {} |",
+                    "| {} | {} | {} | {} | {:.6}s | {:.6}s | {} | {} | {} | {} | {} | {} | {} |",
                     md(&result.name),
                     sample.repetition,
                     sample.method_order,
@@ -371,8 +427,18 @@ impl Report {
                     sample.peak_rss_bytes,
                     sample.item_count,
                     sample.logical_bytes,
+                    sample.source_allocated_bytes,
+                    sample.destination_allocated_bytes,
                     sample.wire_bytes,
-                    if sample.oracle.passed { "pass" } else { "FAIL" }
+                    if sample.oracle.passed {
+                        if sample.oracle.mode == "sampled" {
+                            "pass (sampled)"
+                        } else {
+                            "pass"
+                        }
+                    } else {
+                        "FAIL"
+                    }
                 )
                 .expect("writing to String cannot fail");
             }
@@ -404,6 +470,7 @@ fn validate_input(input: &ReportInput) -> Result<(), ReportError> {
             input.environment.transport.as_str(),
         ),
         ("environment.route", input.environment.route.as_str()),
+        ("environment.shaping", input.environment.shaping.as_str()),
         ("session.compression", input.session.compression.as_str()),
         ("corpus.schema", input.corpus.schema.as_str()),
         (
@@ -593,6 +660,18 @@ fn phase_medians(samples: &[Sample]) -> BTreeMap<String, f64> {
         .collect()
 }
 
+fn sample_with_unaccounted_phase(sample: &Sample) -> Sample {
+    let mut sample = sample.clone();
+    let phase_sum: f64 = sample.phases_seconds.values().sum();
+    let discrepancy = sample.wall_seconds - phase_sum;
+    if discrepancy.abs() > sample.wall_seconds * 0.05 {
+        sample
+            .phases_seconds
+            .insert("unaccounted".to_owned(), discrepancy.max(0.0));
+    }
+    sample
+}
+
 fn median_f64(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -608,6 +687,11 @@ fn median_u64(values: &[u64]) -> u64 {
     let mut sorted = values.to_vec();
     sorted.sort_unstable();
     sorted[sorted.len() / 2]
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn allocated_throughput(bytes: u64, seconds: f64) -> f64 {
+    bytes as f64 / seconds
 }
 
 fn mad_f64(values: &[f64], median: f64) -> f64 {
@@ -671,6 +755,18 @@ mod tests {
             Report::from_input(fixed_order),
             Err(ReportError::UnbalancedOrder { .. })
         ));
+    }
+
+    #[test]
+    fn records_large_phase_timing_gap_as_unaccounted() {
+        let mut input = report_input(1.0);
+        input.results[0].samples[0]
+            .phases_seconds
+            .insert("transfer".to_owned(), 0.5);
+        let report = Report::from_input(input).unwrap();
+        assert!(
+            (report.results[0].samples[0].phases_seconds["unaccounted"] - 1.5).abs() < f64::EPSILON
+        );
     }
 
     #[test]

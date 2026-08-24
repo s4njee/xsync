@@ -12,6 +12,17 @@ cargo build --release -p xsync-bench
 
 ## Deterministic corpora and workload states
 
+> **Legacy for performance purposes.** These synthetic classes remain the **correctness**
+> fixtures — they are reproducible, they pin edge cases such as zero-byte storms and
+> non-UTF-8 names, and the manifest oracle depends on them. They are no longer the basis
+> for performance claims: they are the wrong shape (synthetic flat corpora enumerate
+> roughly 10x faster than real trees, which are directory-open bound), the wrong scale
+> (smoke tier is 513 items / 1.77 MB, where process startup dominates), and they hide
+> both wins and losses. Performance work is tuned against the real corpora defined
+> in [`TUNING.md`](../TUNING.md). Use these classes to prove a change is *correct*, and
+> the real corpora to prove it is *faster*.
+
+
 Create a fixture only through a marker-owned scratch run:
 
 ```bash
@@ -144,6 +155,55 @@ content readback to the candidate operation. The report always uses the independ
 manifest oracle, even without `--paranoid`. Checked-in results and the selection/defer decision are
 in [`results/story-0.4/DECISION.md`](results/story-0.4/DECISION.md).
 
+## Release benchmark matrix (Story 8.1)
+
+`release-bench.py` is the release-evidence runner. Unlike a smoke matrix it produces
+*gate-able* results: every cell carries a same-run `rsync -a` baseline, rotated method order,
+per-invocation wall/CPU/peak-RSS from `os.wait4` rusage, an independent oracle verification after
+every run, and an `xsync.bench.input.v1` document rendered through `xsync-bench report`.
+
+```bash
+cargo build --release -p xsync -p xsync-bench
+python3 benches/scripts/release-bench.py \
+  --routes same-volume,cross-volume,pipe \
+  --cross-volume /Volumes/XSYNC_BENCH/release-bench \
+  --repetitions 5 --tier smoke \
+  --out /tmp/xsync-release
+```
+
+Routes are `same-volume`, `cross-volume`, `pipe` (a child `xsync --server` over stdio, with an
+equivalent `rsync` rsh wrapper so both tools cross a process boundary), and `ssh`. The `ssh` route
+needs a receiver with a native `xsync` build plus `xsync-bench` for the remote oracle:
+
+```bash
+python3 benches/scripts/release-bench.py \
+  --routes ssh --repetitions 5 --tier smoke \
+  --cells deep-small:initial-copy,one-large-file:initial-copy \
+  --ssh-host user@receiver \
+  --ssh-destination /home/user/xsync-release-bench \
+  --remote-bin-dir /home/user/xsync-build/target/release \
+  --remote-bench /home/user/xsync-build/target/release/xsync-bench \
+  --ssh-filesystem "ext4 on NVMe" \
+  --out /tmp/xsync-release-ssh
+```
+
+The ssh route adds production `xsync --transport rsync` as its own row, so the native transport and
+the `RsyncTransport` fallback are always separately visible. `--cells` overrides the default
+class:workload list.
+
+Each cell emits `input-<cell>.json` (every repetition, unaggregated), `report-<cell>.json`, and
+`report-<cell>.md`; the run emits `matrix.json` and `matrix.md`. The matrix marks a row `noisy` when
+it or its baseline exceeds the Epic 0 15% MAD/median policy — noisy rows are reported but are not
+gate-able evidence.
+
+Corpora containing symlinks (the `mixed` class) cannot satisfy the manifest oracle across a
+macOS source and a Linux receiver, because macOS stores symlink permission bits while Linux forces
+0777; `rsync -a` fails the identical check. Use symlink-free classes for cross-platform ssh routes.
+
+Checked-in results and the release decision are in
+[`results/story-8.1/DECISION.md`](results/story-8.1/DECISION.md). The real-world corpora and
+the optimization spikes they support are defined in [`TUNING.md`](../TUNING.md).
+
 ## Independent manifests
 
 The manifest includes the inspected root and every descendant. It pins native path-component bytes,
@@ -184,7 +244,8 @@ A raw `xsync.bench.input.v1` document contains:
 - `results[]`: method name, optional same-run baseline, and every sample.
 
 Every sample records repetition/pairing ID, actual method order, wall and CPU seconds, peak RSS,
-item/logical/wire counts, named phase timings, cache state, and the independent oracle result.
+item/logical/wire counts, timestamped scan/plan/transfer/metadata phase timings, cache state,
+and the independent oracle result.
 Allowed cache labels are:
 
 - `first_pass`: first observation, with no claim that the kernel cache was empty;

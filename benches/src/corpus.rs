@@ -760,7 +760,12 @@ fn set_mode(path: &Path, _directory: bool) -> Result<(), CorpusError> {
             source,
         })?
         .permissions();
-    permissions.set_readonly(false);
+    // Windows has no POSIX mode bits; clear the read-only attribute so
+    // generated fixtures stay writable for later test teardown.
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        permissions.set_readonly(false);
+    }
     fs::set_permissions(path, permissions).map_err(|source| CorpusError::Io {
         operation: "normalize permissions",
         path: path.to_path_buf(),

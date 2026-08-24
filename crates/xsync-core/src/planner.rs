@@ -459,6 +459,19 @@ pub fn try_plan(
     source_entries: impl IntoIterator<Item = FileEntry>,
     destination: DestinationIndex,
 ) -> Result<Plan, PlannerError> {
+    try_plan_with_fingerprint(source_entries, destination, false)
+}
+
+/// Classify entries using the content fingerprint when both sides provide one.
+///
+/// # Errors
+/// Returns an error for malformed entries, duplicate paths, or run-store I/O
+/// failures.
+pub fn try_plan_with_fingerprint(
+    source_entries: impl IntoIterator<Item = FileEntry>,
+    destination: DestinationIndex,
+    compare_fingerprint: bool,
+) -> Result<Plan, PlannerError> {
     let config = destination.config();
     let mut source_spool = PlanningSpool::with_config(IndexConfig {
         memory_budget_bytes: config
@@ -469,7 +482,7 @@ pub fn try_plan(
     for entry in source_entries {
         source_spool.push(entry)?;
     }
-    try_plan_spooled(source_spool, destination)
+    try_plan_spooled_with_fingerprint(source_spool, destination, compare_fingerprint)
 }
 
 /// Classify a source spool after both source and destination discovery have
@@ -482,13 +495,26 @@ pub fn try_plan_spooled(
     source_spool: PlanningSpool,
     destination: DestinationIndex,
 ) -> Result<Plan, PlannerError> {
+    try_plan_spooled_with_fingerprint(source_spool, destination, false)
+}
+
+fn try_plan_spooled_with_fingerprint(
+    source_spool: PlanningSpool,
+    destination: DestinationIndex,
+    compare_fingerprint: bool,
+) -> Result<Plan, PlannerError> {
     let mut source = source_spool.finish()?;
     let mut destination = destination.finish()?;
     let mut plan = Plan::default();
-    classify_cursors(&mut source, &mut destination, |entry, action| {
-        push_classification(&mut plan, entry, action);
-        Ok(())
-    })?;
+    classify_cursors(
+        &mut source,
+        &mut destination,
+        compare_fingerprint,
+        |entry, action| {
+            push_classification(&mut plan, entry, action);
+            Ok(())
+        },
+    )?;
     Ok(plan)
 }
 
@@ -517,7 +543,7 @@ pub fn classify_stream(
     }
     let mut source = source_spool.finish()?;
     let mut destination = destination.finish()?;
-    classify_cursors(&mut source, &mut destination, |entry, action| {
+    classify_cursors(&mut source, &mut destination, false, |entry, action| {
         callback(entry, action)
     })
 }
@@ -555,6 +581,7 @@ pub fn plan(
 fn classify_cursors(
     source: &mut PlanningSource,
     destination: &mut SortedEntries,
+    compare_fingerprint: bool,
     mut emit: impl FnMut(FileEntry, Classification) -> Result<(), PlannerError>,
 ) -> Result<(), PlannerError> {
     let mut source_entry = next_unique(source)?;
@@ -599,8 +626,11 @@ fn classify_cursors(
                         let destination_value = destination_entry
                             .take()
                             .expect("destination entry was matched as present");
-                        let classification = if metadata_matches(&source_value, &destination_value)
-                        {
+                        let classification = if metadata_matches(
+                            &source_value,
+                            &destination_value,
+                            compare_fingerprint,
+                        ) {
                             Classification::Unchanged
                         } else {
                             Classification::Changed
@@ -629,10 +659,17 @@ fn push_classification(plan: &mut Plan, entry: FileEntry, classification: Classi
     }
 }
 
-fn metadata_matches(source: &FileEntry, destination: &FileEntry) -> bool {
+fn metadata_matches(
+    source: &FileEntry,
+    destination: &FileEntry,
+    compare_fingerprint: bool,
+) -> bool {
     source.kind == destination.kind
         && source.size == destination.size
         && source.mtime == destination.mtime
+        && (!compare_fingerprint
+            || source.kind != EntryKind::File
+            || source.fingerprint.identity == destination.fingerprint.identity)
 }
 
 /// Entries of one filesystem kind grouped by their required action.

@@ -5,7 +5,12 @@ use std::ffi::OsStr;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
+use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 
 /// Versioned manifest schema.
@@ -68,6 +73,9 @@ pub struct ManifestEntry {
     pub kind: ManifestKind,
     /// Logical file length; zero for non-files.
     pub length: u64,
+    /// Physical filesystem allocation in bytes, where the platform exposes it.
+    #[serde(default)]
+    pub allocated_bytes: u64,
     /// BLAKE3 content digest for regular files.
     pub content_blake3: Option<String>,
     /// Permission and special mode bits where the platform exposes them.
@@ -91,6 +99,9 @@ pub struct Manifest {
     pub item_count: u64,
     /// Sum of regular-file logical lengths.
     pub logical_bytes: u64,
+    /// Sum of physical filesystem allocation for regular files.
+    #[serde(default)]
+    pub allocated_bytes: u64,
     /// Canonical digest of all entry fields.
     pub manifest_digest: String,
     /// Entries sorted by native encoded relative path.
@@ -107,7 +118,7 @@ pub struct ManifestMismatch {
 }
 
 /// Result of comparing a destination to an expected manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Verification {
     /// True only when every entry and manifest digest matches.
     pub passed: bool,
@@ -119,10 +130,29 @@ pub struct Verification {
     pub item_count: u64,
     /// Actual logical bytes.
     pub logical_bytes: u64,
+    /// Actual physical allocation reported for the destination.
+    #[serde(default)]
+    pub allocated_bytes: u64,
     /// Total mismatches, which may exceed `mismatches.len()`.
     pub mismatch_count: u64,
     /// First bounded mismatch details.
     pub mismatches: Vec<ManifestMismatch>,
+    /// Verification strength used for this result.
+    #[serde(default = "default_verification_mode")]
+    pub mode: String,
+    /// Fraction of regular-file contents selected for hashing in sampled mode.
+    #[serde(default)]
+    pub sample_fraction: Option<f64>,
+    /// Seed used to select sampled content hashes.
+    #[serde(default)]
+    pub sample_seed: Option<u64>,
+    /// Number of regular-file contents actually hashed.
+    #[serde(default)]
+    pub hashed_file_count: u64,
+}
+
+fn default_verification_mode() -> String {
+    "full".to_owned()
 }
 
 /// Manifest creation and validation errors.
@@ -157,6 +187,9 @@ pub enum ManifestError {
     /// An entry count cannot be represented by the manifest schema.
     #[error("manifest contains too many entries")]
     TooManyEntries,
+    /// Sampling fraction was outside the supported range.
+    #[error("sample fraction must be greater than 0 and at most 1, got {0}")]
+    InvalidSampleFraction(f64),
 }
 
 /// Inspect a filesystem tree and return a content-pinned manifest.
@@ -167,10 +200,27 @@ pub enum ManifestError {
 ///
 /// Returns an error when metadata, directory contents, link targets, or file
 /// content cannot be read consistently enough to create the manifest.
+///
+/// # Panics
+///
+/// Panics only if the static progress-bar format is rejected by `indicatif`.
 pub fn build_manifest(root: impl AsRef<Path>) -> Result<Manifest, ManifestError> {
     let root = root.as_ref();
+    let progress = ProgressBar::new_spinner();
+    progress.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+    progress.set_style(
+        ProgressStyle::with_template("{spinner} manifest: {pos} entries ({elapsed})")
+            .expect("static progress template is valid"),
+    );
+    progress.enable_steady_tick(Duration::from_millis(120));
     let mut entries = Vec::new();
-    visit(root, &EncodedPath::root(), &mut entries)?;
+    visit_filtered(
+        root,
+        &EncodedPath::root(),
+        &mut entries,
+        &progress,
+        |_, entry| entry.kind == ManifestKind::File,
+    )?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     let item_count = u64::try_from(entries.len()).map_err(|_| ManifestError::TooManyEntries)?;
     let logical_bytes = entries
@@ -178,13 +228,20 @@ pub fn build_manifest(root: impl AsRef<Path>) -> Result<Manifest, ManifestError>
         .filter(|entry| entry.kind == ManifestKind::File)
         .map(|entry| entry.length)
         .sum();
+    let allocated_bytes = entries
+        .iter()
+        .filter(|entry| entry.kind == ManifestKind::File)
+        .map(|entry| entry.allocated_bytes)
+        .sum();
     let manifest_digest = digest_entries(&entries);
+    progress.finish_with_message(format!("manifest: {item_count} entries"));
     Ok(Manifest {
         schema: MANIFEST_SCHEMA.to_owned(),
         path_encoding: platform_path_encoding().to_owned(),
         digest_algorithm: "blake3".to_owned(),
         item_count,
         logical_bytes,
+        allocated_bytes,
         manifest_digest,
         entries,
     })
@@ -209,6 +266,36 @@ pub fn verify_manifest(
     }
 
     let actual = build_manifest(root)?;
+    Ok(compare_manifests(expected, &actual, None))
+}
+
+/// Verify all entry metadata and a deterministic subset of regular-file contents.
+///
+/// # Errors
+///
+/// Returns an error when the expected manifest is invalid, the fraction is outside
+/// `(0, 1]`, or the destination cannot be inspected.
+pub fn verify_manifest_sampled(
+    root: impl AsRef<Path>,
+    expected: &Manifest,
+    fraction: f64,
+    seed: u64,
+) -> Result<Verification, ManifestError> {
+    if !(fraction.is_finite() && fraction > 0.0 && fraction <= 1.0) {
+        return Err(ManifestError::InvalidSampleFraction(fraction));
+    }
+    let root = root.as_ref();
+    let actual = build_manifest_filtered(root, |path, entry| {
+        entry.kind == ManifestKind::File && selected_sample(path, seed, fraction)
+    })?;
+    Ok(compare_manifests(expected, &actual, Some((fraction, seed))))
+}
+
+fn compare_manifests(
+    expected: &Manifest,
+    actual: &Manifest,
+    sample: Option<(f64, u64)>,
+) -> Verification {
     let expected_by_path: BTreeMap<_, _> = expected
         .entries
         .iter()
@@ -231,7 +318,9 @@ pub fn verify_manifest(
         let reason = match (expected_by_path.get(path), actual_by_path.get(path)) {
             (Some(_), None) => Some("missing destination entry".to_owned()),
             (None, Some(_)) => Some("unexpected destination entry".to_owned()),
-            (Some(expected_entry), Some(actual_entry)) if expected_entry != actual_entry => {
+            (Some(expected_entry), Some(actual_entry))
+                if !entries_match(expected_entry, actual_entry, sample.is_some()) =>
+            {
                 Some(entry_difference(expected_entry, actual_entry))
             }
             _ => None,
@@ -247,32 +336,107 @@ pub fn verify_manifest(
         }
     }
 
-    Ok(Verification {
-        passed: mismatch_count == 0 && actual.manifest_digest == expected.manifest_digest,
+    let hashed_file_count = actual
+        .entries
+        .iter()
+        .filter(|entry| entry.content_blake3.is_some())
+        .count() as u64;
+    Verification {
+        passed: mismatch_count == 0
+            && (sample.is_some() || actual.manifest_digest == expected.manifest_digest),
         expected_manifest_digest: expected.manifest_digest.clone(),
-        actual_manifest_digest: actual.manifest_digest,
+        actual_manifest_digest: actual.manifest_digest.clone(),
         item_count: actual.item_count,
         logical_bytes: actual.logical_bytes,
+        allocated_bytes: actual.allocated_bytes,
         mismatch_count,
         mismatches,
+        mode: if sample.is_some() {
+            "sampled".to_owned()
+        } else {
+            "full".to_owned()
+        },
+        sample_fraction: sample.map(|value| value.0),
+        sample_seed: sample.map(|value| value.1),
+        hashed_file_count,
+    }
+}
+
+fn entries_match(expected: &ManifestEntry, actual: &ManifestEntry, sampled: bool) -> bool {
+    if !sampled || expected.kind != ManifestKind::File || actual.content_blake3.is_some() {
+        return expected == actual;
+    }
+    expected.path == actual.path
+        && expected.kind == actual.kind
+        && expected.length == actual.length
+        && expected.mode == actual.mode
+        && expected.mtime == actual.mtime
+        && expected.symlink_target_hex == actual.symlink_target_hex
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn selected_sample(path: &Path, seed: u64, fraction: f64) -> bool {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&seed.to_le_bytes());
+    hasher.update(path.as_os_str().to_string_lossy().as_bytes());
+    let value = u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("8 bytes"),
+    );
+    (value as f64) / (u64::MAX as f64) < fraction
+}
+
+fn build_manifest_filtered<F>(root: &Path, should_hash: F) -> Result<Manifest, ManifestError>
+where
+    F: Fn(&Path, &ManifestEntry) -> bool + Copy,
+{
+    let progress = ProgressBar::hidden();
+    let mut entries = Vec::new();
+    visit_filtered(
+        root,
+        &EncodedPath::root(),
+        &mut entries,
+        &progress,
+        should_hash,
+    )?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let item_count = entries.len() as u64;
+    let logical_bytes = entries
+        .iter()
+        .filter(|entry| entry.kind == ManifestKind::File)
+        .map(|entry| entry.length)
+        .sum();
+    let allocated_bytes = entries
+        .iter()
+        .filter(|entry| entry.kind == ManifestKind::File)
+        .map(|entry| entry.allocated_bytes)
+        .sum();
+    let manifest_digest = digest_entries(&entries);
+    Ok(Manifest {
+        schema: MANIFEST_SCHEMA.to_owned(),
+        path_encoding: platform_path_encoding().to_owned(),
+        digest_algorithm: "blake3".to_owned(),
+        item_count,
+        logical_bytes,
+        allocated_bytes,
+        manifest_digest,
+        entries,
     })
 }
 
-fn visit(
+fn visit_filtered<F: Fn(&Path, &ManifestEntry) -> bool + Copy>(
     path: &Path,
     encoded_path: &EncodedPath,
     entries: &mut Vec<ManifestEntry>,
+    progress: &ProgressBar,
+    should_hash: F,
 ) -> Result<(), ManifestError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| ManifestError::Inspect {
         path: path.to_path_buf(),
         source,
     })?;
     let kind = manifest_kind(&metadata);
-    let content_blake3 = if kind == ManifestKind::File {
-        Some(hash_file(path)?)
-    } else {
-        None
-    };
     let symlink_target_hex = if kind == ManifestKind::Symlink {
         let target = fs::read_link(path).map_err(|source| ManifestError::Inspect {
             path: path.to_path_buf(),
@@ -282,7 +446,7 @@ fn visit(
     } else {
         None
     };
-    entries.push(ManifestEntry {
+    let entry = ManifestEntry {
         path: encoded_path.clone(),
         kind,
         length: if kind == ManifestKind::File {
@@ -290,14 +454,29 @@ fn visit(
         } else {
             0
         },
-        content_blake3,
+        allocated_bytes: if kind == ManifestKind::File {
+            allocated_bytes(path, &metadata)
+        } else {
+            0
+        },
+        content_blake3: None,
         mode: metadata_mode(&metadata),
         mtime: metadata_mtime(&metadata).map_err(|source| ManifestError::Inspect {
             path: path.to_path_buf(),
             source,
         })?,
         symlink_target_hex,
+    };
+    let content_blake3 = if should_hash(path, &entry) {
+        Some(hash_file(path)?)
+    } else {
+        None
+    };
+    entries.push(ManifestEntry {
+        content_blake3,
+        ..entry
     });
+    progress.inc(1);
 
     if kind == ManifestKind::Directory {
         let directory = fs::read_dir(path).map_err(|source| ManifestError::Inspect {
@@ -322,12 +501,14 @@ fn visit(
         for (key, _name, child_path) in children {
             let mut components = encoded_path.components_hex.clone();
             components.push(hex(&key));
-            visit(
+            visit_filtered(
                 &child_path,
                 &EncodedPath {
                     components_hex: components,
                 },
                 entries,
+                progress,
+                should_hash,
             )?;
         }
     }
@@ -345,6 +526,42 @@ fn manifest_kind(metadata: &Metadata) -> ManifestKind {
     } else {
         ManifestKind::Other
     }
+}
+
+#[cfg(unix)]
+fn allocated_bytes(path: &Path, metadata: &Metadata) -> u64 {
+    if let Some(bytes) = extent_allocated_bytes(path, metadata.len()) {
+        return bytes;
+    }
+    metadata.blocks().saturating_mul(512)
+}
+
+#[cfg(not(unix))]
+fn allocated_bytes(_path: &Path, _metadata: &Metadata) -> u64 {
+    0
+}
+
+#[cfg(unix)]
+fn extent_allocated_bytes(path: &Path, length: u64) -> Option<u64> {
+    if length == 0 {
+        return Some(0);
+    }
+    let file = File::open(path).ok()?;
+    let mut offset = 0_u64;
+    let mut allocated = 0_u64;
+    while offset < length {
+        // SEEK_DATA/SEEK_HOLE are supported by APFS and ext4. Unsupported
+        // filesystems return an error and use the allocation-block fallback.
+        let data = rustix::fs::seek(&file, rustix::fs::SeekFrom::Data(offset)).ok();
+        let Some(data) = data else {
+            return if offset == 0 { Some(0) } else { None };
+        };
+        let hole = rustix::fs::seek(&file, rustix::fs::SeekFrom::Hole(data)).ok()?;
+        let end = hole.min(length);
+        allocated = allocated.saturating_add(end.saturating_sub(data));
+        offset = end;
+    }
+    Some(allocated)
 }
 
 fn hash_file(path: &Path) -> Result<String, ManifestError> {
@@ -513,6 +730,8 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    use std::io::{Seek, SeekFrom, Write};
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
@@ -545,6 +764,25 @@ mod tests {
         fs::write(root.path().join("nested/file"), b"changed").unwrap();
         let changed = build_manifest(root.path()).unwrap();
         assert_ne!(first.manifest_digest, changed.manifest_digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extent_accounting_sees_holes_without_changing_content_identity() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("sparse");
+        let mut file = fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        file.seek(SeekFrom::Start(1024 * 1024 - 1)).unwrap();
+        file.write_all(&[1]).unwrap();
+        let manifest = build_manifest(root.path()).unwrap();
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path.components_hex.len() == 1)
+            .unwrap();
+        assert_eq!(entry.length, 1024 * 1024);
+        assert!(entry.allocated_bytes < entry.length);
     }
 
     #[test]
@@ -590,6 +828,25 @@ mod tests {
             verify_manifest(root.path(), &expected),
             Err(ManifestError::InvalidDigest { .. })
         ));
+    }
+
+    #[test]
+    fn sampled_verification_is_deterministic_and_checks_metadata() {
+        let expected_root = fixture();
+        let actual_root = fixture();
+        let expected = build_manifest(expected_root.path()).unwrap();
+        let first = verify_manifest_sampled(actual_root.path(), &expected, 0.5, 42).unwrap();
+        let second = verify_manifest_sampled(actual_root.path(), &expected, 0.5, 42).unwrap();
+        assert_eq!(first.mode, "sampled");
+        assert_eq!(first.sample_fraction, Some(0.5));
+        assert_eq!(first.sample_seed, Some(42));
+        assert_eq!(first.hashed_file_count, second.hashed_file_count);
+        assert_eq!(first.passed, second.passed);
+
+        fs::write(actual_root.path().join("empty"), b"changed").unwrap();
+        let metadata_only_change =
+            verify_manifest_sampled(actual_root.path(), &expected, 0.01, 42).unwrap();
+        assert!(!metadata_only_change.passed);
     }
 
     #[cfg(unix)]

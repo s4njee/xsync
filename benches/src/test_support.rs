@@ -14,8 +14,13 @@ pub(crate) fn verification(passed: bool) -> Verification {
         actual_manifest_digest: if passed { digest } else { "b".repeat(64) },
         item_count: 10,
         logical_bytes: 100,
+        allocated_bytes: 100,
         mismatch_count: u64::from(!passed),
         mismatches: Vec::new(),
+        mode: "full".to_owned(),
+        sample_fraction: None,
+        sample_seed: None,
+        hashed_file_count: 1,
     }
 }
 
@@ -28,8 +33,12 @@ fn sample(repetition: u32, order: u32, wall: f64) -> Sample {
         peak_rss_bytes: 1024,
         item_count: 10,
         logical_bytes: 100,
+        source_allocated_bytes: 100,
+        destination_allocated_bytes: 100,
         wire_bytes: 80,
         phases_seconds: BTreeMap::from([("transfer".to_owned(), wall)]),
+        seed_destination_seconds: 0.0,
+        verify_oracle_seconds: 0.0,
         cache_state: if repetition == 0 {
             CacheState::FirstPass
         } else {
@@ -37,6 +46,8 @@ fn sample(repetition: u32, order: u32, wall: f64) -> Sample {
         },
         cache_eviction_method: None,
         oracle: verification(true),
+        source_manifest_digest: None,
+        mutation_selection: Vec::new(),
     }
 }
 
@@ -61,6 +72,7 @@ pub(crate) fn report_input(candidate_wall: f64) -> ReportInput {
             filesystem: "apfs".to_owned(),
             transport: "local".to_owned(),
             route: "local".to_owned(),
+            shaping: "none".to_owned(),
         },
         session: SessionConfig {
             streams: 1,

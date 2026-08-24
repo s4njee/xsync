@@ -18,7 +18,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::protocol::ByteRange;
-use crate::scanner::{SourceFingerprint, EntryKind};
+use crate::scanner::{EntryKind, SourceFingerprint};
 
 /// Journal record format version. Bumped on any incompatible layout change.
 pub const RESUME_JOURNAL_VERSION: u32 = 1;
@@ -67,11 +67,7 @@ impl ResumeIdentity {
     pub fn matches(&self, record: &JournalRecord) -> bool {
         record.size == self.fingerprint.size
             && record.mtime_ns == timestamp_nanos(self.fingerprint.mtime)
-            && record.ctime_ns
-                == self
-                    .fingerprint
-                    .ctime
-                    .map_or(0, timestamp_nanos)
+            && record.ctime_ns == self.fingerprint.ctime.map_or(0, timestamp_nanos)
             && record.identity_device == self.fingerprint.identity.device
             && record.identity_file == self.fingerprint.identity.file
             && record.kind == self.fingerprint.kind
@@ -118,9 +114,8 @@ impl ResumeJournal {
     /// Returns [`JournalError::Io`] if the root directory cannot be created.
     pub fn new(job_id: &[u8; 16]) -> Result<Self, JournalError> {
         let root = Self::root_for(job_id);
-        fs::create_dir_all(&root).map_err(|source| {
-            journal_io("create resume journal root", &root, source)
-        })?;
+        fs::create_dir_all(&root)
+            .map_err(|source| journal_io("create resume journal root", &root, source))?;
         Ok(Self { root })
     }
 
@@ -149,9 +144,7 @@ impl ResumeJournal {
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(journal_io("read resume journal record", &path, source))
-            }
+            Err(source) => return Err(journal_io("read resume journal record", &path, source)),
         };
         match decode_record(&bytes) {
             Ok(record) => {
@@ -185,8 +178,7 @@ impl ResumeJournal {
     ) -> Result<(), JournalError> {
         self.with_lock(|| {
             let existing = self.load_unlocked(identity)?;
-            let mut merged_ranges =
-                existing.map_or_else(Vec::new, |record| record.ranges);
+            let mut merged_ranges = existing.map_or_else(Vec::new, |record| record.ranges);
             let mut merged = merge_ranges(&merged_ranges, ranges);
             std::mem::swap(&mut merged_ranges, &mut merged);
             let mut sorted_ranges = merged_ranges;
@@ -228,9 +220,7 @@ impl ResumeJournal {
             match fs::remove_file(&path) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(source) => {
-                    Err(journal_io("remove resume journal record", &path, source))
-                }
+                Err(source) => Err(journal_io("remove resume journal record", &path, source)),
             }
         })
     }
@@ -309,11 +299,7 @@ pub fn merge_ranges(existing: &[ByteRange], added: &[ByteRange]) -> Vec<ByteRang
 /// `verified` ranges may cover arbitrary offsets; the returned list is the
 /// chunk-sized gaps that still require transmission.
 #[must_use]
-pub fn missing_chunks(
-    size: u64,
-    chunk_size: u64,
-    verified: &[ByteRange],
-) -> Vec<ByteRange> {
+pub fn missing_chunks(size: u64, chunk_size: u64, verified: &[ByteRange]) -> Vec<ByteRange> {
     let merged = merge_ranges(verified, &[]);
     let mut missing = Vec::new();
     let mut cursor = 0u64;
@@ -330,16 +316,12 @@ pub fn missing_chunks(
     missing
 }
 
-fn append_chunks(
-    out: &mut Vec<ByteRange>,
-    size: u64,
-    chunk_size: u64,
-    start: u64,
-    end: u64,
-) {
+fn append_chunks(out: &mut Vec<ByteRange>, size: u64, chunk_size: u64, start: u64, end: u64) {
     let mut offset = start;
     while offset < end {
-        let length = chunk_size.min(size.saturating_sub(offset)).min(end - offset);
+        let length = chunk_size
+            .min(size.saturating_sub(offset))
+            .min(end - offset);
         if length > 0 {
             out.push(ByteRange { offset, length });
         }
@@ -387,17 +369,21 @@ fn write_all(file: &mut File, path: &Path, bytes: &[u8]) -> Result<(), JournalEr
 }
 
 /// Sync the parent directory so a rename is durable.
+#[cfg(unix)]
 fn sync_parent(path: &Path) -> Result<(), JournalError> {
-    #[cfg(unix)]
-    {
-        let dir = File::open(
-            path.parent()
-                .expect("journal paths always have a parent"),
-        )
+    let dir = File::open(path.parent().expect("journal paths always have a parent"))
         .map_err(|source| journal_io("open resume journal directory", path, source))?;
-        dir.sync_all()
-            .map_err(|source| journal_io("sync resume journal directory", path, source))?;
-    }
+    dir.sync_all()
+        .map_err(|source| journal_io("sync resume journal directory", path, source))?;
+    Ok(())
+}
+
+/// Windows has no stable std API to fsync a directory after rename.
+/// The journal file itself is `sync_all`'d before the rename.
+/// Signature matches the Unix counterpart so callers stay cfg-free.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn sync_parent(_path: &Path) -> Result<(), JournalError> {
     Ok(())
 }
 
@@ -412,12 +398,11 @@ fn encode_record(record: &JournalRecord) -> Result<Vec<u8>, JournalError> {
     push_u64(&mut out, record.identity_device);
     push_u64(&mut out, record.identity_file);
     push_u8(&mut out, kind_to_byte(record.kind));
-    let count = u32::try_from(record.ranges.len())
-        .map_err(|_| JournalError::Io {
-            operation: "encode resume journal range count",
-            path: PathBuf::new(),
-            source: io::Error::new(io::ErrorKind::InvalidData, "too many ranges"),
-        })?;
+    let count = u32::try_from(record.ranges.len()).map_err(|_| JournalError::Io {
+        operation: "encode resume journal range count",
+        path: PathBuf::new(),
+        source: io::Error::new(io::ErrorKind::InvalidData, "too many ranges"),
+    })?;
     push_u32(&mut out, count);
     for range in &record.ranges {
         push_u64(&mut out, range.offset);

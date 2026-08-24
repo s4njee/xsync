@@ -16,7 +16,11 @@ fn xsync_bin() -> &'static str {
 fn populate_test_tree(root: &Path) {
     fs::create_dir_all(root.join("nested/alpha/beta")).unwrap();
     fs::create_dir_all(root.join("empty_dir")).unwrap();
-    fs::write(root.join("nested/alpha/beta/small.txt"), b"small file content").unwrap();
+    fs::write(
+        root.join("nested/alpha/beta/small.txt"),
+        b"small file content",
+    )
+    .unwrap();
     fs::write(root.join("root_file.dat"), vec![0xAB; 64 * 1024]).unwrap();
 
     // Large file (multi-segment)
@@ -47,14 +51,14 @@ fn write_fake_rsh(script_dir: &Path, mode: &str) -> PathBuf {
             } else {
                 xsync_bin().to_owned()
             };
-            format!("#!/bin/sh\nexec {target} \"$3\" \"$4\"\n")
+            format!("#!/bin/sh\nshift\neval \"set -- $1\"\nexec {target} \"$2\" \"$3\"\n")
         }
         // Start the server, then SIGKILL it shortly after so the client sees a
         // mid-transfer disconnect and leaves only staging artifacts.
         "crash" => {
             let xs = xsync_bin();
             format!(
-                "#!/bin/sh\n\"{xs}\" \"$3\" \"$4\" &\nPID=$!\nsleep 0.05\nkill -9 $PID\nwait $PID\n"
+                "#!/bin/sh\nshift\neval \"set -- $1\"\n\"{xs}\" \"$2\" \"$3\" &\nPID=$!\nsleep 0.05\nkill -9 $PID\nwait $PID\n"
             )
         }
         // Start the server and SIGKILL it once the receiver has durably staged
@@ -63,9 +67,9 @@ fn write_fake_rsh(script_dir: &Path, mode: &str) -> PathBuf {
         "crash_after_chunk" => {
             let xs = xsync_bin();
             format!(
-                "#!/bin/sh\n\"{xs}\" \"$3\" \"$4\" &\nPID=$!\n\
+                "#!/bin/sh\nshift\neval \"set -- $1\"\n\"{xs}\" \"$2\" \"$3\" &\nPID=$!\n\
                  for i in $(seq 1 400); do\n\
-                 \x20 f=$(ls \"$4\"/.xsync.tmp.* 2>/dev/null | head -n1)\n\
+                 \x20 f=$(ls \"$3\"/.xsync.tmp.* 2>/dev/null | head -n1)\n\
                  \x20 if [ -n \"$f\" ] && [ \"$(wc -c < \"$f\" 2>/dev/null || echo 0)\" -ge 8388608 ]; then\n\
                  \x20   kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null; exit 0\n\
                  \x20 fi\n\
@@ -85,6 +89,604 @@ fn write_fake_rsh(script_dir: &Path, mode: &str) -> PathBuf {
         fs::set_permissions(&script, perms).unwrap();
     }
     script
+}
+
+/// Fake remote shell backed by an absolute reference rsync. The xsync process
+/// can have a poisoned PATH: only this simulated remote environment restores
+/// the directory containing the oracle executable.
+fn write_fake_rsync_rsh(script_dir: &Path, missing_xsync: bool) -> Option<PathBuf> {
+    let reference = reference_rsync()?;
+    let remote_path = Path::new(reference).parent().unwrap();
+    let script = script_dir.join("fake_rsync_rsh.sh");
+    let missing = if missing_xsync {
+        "case \"$1\" in *\"'xsync' '--server'\"*) echo 'xsync: command not found' >&2; exit 127;; esac"
+    } else {
+        "case \"$1\" in *\"'xsync' '--server'\"*) echo 'native xsync unexpectedly requested' >&2; exit 99;; esac"
+    };
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nshift\n{missing}\nPATH='{}':/usr/bin:/bin\nexport PATH\nexec /bin/sh -c \"$*\"\n",
+            remote_path.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+    }
+    Some(script)
+}
+
+fn reference_rsync() -> Option<&'static str> {
+    ["/opt/homebrew/bin/rsync", "/usr/bin/rsync"]
+        .into_iter()
+        .find(|path| {
+            if !Path::new(path).is_file() {
+                return false;
+            }
+            Command::new(path)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).contains("protocol version 32")
+                })
+        })
+}
+
+#[test]
+fn test_native_rsync_fallback_needs_no_local_rsync_executable() {
+    let src = tempdir().unwrap();
+    populate_test_tree(src.path());
+    for name in [
+        "space name",
+        "quote'name",
+        "-leading-dash",
+        "semi;dollar$bracket[glob]",
+    ] {
+        fs::write(src.path().join(name), name.as_bytes()).unwrap();
+    }
+    let expected = tempdir().unwrap();
+    let actual = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), false) else {
+        return;
+    };
+
+    assert!(Command::new(reference_rsync().unwrap())
+        .arg("-rlptW")
+        .arg("--protocol=32")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", expected.path().display()))
+        .status()
+        .unwrap()
+        .success());
+
+    let output = Command::new(xsync_bin())
+        .env("PATH", "/definitely/no/local/rsync")
+        .arg("--transport")
+        .arg("rsync")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", actual.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "native rsync codec failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut expected_entries = build_manifest(expected.path()).unwrap().entries;
+    let mut actual_entries = build_manifest(actual.path()).unwrap().entries;
+    // GNU rsync's receiver applies protocol-32 nanosecond timestamps to
+    // regular files, while directory and symlink timestamp precision remains
+    // platform/receiver dependent. Compare their documented second-level
+    // metadata contract and retain exact file precision checks.
+    for (expected, actual) in expected_entries.iter_mut().zip(&mut actual_entries) {
+        if expected.kind != xsync_bench::manifest::ManifestKind::File {
+            expected.mtime.nanoseconds = 0;
+            actual.mtime.nanoseconds = 0;
+        }
+    }
+    assert_eq!(expected_entries, actual_entries);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("transport: rsync"));
+}
+
+#[test]
+fn test_auto_falls_back_only_when_remote_xsync_is_missing() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file.txt"), b"fallback").unwrap();
+    let dst = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), true) else {
+        return;
+    };
+
+    let output = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(dst.path().join("file.txt")).unwrap(), b"fallback");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("trying supported rsync fallback"));
+}
+
+#[test]
+fn test_auto_does_not_fallback_on_authentication_failure() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file.txt"), b"data").unwrap();
+    let dst = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let marker = scripts.path().join("calls");
+    let script = scripts.path().join("auth_failure.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'Permission denied (publickey)' >&2\nexit 255\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+    }
+
+    let output = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&script)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Permission denied"));
+    assert_eq!(fs::read_to_string(marker).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn test_auto_does_not_fallback_on_host_key_or_native_protocol_failure() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file.txt"), b"data").unwrap();
+    let dst = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+
+    for (name, body) in [
+        (
+            "host_key",
+            "echo 'Host key verification failed.' >&2\nexit 255\n",
+        ),
+        ("malformed_native", "printf 'bad native protocol'\nexit 0\n"),
+    ] {
+        let marker = scripts.path().join(format!("{name}.calls"));
+        let script = scripts.path().join(format!("{name}.sh"));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        let output = Command::new(xsync_bin())
+            .arg("-e")
+            .arg(&script)
+            .arg(format!("{}/", src.path().display()))
+            .arg(format!("fakehost:{}/", dst.path().display()))
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{name} unexpectedly succeeded");
+        assert_eq!(
+            fs::read_to_string(marker).unwrap().lines().count(),
+            1,
+            "{name} triggered a second backend"
+        );
+    }
+}
+
+#[test]
+fn test_rsync_remote_destination_is_shell_quoted() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file.txt"), b"quoted").unwrap();
+    let base = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), true) else {
+        return;
+    };
+    let marker = std::env::current_dir()
+        .unwrap()
+        .join("XSYNC_RSYNC_INJECTION_MARKER");
+    let _ = fs::remove_file(&marker);
+    let hostile = base
+        .path()
+        .join("dst'; touch XSYNC_RSYNC_INJECTION_MARKER; echo '");
+
+    let output = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", hostile.display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "hostile destination executed a second command"
+    );
+    assert_eq!(fs::read(hostile.join("file.txt")).unwrap(), b"quoted");
+}
+
+#[test]
+fn test_rsync_trailing_slash_and_type_replacement() {
+    let src_parent = tempdir().unwrap();
+    let src = src_parent.path().join("source-dir");
+    fs::create_dir_all(src.join("folder")).unwrap();
+    fs::write(src.join("item"), b"file replaces directory").unwrap();
+    fs::write(src.join("folder/child"), b"directory replaces file").unwrap();
+    let dst = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), false) else {
+        return;
+    };
+
+    // No source trailing slash retains the source directory basename.
+    let output = Command::new(xsync_bin())
+        .arg("--transport=rsync")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(&src)
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let nested = dst.path().join("source-dir");
+    assert_eq!(
+        fs::read(nested.join("item")).unwrap(),
+        b"file replaces directory"
+    );
+
+    // Replace destination objects with opposite source types on the next run.
+    fs::remove_file(nested.join("item")).unwrap();
+    fs::create_dir(nested.join("item")).unwrap();
+    fs::write(nested.join("item/stale"), b"stale").unwrap();
+    fs::remove_dir_all(nested.join("folder")).unwrap();
+    fs::write(nested.join("folder"), b"wrong type").unwrap();
+
+    let second = Command::new(xsync_bin())
+        .arg("--transport=rsync")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(&src)
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        fs::read(nested.join("item")).unwrap(),
+        b"file replaces directory"
+    );
+    assert_eq!(
+        fs::read(nested.join("folder/child")).unwrap(),
+        b"directory replaces file"
+    );
+}
+
+#[test]
+fn test_rsync_rejects_unsupported_guarantees_before_remote_probe() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file"), b"data").unwrap();
+    let dst = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let marker = scripts.path().join("invoked");
+    let rsh = scripts.path().join("must_not_run.sh");
+    fs::write(
+        &rsh,
+        format!("#!/bin/sh\ntouch '{}'\nexit 99\n", marker.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&rsh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&rsh, permissions).unwrap();
+    }
+
+    let output = Command::new(xsync_bin())
+        .arg("--transport=rsync")
+        .arg("--delete")
+        .arg("-e")
+        .arg(&rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not support --delete"));
+    assert!(
+        !marker.exists(),
+        "unsupported option opened the remote transport"
+    );
+}
+
+#[test]
+fn test_rsync_nonzero_receiver_exit_is_failure() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file"), b"data").unwrap();
+    let dst = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let reference = reference_rsync().unwrap_or("/usr/bin/rsync");
+    let rsh = scripts.path().join("disk_full.sh");
+    fs::write(
+        &rsh,
+        format!(
+            "#!/bin/sh\nshift\ncase \"$1\" in *--version*) exec '{reference}' --version;; esac\necho 'No space left on device' >&2\nexit 23\n"
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&rsh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&rsh, permissions).unwrap();
+    }
+
+    let output = Command::new(xsync_bin())
+        .arg("--transport=rsync")
+        .arg("-e")
+        .arg(&rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No space left on device"));
+}
+
+#[test]
+fn test_rsync_final_json_contains_transport_contract() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file"), b"json").unwrap();
+    let dst = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), false) else {
+        return;
+    };
+
+    let output = Command::new(xsync_bin())
+        .arg("--transport=rsync")
+        .arg("--progress-json")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let finished = events
+        .iter()
+        .find(|event| event["event"] == "finished")
+        .expect("finished event");
+    assert_eq!(finished["transport"], "rsync");
+    assert_eq!(finished["remote_implementation"], "GNU rsync");
+    assert_eq!(
+        finished["wire_version"],
+        i64::from(xsync_core::rsync::RSYNC_WIRE_VERSION)
+    );
+    assert_eq!(finished["selection_reason"], "explicit --transport=rsync");
+    assert_eq!(finished["checksum_algorithm"], "md5");
+    assert!(finished["wire_bytes"].as_u64().unwrap() > 0);
+    assert!(finished["mapped_options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|option| option == "whole-file"));
+    assert!(finished["unavailable_guarantees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|guarantee| guarantee == "durable-resume"));
+}
+
+#[test]
+fn test_native_compression_reports_wire_bytes_for_mixed_corpus() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("text.txt"), vec![b'a'; 2 * 1024 * 1024]).unwrap();
+    let mut random = Vec::with_capacity(2 * 1024 * 1024);
+    let mut state = 0x1234_5678_u32;
+    for _ in 0..2 * 1024 * 1024 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        random.push(u8::try_from(state & 0xff).unwrap());
+    }
+    fs::write(src.path().join("random.bin"), random).unwrap();
+
+    let scripts = tempdir().unwrap();
+    let fake_rsh = write_fake_rsh(scripts.path(), "exec");
+    let compressed_dst = tempdir().unwrap();
+    let compressed = Command::new(xsync_bin())
+        .args([
+            "--transport=xsync",
+            "--progress-json",
+            "--compress-level",
+            "9",
+        ])
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", compressed_dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        compressed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compressed.stderr)
+    );
+    let compressed_finished = finished_json(&compressed.stdout);
+    assert_eq!(compressed_finished["compression_algorithm"], "zstd");
+    assert!(compressed_finished["wire_bytes"].as_u64().unwrap() > 0);
+
+    let raw_dst = tempdir().unwrap();
+    let raw = Command::new(xsync_bin())
+        .args(["--transport=xsync", "--progress-json", "--no-compress"])
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", raw_dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        raw.status.success(),
+        "{}",
+        String::from_utf8_lossy(&raw.stderr)
+    );
+    let raw_finished = finished_json(&raw.stdout);
+    assert_eq!(
+        raw_finished["compression_algorithm"],
+        serde_json::Value::Null
+    );
+    assert!(
+        compressed_finished["wire_bytes"].as_u64().unwrap()
+            < raw_finished["wire_bytes"].as_u64().unwrap()
+    );
+    assert_eq!(
+        build_manifest(compressed_dst.path()).unwrap(),
+        build_manifest(raw_dst.path()).unwrap()
+    );
+}
+
+fn finished_json(stdout: &[u8]) -> serde_json::Value {
+    String::from_utf8(stdout.to_vec())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|event: &serde_json::Value| event["event"] == "finished")
+        .expect("finished event")
+}
+
+#[test]
+fn test_native_compression_multi_stream_stress_preserves_mixed_ranges() {
+    let src = tempdir().unwrap();
+    for index in 0..2 {
+        let path = src.path().join(format!("chunk-{index}.bin"));
+        if index % 2 == 0 {
+            fs::write(path, vec![b'Z'; 40 * 1024 * 1024]).unwrap();
+        } else {
+            let mut bytes = Vec::with_capacity(40 * 1024 * 1024);
+            let mut state = 0x9e37_79b9_u32.wrapping_add(index);
+            for _ in 0..40 * 1024 * 1024 {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                bytes.push(u8::try_from(state & 0xff).unwrap());
+            }
+            fs::write(path, bytes).unwrap();
+        }
+    }
+    let scripts = tempdir().unwrap();
+    let fake_rsh = write_fake_rsh(scripts.path(), "exec");
+    let dst = tempdir().unwrap();
+    let output = Command::new(xsync_bin())
+        .args([
+            "--transport=xsync",
+            "--progress-json",
+            "--streams",
+            "4",
+            "--compress-level",
+            "5",
+        ])
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let finished = finished_json(&output.stdout);
+    assert_eq!(finished["compression_algorithm"], "zstd");
+    assert!(finished["wire_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(
+        build_manifest(src.path()).unwrap(),
+        build_manifest(dst.path()).unwrap()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_rsync_preserves_non_utf8_unix_filename() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let src = tempdir().unwrap();
+    let raw_name = std::ffi::OsString::from_vec(vec![b'n', b'a', b'm', b'e', 0xff]);
+    fs::write(src.path().join(&raw_name), b"raw").unwrap();
+    let dst = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), false) else {
+        return;
+    };
+
+    let output = Command::new(xsync_bin())
+        .arg("--transport=rsync")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(dst.path().join(raw_name)).unwrap(), b"raw");
 }
 
 #[test]
@@ -120,7 +722,10 @@ fn test_push_matches_local_sync_identically() {
     // Compare manifests
     let manifest_local = build_manifest(dst_local.path()).unwrap();
     let manifest_push = build_manifest(dst_push.path()).unwrap();
-    assert_eq!(manifest_local.manifest_digest, manifest_push.manifest_digest);
+    assert_eq!(
+        manifest_local.manifest_digest,
+        manifest_push.manifest_digest
+    );
     assert_eq!(manifest_local.entries.len(), manifest_push.entries.len());
 }
 
@@ -196,7 +801,10 @@ fn test_rsh_override_uses_fake_rsh_and_matches_push() {
 
     let manifest_local = build_manifest(dst_local.path()).unwrap();
     let manifest_fake = build_manifest(dst_fake.path()).unwrap();
-    assert_eq!(manifest_local.manifest_digest, manifest_fake.manifest_digest);
+    assert_eq!(
+        manifest_local.manifest_digest,
+        manifest_fake.manifest_digest
+    );
     assert_eq!(manifest_local.entries.len(), manifest_fake.entries.len());
 
     // `-e` short form routes through the same pipe transport.
@@ -210,7 +818,10 @@ fn test_rsh_override_uses_fake_rsh_and_matches_push() {
         .unwrap();
     assert!(status_short.success());
     let manifest_short = build_manifest(dst_short.path()).unwrap();
-    assert_eq!(manifest_fake.manifest_digest, manifest_short.manifest_digest);
+    assert_eq!(
+        manifest_fake.manifest_digest,
+        manifest_short.manifest_digest
+    );
 }
 
 #[test]
@@ -301,6 +912,7 @@ fn test_missing_remote_binary_reports_clear_error() {
     let missing_rsh = write_fake_rsh(script_dir.path(), "missing");
 
     let output = Command::new(xsync_bin())
+        .arg("--transport=xsync")
         .arg("-e")
         .arg(&missing_rsh)
         .arg(format!("{}/", src.path().display()))
@@ -367,7 +979,7 @@ fn test_durable_resume_skips_verified_ranges() {
     // physical bytes that are less than the full logical size.
     let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(
-        stdout.contains("resume:") && !stdout.contains(", 0 restarted,") ,
+        stdout.contains("resume:") && !stdout.contains(", 0 restarted,"),
         "expected nonzero resume accounting, got: {stdout}"
     );
     assert!(
@@ -394,6 +1006,7 @@ fn test_durable_resume_skips_verified_ranges() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn test_ssh_default_transport_reports_remote_stderr_on_failure() {
     let src = tempdir().unwrap();
@@ -439,8 +1052,11 @@ fn test_multi_stream_push_stripes_large_file_and_is_byte_identical() {
     let src = tempdir().unwrap();
     fs::create_dir_all(src.path().join("nested")).unwrap();
     for i in 0..20 {
-        fs::write(src.path().join("nested").join(format!("f{i:02}.bin")), vec![0x33 + i; 4096])
-            .unwrap();
+        fs::write(
+            src.path().join("nested").join(format!("f{i:02}.bin")),
+            vec![0x33 + i; 4096],
+        )
+        .unwrap();
     }
     // 64 MiB -> eight 8 MiB chunks, so each of four data sessions carries
     // multiple disjoint ranges and must prepare the file only once.
@@ -565,6 +1181,7 @@ fn test_server_stdout_is_protocol_only() {
         window: 32 * 1024 * 1024,
         job_id: [0u8; 16],
         compression: xsync_core::protocol::CompressionMode::None,
+        compression_level: 3,
     };
     let bytes = xsync_core::protocol::encode_frame(1, &handshake).unwrap();
     stdin.write_all(&bytes).unwrap();
@@ -579,7 +1196,9 @@ fn test_server_stdout_is_protocol_only() {
     let mut cursor = std::io::Cursor::new(&output.stdout);
     let mut decoded_count = 0;
     while cursor.position() < output.stdout.len() as u64 {
-        let frame = decoder.read(&mut cursor).expect("stdout must be valid frames only");
+        let frame = decoder
+            .read(&mut cursor)
+            .expect("stdout must be valid frames only");
         assert!(frame.message_id >= 1000);
         decoded_count += 1;
     }

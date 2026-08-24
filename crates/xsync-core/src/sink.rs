@@ -5,9 +5,11 @@
 //! verification is requested once more before becoming a file-level failure.
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use filetime::FileTime;
 
@@ -97,6 +99,7 @@ pub enum SinkError {
 #[derive(Debug, Clone)]
 pub struct Sink {
     root: PathBuf,
+    temporary_hashes: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Sink {
@@ -109,7 +112,10 @@ impl Sink {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)
             .map_err(|source| io_error("create destination root", &root, source))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            temporary_hashes: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     /// Return this sink's destination root.
@@ -157,7 +163,14 @@ impl Sink {
     /// Returns [`SinkError::InvalidPath`] for an unsafe protocol path.
     pub fn temporary_path(&self, relative_path: &str) -> Result<PathBuf, SinkError> {
         let final_path = self.destination_path(relative_path)?;
-        let hash = blake3::hash(relative_path.as_bytes()).to_hex();
+        let mut temporary_hashes = match self.temporary_hashes.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let hash = temporary_hashes
+            .entry(relative_path.to_owned())
+            .or_insert_with(|| blake3::hash(relative_path.as_bytes()).to_hex().to_string())
+            .clone();
         let parent = final_path
             .parent()
             .ok_or_else(|| invalid_path(relative_path))?;
@@ -728,10 +741,7 @@ mod tests {
         })
         .unwrap();
         sink.finish_large(&file).unwrap();
-        assert_eq!(
-            fs::read(temp.path().join("large")).unwrap(),
-            b"helloworld"
-        );
+        assert_eq!(fs::read(temp.path().join("large")).unwrap(), b"helloworld");
 
         // A differently-sized entry collapses the stage to the new size.
         let other = entry("large", EntryKind::File, 4, 0o600, 200);
@@ -743,10 +753,7 @@ mod tests {
             4
         );
         // The committed final file is unaffected by a later prepare.
-        assert_eq!(
-            fs::read(temp.path().join("large")).unwrap(),
-            b"helloworld"
-        );
+        assert_eq!(fs::read(temp.path().join("large")).unwrap(), b"helloworld");
     }
 
     #[cfg(unix)]

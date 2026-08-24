@@ -30,17 +30,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use filetime::{set_file_mtime, FileTime};
 use thiserror::Error;
 
-use crate::local::{
-    LocalEvent, LocalSyncOptions, LocalSyncReport, TransferMethod,
-};
+use crate::local::{LocalEvent, LocalSyncOptions, LocalSyncReport, TransferMethod};
 use crate::planner::{
-    try_plan, DestinationIndex, IndexConfig, PlannerError,
+    try_plan, try_plan_with_fingerprint, DestinationIndex, IndexConfig, PlannerError,
 };
 use crate::protocol::{
-    encode_frame, ByteRange, CompressionMode,
-    EntryRecord, FrameDecoder, Message, MetadataOperation,
-    ProtocolError, Role, MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD,
-    MAX_DATA_SEGMENT, DEFAULT_UNACKNOWLEDGED_WINDOW,
+    encode_frame, encode_frame_with_compression, ByteRange, CompressionMode, EntryRecord,
+    FrameDecoder, Message, MetadataOperation, ProtocolError, Role, DEFAULT_UNACKNOWLEDGED_WINDOW,
+    MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
 };
 use crate::scanner::{
     permission_mode, scan, EntryKind as ScanEntryKind, FileEntry, FileIdentity, ScanError,
@@ -48,6 +45,7 @@ use crate::scanner::{
 };
 use crate::sink::{Sink, SinkError, SymlinkTargetKind};
 use crate::source::{SourceReadError, SourceReader};
+use crate::strategy::{BATCH_TARGET_SIZE, MAX_BATCH_FILES, SMALL_FILE_LIMIT};
 
 /// Errors produced by server operations and remote protocol sessions.
 #[derive(Debug, Error)]
@@ -93,6 +91,9 @@ pub enum ServerError {
         /// Remote diagnostic message.
         message: String,
     },
+    /// The remote shell positively reported that xsync is unavailable.
+    #[error("xsync not found on remote host — install it or check PATH")]
+    MissingRemoteXsync,
     /// A transport error occurred on the named stream.
     #[error("transport error on stream {stream}: {message}")]
     Transport {
@@ -164,6 +165,24 @@ pub fn entry_record_from_file_entry(entry: &FileEntry) -> EntryRecord {
     }
 }
 
+fn content_identity(path: &Path) -> io::Result<FileIdentity> {
+    let hash = blake3::hash(&fs::read(path)?);
+    Ok(FileIdentity {
+        device: u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap_or([0; 8])),
+        file: u64::from_le_bytes(hash.as_bytes()[8..16].try_into().unwrap_or([0; 8])),
+    })
+}
+
+fn content_entry_record(root: &Path, entry: &FileEntry) -> Result<EntryRecord, ServerError> {
+    let mut record = entry_record_from_file_entry(entry);
+    if entry.kind == ScanEntryKind::File {
+        let identity = content_identity(&root.join(&entry.path)).map_err(ServerError::Io)?;
+        record.fingerprint[..8].copy_from_slice(&identity.device.to_le_bytes());
+        record.fingerprint[8..16].copy_from_slice(&identity.file.to_le_bytes());
+    }
+    Ok(record)
+}
+
 /// Convert an [`EntryRecord`] received from the wire into a [`FileEntry`].
 ///
 /// # Errors
@@ -172,16 +191,8 @@ pub fn file_entry_from_entry_record(record: &EntryRecord) -> Result<FileEntry, S
     let path = String::from_utf8(record.path.clone())
         .map_err(|_| ServerError::InvalidPath(format!("{:?}", record.path)))?;
     let mtime = nanos_to_system_time(record.mtime_ns);
-    let device = u64::from_le_bytes(
-        record.fingerprint[0..8]
-            .try_into()
-            .unwrap_or([0; 8]),
-    );
-    let file = u64::from_le_bytes(
-        record.fingerprint[8..16]
-            .try_into()
-            .unwrap_or([0; 8]),
-    );
+    let device = u64::from_le_bytes(record.fingerprint[0..8].try_into().unwrap_or([0; 8]));
+    let file = u64::from_le_bytes(record.fingerprint[8..16].try_into().unwrap_or([0; 8]));
     let kind = from_protocol_kind(record.kind);
     Ok(FileEntry {
         path,
@@ -235,6 +246,8 @@ pub struct Server {
     decoder: FrameDecoder,
     seen_destinations: HashSet<String>,
     journal: Option<crate::journal::ResumeJournal>,
+    compression: CompressionMode,
+    compression_level: i32,
 }
 
 impl Server {
@@ -247,6 +260,8 @@ impl Server {
             decoder: FrameDecoder::new(),
             seen_destinations: HashSet::new(),
             journal: None,
+            compression: CompressionMode::None,
+            compression_level: 3,
         }
     }
 
@@ -267,20 +282,24 @@ impl Server {
     ) -> Result<(), ServerError> {
         // 1. Receive Handshake from client.
         let frame = self.decoder.read(&mut reader)?;
-        let (client_role, client_capabilities, job_id, compression) = match frame.message {
-            Message::Handshake {
-                role,
-                capabilities,
-                job_id,
-                compression,
-                ..
-            } => (role, capabilities, job_id, compression),
-            other => {
-                return Err(ServerError::UnexpectedMessage(format!(
-                    "expected Handshake, got {other:?}"
-                )))
-            }
-        };
+        let (client_role, client_capabilities, job_id, compression, compression_level) =
+            match frame.message {
+                Message::Handshake {
+                    role,
+                    capabilities,
+                    job_id,
+                    compression,
+                    compression_level,
+                    ..
+                } => (role, capabilities, job_id, compression, compression_level),
+                other => {
+                    return Err(ServerError::UnexpectedMessage(format!(
+                        "expected Handshake, got {other:?}"
+                    )))
+                }
+            };
+        self.compression = compression;
+        self.compression_level = compression_level;
 
         // Establish the durable resume journal for this session's job ID.
         self.journal = Some(crate::journal::ResumeJournal::new(&job_id)?);
@@ -288,8 +307,7 @@ impl Server {
         // A data-only session (multi-stream) skips the destination scan and
         // only writes segment traffic; the control session owns metadata and
         // the journal.
-        let data_only =
-            client_capabilities & crate::protocol::CAP_DATA_ONLY != 0;
+        let data_only = client_capabilities & crate::protocol::CAP_DATA_ONLY != 0;
 
         // Determine server's role.
         let server_role = match client_role {
@@ -306,6 +324,7 @@ impl Server {
             window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
             job_id,
             compression,
+            compression_level,
         };
         let msg_id = self.next_id();
         let bytes = encode_frame(msg_id, &server_handshake)?;
@@ -322,13 +341,15 @@ impl Server {
 
         // 2. Receive SessionConfig from client.
         let frame = self.decoder.read(&mut reader)?;
-        let (paranoid, delete, checksum) = match frame.message {
+        let (paranoid, delete, checksum, dry_run, exclude_patterns) = match frame.message {
             Message::SessionConfig {
                 paranoid,
                 delete,
                 checksum,
+                dry_run,
+                exclude_patterns,
                 ..
-            } => (paranoid, delete, checksum),
+            } => (paranoid, delete, checksum, dry_run, exclude_patterns),
             other => {
                 return Err(ServerError::UnexpectedMessage(format!(
                     "expected SessionConfig, got {other:?}"
@@ -351,7 +372,15 @@ impl Server {
                 if data_only {
                     self.run_data_sink(&mut reader, &mut writer)
                 } else {
-                    self.run_sink(&mut reader, &mut writer, paranoid, delete, checksum)
+                    self.run_sink(
+                        &mut reader,
+                        &mut writer,
+                        paranoid,
+                        delete,
+                        checksum,
+                        dry_run,
+                        &exclude_patterns,
+                    )
                 }
             }
             Role::Source => self.run_source(&mut reader, &mut writer),
@@ -408,16 +437,22 @@ impl Server {
                             return Err(ServerError::DuplicatePath(file_entry.path.clone()));
                         }
                         let hash = blake3::hash(&data);
-                        sink.write_file_with_retry(&file_entry, &hash, |_attempt| {
-                            Ok(data.clone())
-                        })?;
+                        sink.write_file_with_retry(
+                            &file_entry,
+                            &hash,
+                            |_attempt| Ok(data.clone()),
+                        )?;
                         self.ack(writer, frame.message_id, 4)?;
                     } else if let Some(file_entry) = large_files.get(&file_id) {
                         let length = data.len() as u64;
                         let hash = blake3::hash(&data);
-                        sink.write_chunk_with_retry(file_entry, offset, length, &hash, |_attempt| {
-                            Ok(data.clone())
-                        })?;
+                        sink.write_chunk_with_retry(
+                            file_entry,
+                            offset,
+                            length,
+                            &hash,
+                            |_attempt| Ok(data.clone()),
+                        )?;
                         // Durably merge this verified range into the union journal.
                         let range = ByteRange { offset, length };
                         let track = large_ranges
@@ -454,10 +489,8 @@ impl Server {
                     if !self.seen_destinations.insert(rel_path.clone()) {
                         return Err(ServerError::DuplicatePath(rel_path));
                     }
-                    let device =
-                        u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
-                    let file =
-                        u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
+                    let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
+                    let file = u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
                     let mtime = nanos_to_system_time(mtime_ns);
                     let entry = FileEntry {
                         path: rel_path,
@@ -510,13 +543,16 @@ impl Server {
         Ok(())
     }
 
+    #[allow(clippy::fn_params_excessive_bools)]
     fn run_sink<R: Read, W: Write>(
         &mut self,
         reader: &mut R,
         writer: &mut W,
         paranoid: bool,
         delete: bool,
-        _checksum: bool,
+        checksum: bool,
+        dry_run: bool,
+        exclude_patterns: &[Vec<u8>],
     ) -> Result<(), ServerError> {
         // Destination scan phase: if destination exists, scan and send Scan frames.
         let mut entries = Vec::new();
@@ -524,7 +560,13 @@ impl Server {
             if let Ok(scan_result) = scan(&self.root) {
                 for item in scan_result.entries() {
                     if let Ok(entry) = item {
-                        entries.push(entry_record_from_file_entry(&entry));
+                        if !excluded_path(exclude_patterns, &entry.path) {
+                            entries.push(if checksum {
+                                content_entry_record(&self.root, &entry)?
+                            } else {
+                                entry_record_from_file_entry(&entry)
+                            });
+                        }
                     }
                 }
                 let _ = scan_result.finish();
@@ -598,6 +640,22 @@ impl Server {
                 }
                 Err(err) => return Err(ServerError::Protocol(err)),
             };
+
+            if dry_run
+                && matches!(
+                    &frame.message,
+                    Message::Metadata { .. }
+                        | Message::FileBatch { .. }
+                        | Message::FileSegment { .. }
+                        | Message::LargeFilePrepare { .. }
+                        | Message::LargeFileRange { .. }
+                        | Message::LargeFileFinish { .. }
+                )
+            {
+                return Err(ServerError::UnexpectedMessage(
+                    "dry-run receiver rejected a mutation message".to_owned(),
+                ));
+            }
 
             match frame.message {
                 Message::Metadata {
@@ -754,9 +812,11 @@ impl Server {
                             return Err(ServerError::DuplicatePath(file_entry.path.clone()));
                         }
                         let hash = blake3::hash(&data);
-                        sink.write_file_with_retry(&file_entry, &hash, |_attempt| {
-                            Ok(data.clone())
-                        })?;
+                        sink.write_file_with_retry(
+                            &file_entry,
+                            &hash,
+                            |_attempt| Ok(data.clone()),
+                        )?;
 
                         if paranoid {
                             let committed_path = sink.path_for(&file_entry.path)?;
@@ -839,8 +899,7 @@ impl Server {
                         return Err(ServerError::DuplicatePath(rel_path));
                     }
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
-                    let file =
-                        u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
+                    let file = u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
                     let mtime = nanos_to_system_time(mtime_ns);
                     let entry = FileEntry {
                         path: rel_path.clone(),
@@ -1095,6 +1154,11 @@ impl Server {
                     batch_id: _,
                     entries,
                 } => {
+                    // Segments stream out without stopping for each
+                    // acknowledgement; replies are drained on a bounded window
+                    // so the client's pending acknowledgements always fit in
+                    // the channel buffer.
+                    let mut outstanding = 0usize;
                     for entry_rec in entries {
                         let file_entry = file_entry_from_entry_record(&entry_rec)?;
                         let stable_read = source_reader.read(&file_entry)?;
@@ -1107,19 +1171,24 @@ impl Server {
                             data: stable_read.bytes,
                         };
                         let msg_id = self.next_id();
-                        let bytes = encode_frame(msg_id, &seg)?;
-                        writer.write_all(&bytes)?;
-                        writer.flush()?;
-
-                        // Wait for client Ack for segment.
-                        let ack_frame = self.decoder.read(reader)?;
-                        if !matches!(ack_frame.message, Message::Ack { .. }) {
-                            return Err(ServerError::UnexpectedMessage(format!(
-                                "expected Ack for segment, got {:?}",
-                                ack_frame.message
-                            )));
+                        write_data_frame(
+                            writer,
+                            msg_id,
+                            &seg,
+                            self.compression == CompressionMode::Zstd,
+                            self.compression_level,
+                        )?;
+                        outstanding += 1;
+                        if outstanding >= MAX_PIPELINED_FRAMES {
+                            drain_acks(
+                                &mut self.decoder,
+                                reader,
+                                &mut outstanding,
+                                MAX_PIPELINED_FRAMES / 2,
+                            )?;
                         }
                     }
+                    drain_acks(&mut self.decoder, reader, &mut outstanding, 0)?;
 
                     // Acknowledge the batch.
                     let ack = Message::Ack {
@@ -1142,8 +1211,7 @@ impl Server {
                     let rel_path = String::from_utf8(path)
                         .map_err(|_| ServerError::InvalidPath("invalid UTF-8 path".to_owned()))?;
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
-                    let file =
-                        u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
+                    let file = u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
                     let entry = FileEntry {
                         path: rel_path,
                         kind: ScanEntryKind::File,
@@ -1169,10 +1237,7 @@ impl Server {
                     writer.write_all(&bytes)?;
                     writer.flush()?;
                 }
-                Message::LargeFileRange {
-                    file_id,
-                    range,
-                } => {
+                Message::LargeFileRange { file_id, range } => {
                     if let Some(entry) = large_source_files.get(&file_id) {
                         let stable = source_reader.read(entry)?;
                         let start = usize::try_from(range.offset).unwrap_or(0);
@@ -1186,9 +1251,13 @@ impl Server {
                             data: slice.to_vec(),
                         };
                         let msg_id = self.next_id();
-                        let bytes = encode_frame(msg_id, &seg)?;
-                        writer.write_all(&bytes)?;
-                        writer.flush()?;
+                        write_data_frame(
+                            writer,
+                            msg_id,
+                            &seg,
+                            self.compression == CompressionMode::Zstd,
+                            self.compression_level,
+                        )?;
 
                         // Wait for client Ack for segment.
                         let ack_frame = self.decoder.read(reader)?;
@@ -1209,10 +1278,7 @@ impl Server {
                     writer.write_all(&bytes)?;
                     writer.flush()?;
                 }
-                Message::LargeFileFinish {
-                    file_id,
-                    digest: _,
-                } => {
+                Message::LargeFileFinish { file_id, digest: _ } => {
                     large_source_files.remove(&file_id);
                     let ack = Message::Ack {
                         acknowledged_id: frame.message_id,
@@ -1321,6 +1387,41 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
     server.run(&mut reader, &mut writer)
 }
 
+/// Frames the client may leave unacknowledged before it drains replies.
+///
+/// The receiver acknowledges every frame and blocks once its own writes fill the
+/// socket buffer, so a client that writes without ever reading can deadlock
+/// against it. An acknowledgement frame is 41 bytes, so this window keeps the
+/// peer's pending replies near 10 KiB — comfortably inside an ordinary pipe or
+/// SSH channel buffer — while still removing the per-file round trip.
+pub const MAX_PIPELINED_FRAMES: usize = 256;
+
+/// Read acknowledgements until at most `limit` frames remain outstanding.
+fn drain_acks<R: Read>(
+    decoder: &mut FrameDecoder,
+    reader: &mut R,
+    outstanding: &mut usize,
+    limit: usize,
+) -> Result<(), ServerError> {
+    while *outstanding > limit {
+        let frame = decoder
+            .read(reader)
+            .map_err(|error| map_transport_error(error, 0))?;
+        match frame.message {
+            Message::Ack { .. } => *outstanding -= 1,
+            Message::Error { code, message, .. } => {
+                return Err(ServerError::RemoteError { code, message })
+            }
+            other => {
+                return Err(ServerError::UnexpectedMessage(format!(
+                    "expected Ack while draining pipelined writes, got {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Run a client-side Push session (local source to remote destination).
 ///
 /// # Errors
@@ -1348,6 +1449,11 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         local_workers: options.local_workers,
         streams: options.streams,
     });
+    emit(LocalEvent::CloudPlaceholders {
+        files: 0,
+        bytes: 0,
+        detection_available: cfg!(target_os = "macos"),
+    });
 
     // 1. Send Handshake (Client is Source).
     let handshake = Message::Handshake {
@@ -1356,11 +1462,13 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         max_payload: MAX_COMPLETE_PAYLOAD as u32,
         max_segment: MAX_DATA_SEGMENT as u32,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-        job_id: session_job_id(
-            source_path.to_string_lossy().as_ref(),
-            dest_path,
-        ),
-        compression: CompressionMode::None,
+        job_id: session_job_id(source_path.to_string_lossy().as_ref(), dest_path),
+        compression: if options.compress {
+            CompressionMode::Zstd
+        } else {
+            CompressionMode::None
+        },
+        compression_level: options.compress_level,
     };
     let hs_id = alloc_id();
     let bytes = encode_frame(hs_id, &handshake)?;
@@ -1368,14 +1476,18 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     writer.flush()?;
 
     // Read Server Handshake and Ack.
-    let frame1 = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let frame1 = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
     if !matches!(frame1.message, Message::Handshake { .. }) {
         return Err(ServerError::UnexpectedMessage(format!(
             "expected Server Handshake, got {:?}",
             frame1.message
         )));
     }
-    let frame2 = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let frame2 = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
     if !matches!(frame2.message, Message::Ack { .. }) {
         return Err(ServerError::UnexpectedMessage(format!(
             "expected Ack for Handshake, got {:?}",
@@ -1390,8 +1502,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         chunk_bytes: 16 * 1024 * 1024,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
         delete: options.delete,
-        checksum: false,
+        checksum: options.checksum,
         paranoid: options.paranoid,
+        dry_run: options.dry_run,
+        exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
     };
     let sc_id = alloc_id();
     let bytes = encode_frame(sc_id, &session_config)?;
@@ -1399,7 +1513,9 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     writer.flush()?;
 
     // Read Ack for SessionConfig.
-    let frame3 = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let frame3 = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
     if !matches!(frame3.message, Message::Ack { .. }) {
         return Err(ServerError::UnexpectedMessage(format!(
             "expected Ack for SessionConfig, got {:?}",
@@ -1408,9 +1524,15 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     }
 
     // 3. Receive Scan pages from server.
+    emit(LocalEvent::Phase {
+        name: "scan",
+        started: true,
+    });
     let mut dest_entries = Vec::new();
     loop {
-        let frame = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+        let frame = decoder
+            .read(&mut reader)
+            .map_err(|e| map_transport_error(e, 0))?;
         match frame.message {
             Message::Scan {
                 scan_id: _,
@@ -1418,7 +1540,13 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 entries,
             } => {
                 for rec in entries {
-                    dest_entries.push(file_entry_from_entry_record(&rec)?);
+                    let entry = file_entry_from_entry_record(&rec)?;
+                    if !excluded_path(
+                        &encode_exclude_patterns(&options.exclude_patterns),
+                        &entry.path,
+                    ) {
+                        dest_entries.push(entry);
+                    }
                 }
                 // Send Ack for Scan page.
                 let ack = Message::Ack {
@@ -1455,10 +1583,22 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     let source_scan = scan(source_path)?;
     let mut source_entries = Vec::new();
     for item in source_scan.entries() {
-        let entry = item?;
-        source_entries.push(entry);
+        let mut entry = item?;
+        if options.checksum && entry.kind == ScanEntryKind::File {
+            entry.fingerprint.identity = content_identity(&source_path.join(&entry.path))?;
+        }
+        if !excluded_path(
+            &encode_exclude_patterns(&options.exclude_patterns),
+            &entry.path,
+        ) {
+            source_entries.push(entry);
+        }
     }
     source_scan.finish()?;
+    emit(LocalEvent::Phase {
+        name: "scan",
+        started: false,
+    });
 
     // Map source entries relative to destination root according to trailing-slash rules.
     let source_metadata = fs::symlink_metadata(source_path)?;
@@ -1494,7 +1634,15 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     }
 
     // Plan differences.
-    let plan = try_plan(mapped_source, dest_index)?;
+    emit(LocalEvent::Phase {
+        name: "plan",
+        started: true,
+    });
+    let plan = try_plan_with_fingerprint(mapped_source, dest_index, options.checksum)?;
+    emit(LocalEvent::Phase {
+        name: "plan",
+        started: false,
+    });
 
     let mut report = LocalSyncReport {
         local_workers: options.local_workers,
@@ -1526,11 +1674,23 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             path: entry.path.clone(),
         });
     }
+    if options.dry_run {
+        crate::local::emit_plan_actions(&plan, &mut emit);
+    }
 
+    emit(LocalEvent::Phase {
+        name: "transfer",
+        started: true,
+    });
     if !options.dry_run {
         // Create directories.
+        // `changed` covers a destination entry whose *type* differs — a file
+        // where the source now has a directory. The sink replaces it, but only
+        // if the client actually announces it, so both buckets are created.
         let mut dirs_to_create = plan.directories.new.clone();
+        dirs_to_create.extend(plan.directories.changed.iter().cloned());
         dirs_to_create.sort_by_key(|d| d.path.len());
+        let mut pending = 0usize;
         for dir in dirs_to_create {
             let meta_msg = Message::Metadata {
                 operation: MetadataOperation::CreateDirectory,
@@ -1542,23 +1702,30 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             let msg_id = alloc_id();
             let b = encode_frame(msg_id, &meta_msg)?;
             writer.write_all(&b)?;
-            writer.flush()?;
-
-            let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
-            if !matches!(ack.message, Message::Ack { .. }) {
-                return Err(ServerError::UnexpectedMessage(format!(
-                    "expected Ack for CreateDirectory, got {:?}",
-                    ack.message
-                )));
+            pending += 1;
+            if pending >= MAX_PIPELINED_FRAMES {
+                writer.flush()?;
+                drain_acks(
+                    &mut decoder,
+                    &mut reader,
+                    &mut pending,
+                    MAX_PIPELINED_FRAMES / 2,
+                )?;
             }
         }
+        writer.flush()?;
+        drain_acks(&mut decoder, &mut reader, &mut pending, 0)?;
 
         // Create symlinks.
+        let mut pending = 0usize;
         for sym in plan.symlinks.new.iter().chain(&plan.symlinks.changed) {
             let local_sym_path = if prefix.is_empty() {
                 source_path.join(&sym.path)
             } else {
-                let stripped = sym.path.strip_prefix(&format!("{prefix}/")).unwrap_or(&sym.path);
+                let stripped = sym
+                    .path
+                    .strip_prefix(&format!("{prefix}/"))
+                    .unwrap_or(&sym.path);
                 source_path.join(stripped)
             };
             let target = fs::read_link(&local_sym_path)?;
@@ -1574,20 +1741,148 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             let msg_id = alloc_id();
             let b = encode_frame(msg_id, &meta_msg)?;
             writer.write_all(&b)?;
-            writer.flush()?;
-
-            let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
-            if !matches!(ack.message, Message::Ack { .. }) {
-                return Err(ServerError::UnexpectedMessage(format!(
-                    "expected Ack for CreateSymlink, got {:?}",
-                    ack.message
-                )));
+            pending += 1;
+            if pending >= MAX_PIPELINED_FRAMES {
+                writer.flush()?;
+                drain_acks(
+                    &mut decoder,
+                    &mut reader,
+                    &mut pending,
+                    MAX_PIPELINED_FRAMES / 2,
+                )?;
             }
         }
+        writer.flush()?;
+        drain_acks(&mut decoder, &mut reader, &mut pending, 0)?;
 
         // Transfer files.
         let source_reader = SourceReader::new(source_path);
+
+        // Small files are coalesced and pipelined: one metadata frame describes
+        // many files, and their segments are written without stopping for each
+        // acknowledgement. This removes the two serialized round trips per file
+        // that previously dominated small-file transfers over a real link.
+        let small_files: Vec<&FileEntry> = plan
+            .files
+            .new
+            .iter()
+            .chain(&plan.files.changed)
+            .filter(|file| file.size <= SMALL_FILE_LIMIT)
+            .collect();
+        let mut cursor = 0usize;
+        while cursor < small_files.len() {
+            let mut loaded: Vec<(&FileEntry, Vec<u8>)> = Vec::new();
+            let mut batch_bytes = 0u64;
+            while cursor < small_files.len()
+                && loaded.len() < MAX_BATCH_FILES
+                && (loaded.is_empty()
+                    || batch_bytes.saturating_add(small_files[cursor].size) <= BATCH_TARGET_SIZE)
+            {
+                let file = small_files[cursor];
+                cursor += 1;
+                let mut file_to_read = file.clone();
+                if !prefix.is_empty() {
+                    file_to_read.path = file
+                        .path
+                        .strip_prefix(&format!("{prefix}/"))
+                        .unwrap_or(&file.path)
+                        .to_owned();
+                }
+                // Read before the file is announced, so a read failure never
+                // leaves the receiver waiting for a segment that never arrives.
+                match source_reader.read(&file_to_read) {
+                    Ok(stable) => {
+                        batch_bytes = batch_bytes.saturating_add(file.size);
+                        loaded.push((file, stable.bytes));
+                    }
+                    Err(err) => {
+                        emit(LocalEvent::Failed {
+                            path: file.path.clone(),
+                            message: err.to_string(),
+                        });
+                        report.failed_entries = report.failed_entries.saturating_add(1);
+                    }
+                }
+            }
+            if loaded.is_empty() {
+                continue;
+            }
+
+            let transferred: Vec<(String, u64)> = loaded
+                .iter()
+                .map(|(file, _)| (file.path.clone(), file.size))
+                .collect();
+            let entries = loaded
+                .iter()
+                .map(|(file, _)| {
+                    let mut rec = entry_record_from_file_entry(file);
+                    rec.path = file.path.as_bytes().to_vec();
+                    rec
+                })
+                .collect();
+
+            let batch_id = alloc_id();
+            let bytes = encode_frame(
+                batch_id,
+                &Message::FileBatch {
+                    batch_id: 1,
+                    entries,
+                },
+            )?;
+            writer.write_all(&bytes)?;
+            let mut outstanding = 1usize;
+
+            for (index, (_, data)) in loaded.into_iter().enumerate() {
+                // The receiver derives the same identity from the batch frame's
+                // message ID and the entry's position within it.
+                let file_id = (batch_id << 16) | index as u64;
+                let seg_msg = Message::FileSegment {
+                    file_id,
+                    offset: 0,
+                    data,
+                };
+                let msg_id = alloc_id();
+                let wire_bytes = write_data_frame(
+                    &mut writer,
+                    msg_id,
+                    &seg_msg,
+                    options.compress,
+                    options.compress_level,
+                )?;
+                report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
+                outstanding += 1;
+                if outstanding >= MAX_PIPELINED_FRAMES {
+                    writer.flush()?;
+                    drain_acks(
+                        &mut decoder,
+                        &mut reader,
+                        &mut outstanding,
+                        MAX_PIPELINED_FRAMES / 2,
+                    )?;
+                }
+            }
+            writer.flush()?;
+            drain_acks(&mut decoder, &mut reader, &mut outstanding, 0)?;
+
+            for (path, size) in transferred {
+                report.transferred_files = report.transferred_files.saturating_add(1);
+                report.transferred_bytes = report.transferred_bytes.saturating_add(size);
+                report.physical_bytes = report.physical_bytes.saturating_add(size);
+                report.byte_copies = report.byte_copies.saturating_add(1);
+                emit(LocalEvent::Transferred {
+                    path,
+                    bytes: size,
+                    physical_bytes: size,
+                    method: TransferMethod::ByteCopy,
+                });
+            }
+        }
+
         for file in plan.files.new.iter().chain(&plan.files.changed) {
+            if file.size <= SMALL_FILE_LIMIT {
+                // Already sent by the coalesced small-file pass above.
+                continue;
+            }
             let mut file_to_read = file.clone();
             if !prefix.is_empty() {
                 file_to_read.path = file
@@ -1622,7 +1917,9 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 writer.write_all(&b)?;
                 writer.flush()?;
 
-                let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                let ack = decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?;
                 if !matches!(ack.message, Message::Ack { .. }) {
                     return Err(ServerError::UnexpectedMessage(format!(
                         "expected Ack for FileBatch, got {:?}",
@@ -1637,11 +1934,18 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     data: stable.bytes,
                 };
                 let msg_id = alloc_id();
-                let b = encode_frame(msg_id, &seg_msg)?;
-                writer.write_all(&b)?;
-                writer.flush()?;
+                let wire_bytes = write_data_frame(
+                    &mut writer,
+                    msg_id,
+                    &seg_msg,
+                    options.compress,
+                    options.compress_level,
+                )?;
+                report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
 
-                let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                let ack = decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?;
                 if !matches!(ack.message, Message::Ack { .. }) {
                     return Err(ServerError::UnexpectedMessage(format!(
                         "expected Ack for FileSegment, got {:?}",
@@ -1678,7 +1982,9 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 writer.write_all(&b)?;
                 writer.flush()?;
 
-                let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                let ack = decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?;
                 if !matches!(ack.message, Message::Ack { .. }) {
                     return Err(ServerError::UnexpectedMessage(format!(
                         "expected Ack for LargeFilePrepare, got {:?}",
@@ -1691,8 +1997,9 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     let mut all = Vec::new();
                     let mut final_page = false;
                     while !final_page {
-                        let frame =
-                            decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                        let frame = decoder
+                            .read(&mut reader)
+                            .map_err(|e| map_transport_error(e, 0))?;
                         match frame.message {
                             Message::ResumePage {
                                 final_page: fp,
@@ -1718,11 +2025,8 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 }
 
                 // Send only the chunks that are not yet durably verified.
-                let missing = crate::journal::missing_chunks(
-                    file.size,
-                    8 * 1024 * 1024,
-                    &verified_ranges,
-                );
+                let missing =
+                    crate::journal::missing_chunks(file.size, 8 * 1024 * 1024, &verified_ranges);
                 let mut sent_bytes = 0u64;
                 for range in missing {
                     let start = usize::try_from(range.offset).unwrap_or(0);
@@ -1745,14 +2049,21 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                         data: stable.bytes[start..(start + len)].to_vec(),
                     };
                     let msg_id = alloc_id();
-                    let b = encode_frame(msg_id, &seg_msg)?;
-                    writer.write_all(&b)?;
-                    writer.flush()?;
+                    let wire_bytes = write_data_frame(
+                        &mut writer,
+                        msg_id,
+                        &seg_msg,
+                        options.compress,
+                        options.compress_level,
+                    )?;
+                    report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
 
-                    let ack1 =
-                        decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
-                    let ack2 =
-                        decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                    let ack1 = decoder
+                        .read(&mut reader)
+                        .map_err(|e| map_transport_error(e, 0))?;
+                    let ack2 = decoder
+                        .read(&mut reader)
+                        .map_err(|e| map_transport_error(e, 0))?;
                     if !matches!(ack1.message, Message::Ack { .. })
                         || !matches!(ack2.message, Message::Ack { .. })
                     {
@@ -1760,11 +2071,16 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                             "expected Ack for LargeFileRange/Segment".to_owned(),
                         ));
                     }
+                    emit(LocalEvent::Progress {
+                        path: file.path.clone(),
+                        stream: 0,
+                        completed: resumed_bytes.saturating_add(sent_bytes),
+                        total: file.size,
+                    });
                 }
-                retransmitted_bytes_total =
-                    retransmitted_bytes_total.saturating_add(sent_bytes);
-                checkpoint_bytes_total = checkpoint_bytes_total
-                    .saturating_add(resumed_bytes.saturating_add(sent_bytes));
+                retransmitted_bytes_total = retransmitted_bytes_total.saturating_add(sent_bytes);
+                checkpoint_bytes_total =
+                    checkpoint_bytes_total.saturating_add(resumed_bytes.saturating_add(sent_bytes));
 
                 let finish_msg = Message::LargeFileFinish {
                     file_id,
@@ -1775,7 +2091,9 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 writer.write_all(&b)?;
                 writer.flush()?;
 
-                let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                let ack = decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?;
                 if !matches!(ack.message, Message::Ack { .. }) {
                     return Err(ServerError::UnexpectedMessage(format!(
                         "expected Ack for LargeFileFinish, got {:?}",
@@ -1797,6 +2115,45 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             }
         }
 
+        // Deletions update parent directory mtimes, so perform them before the
+        // final directory metadata pass.
+        if options.delete && !report.partial_failure() {
+            let mut to_delete = Vec::new();
+            to_delete.extend(plan.files.extraneous.clone());
+            to_delete.extend(plan.symlinks.extraneous.clone());
+            to_delete.extend(plan.other.extraneous.clone());
+            let mut ext_dirs = plan.directories.extraneous.clone();
+            ext_dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
+            to_delete.extend(ext_dirs);
+
+            let mut pending = 0usize;
+            for entry in to_delete {
+                let meta_msg = Message::Metadata {
+                    operation: MetadataOperation::Delete,
+                    path: entry.path.as_bytes().to_vec(),
+                    target: Vec::new(),
+                    mode: 0,
+                    mtime_ns: 0,
+                };
+                let msg_id = alloc_id();
+                let b = encode_frame(msg_id, &meta_msg)?;
+                writer.write_all(&b)?;
+                pending += 1;
+                if pending >= MAX_PIPELINED_FRAMES {
+                    writer.flush()?;
+                    drain_acks(
+                        &mut decoder,
+                        &mut reader,
+                        &mut pending,
+                        MAX_PIPELINED_FRAMES / 2,
+                    )?;
+                }
+                emit(LocalEvent::Deleted { path: entry.path });
+            }
+            writer.flush()?;
+            drain_acks(&mut decoder, &mut reader, &mut pending, 0)?;
+        }
+
         // Finish directories metadata deepest first.
         let mut dirs_to_finish: Vec<_> = plan
             .directories
@@ -1806,6 +2163,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             .chain(&plan.directories.unchanged)
             .collect();
         dirs_to_finish.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
+        let mut pending = 0usize;
         for dir in dirs_to_finish {
             let meta_msg = Message::Metadata {
                 operation: MetadataOperation::SetDirectory,
@@ -1817,16 +2175,19 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             let msg_id = alloc_id();
             let b = encode_frame(msg_id, &meta_msg)?;
             writer.write_all(&b)?;
-            writer.flush()?;
-
-            let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
-            if !matches!(ack.message, Message::Ack { .. }) {
-                return Err(ServerError::UnexpectedMessage(format!(
-                    "expected Ack for SetDirectory, got {:?}",
-                    ack.message
-                )));
+            pending += 1;
+            if pending >= MAX_PIPELINED_FRAMES {
+                writer.flush()?;
+                drain_acks(
+                    &mut decoder,
+                    &mut reader,
+                    &mut pending,
+                    MAX_PIPELINED_FRAMES / 2,
+                )?;
             }
         }
+        writer.flush()?;
+        drain_acks(&mut decoder, &mut reader, &mut pending, 0)?;
 
         // Apply root directory metadata if source is a directory.
         if source_is_dir {
@@ -1842,7 +2203,9 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             writer.write_all(&b)?;
             writer.flush()?;
 
-            let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+            let ack = decoder
+                .read(&mut reader)
+                .map_err(|e| map_transport_error(e, 0))?;
             if !matches!(ack.message, Message::Ack { .. }) {
                 return Err(ServerError::UnexpectedMessage(format!(
                     "expected Ack for root SetDirectory, got {:?}",
@@ -1850,43 +2213,20 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 )));
             }
         }
-
-        // Delete extraneous entries if enabled.
-        if options.delete && !report.partial_failure() {
-            let mut to_delete = Vec::new();
-            to_delete.extend(plan.files.extraneous.clone());
-            to_delete.extend(plan.symlinks.extraneous.clone());
-            to_delete.extend(plan.other.extraneous.clone());
-            // Directories deleted deepest first
-            let mut ext_dirs = plan.directories.extraneous.clone();
-            ext_dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
-            to_delete.extend(ext_dirs);
-
-            for entry in to_delete {
-                let meta_msg = Message::Metadata {
-                    operation: MetadataOperation::Delete,
-                    path: entry.path.as_bytes().to_vec(),
-                    target: Vec::new(),
-                    mode: 0,
-                    mtime_ns: 0,
-                };
-                let msg_id = alloc_id();
-                let b = encode_frame(msg_id, &meta_msg)?;
-                writer.write_all(&b)?;
-                writer.flush()?;
-
-                let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
-                if !matches!(ack.message, Message::Ack { .. }) {
-                    return Err(ServerError::UnexpectedMessage(format!(
-                        "expected Ack for Delete, got {:?}",
-                        ack.message
-                    )));
-                }
-
-                emit(LocalEvent::Deleted { path: entry.path });
-            }
-        }
     }
+
+    emit(LocalEvent::Phase {
+        name: "transfer",
+        started: false,
+    });
+    emit(LocalEvent::Phase {
+        name: "metadata",
+        started: true,
+    });
+    emit(LocalEvent::Phase {
+        name: "metadata",
+        started: false,
+    });
 
     // Send Stats.
     let stats_msg = Message::Stats {
@@ -1901,7 +2241,9 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     writer.write_all(&b)?;
     writer.flush()?;
 
-    let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let ack = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
     if !matches!(ack.message, Message::Ack { .. }) {
         return Err(ServerError::UnexpectedMessage(format!(
             "expected Ack for Stats, got {:?}",
@@ -1919,9 +2261,11 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     report.checkpoint_bytes = checkpoint_bytes_total;
 
     emit(LocalEvent::Finished {
+        transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
+        wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
         failed_entries: report.failed_entries,
         warnings: report.warnings,
@@ -1967,10 +2311,14 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         local_workers: options.local_workers,
         streams: options.streams,
     });
+    emit(LocalEvent::CloudPlaceholders {
+        files: 0,
+        bytes: 0,
+        detection_available: cfg!(target_os = "macos"),
+    });
 
     // 1. Send Handshake (Client is Sink).
-    let job_id =
-        session_job_id(src_path, dest_path.to_string_lossy().as_ref());
+    let job_id = session_job_id(src_path, dest_path.to_string_lossy().as_ref());
     let resume_journal = crate::journal::ResumeJournal::new(&job_id)?;
     let handshake = Message::Handshake {
         role: Role::Sink,
@@ -1979,7 +2327,12 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         max_segment: MAX_DATA_SEGMENT as u32,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
         job_id,
-        compression: CompressionMode::None,
+        compression: if options.compress {
+            CompressionMode::Zstd
+        } else {
+            CompressionMode::None
+        },
+        compression_level: options.compress_level,
     };
     let hs_id = alloc_id();
     let bytes = encode_frame(hs_id, &handshake)?;
@@ -1987,14 +2340,18 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     writer.flush()?;
 
     // Read Server Handshake and Ack.
-    let frame1 = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let frame1 = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
     if !matches!(frame1.message, Message::Handshake { .. }) {
         return Err(ServerError::UnexpectedMessage(format!(
             "expected Server Handshake, got {:?}",
             frame1.message
         )));
     }
-    let frame2 = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let frame2 = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
     if !matches!(frame2.message, Message::Ack { .. }) {
         return Err(ServerError::UnexpectedMessage(format!(
             "expected Ack for Handshake, got {:?}",
@@ -2011,6 +2368,8 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         delete: options.delete,
         checksum: false,
         paranoid: options.paranoid,
+        dry_run: options.dry_run,
+        exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
     };
     let sc_id = alloc_id();
     let bytes = encode_frame(sc_id, &session_config)?;
@@ -2018,7 +2377,9 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     writer.flush()?;
 
     // Read Ack for SessionConfig.
-    let frame3 = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let frame3 = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
     if !matches!(frame3.message, Message::Ack { .. }) {
         return Err(ServerError::UnexpectedMessage(format!(
             "expected Ack for SessionConfig, got {:?}",
@@ -2027,10 +2388,16 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     }
 
     // 3. Receive source Scan pages from server.
+    emit(LocalEvent::Phase {
+        name: "scan",
+        started: true,
+    });
     let mut source_entries = Vec::new();
     let mut source_root_entry: Option<FileEntry> = None;
     loop {
-        let frame = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+        let frame = decoder
+            .read(&mut reader)
+            .map_err(|e| map_transport_error(e, 0))?;
         match frame.message {
             Message::Scan {
                 scan_id: _,
@@ -2053,7 +2420,13 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                             ),
                         });
                     } else {
-                        source_entries.push(file_entry_from_entry_record(&rec)?);
+                        let entry = file_entry_from_entry_record(&rec)?;
+                        if !excluded_path(
+                            &encode_exclude_patterns(&options.exclude_patterns),
+                            &entry.path,
+                        ) {
+                            source_entries.push(entry);
+                        }
                     }
                 }
                 // Send Ack for Scan page.
@@ -2087,12 +2460,22 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         if let Ok(dest_scan) = scan(dest_path) {
             for item in dest_scan.entries() {
                 if let Ok(entry) = item {
-                    dest_index.insert(entry)?;
+                    if !excluded_path(
+                        &encode_exclude_patterns(&options.exclude_patterns),
+                        &entry.path,
+                    ) {
+                        dest_index.insert(entry)?;
+                    }
                 }
             }
             let _ = dest_scan.finish();
         }
     }
+
+    emit(LocalEvent::Phase {
+        name: "scan",
+        started: false,
+    });
 
     // Map source entries according to trailing-slash rules.
     let source_basename = Path::new(src_path)
@@ -2114,7 +2497,15 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     }
 
     // Plan differences.
+    emit(LocalEvent::Phase {
+        name: "plan",
+        started: true,
+    });
     let plan = try_plan(mapped_source, dest_index)?;
+    emit(LocalEvent::Phase {
+        name: "plan",
+        started: false,
+    });
 
     let mut report = LocalSyncReport {
         local_workers: options.local_workers,
@@ -2146,7 +2537,14 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
             path: entry.path.clone(),
         });
     }
+    if options.dry_run {
+        crate::local::emit_plan_actions(&plan, &mut emit);
+    }
 
+    emit(LocalEvent::Phase {
+        name: "transfer",
+        started: true,
+    });
     if !options.dry_run {
         let sink = Sink::new(dest_path)?;
 
@@ -2178,29 +2576,134 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
             writer.write_all(&b)?;
             writer.flush()?;
 
-            let reply = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+            let reply = decoder
+                .read(&mut reader)
+                .map_err(|e| map_transport_error(e, 0))?;
             if let Message::Metadata { target, .. } = reply.message {
-                let target_str = String::from_utf8(target).map_err(|_| {
-                    ServerError::InvalidPath("invalid symlink target".to_owned())
-                })?;
-                sink.create_symlink(
-                    sym,
-                    Path::new(&target_str),
-                    SymlinkTargetKind::File,
-                )?;
+                let target_str = String::from_utf8(target)
+                    .map_err(|_| ServerError::InvalidPath("invalid symlink target".to_owned()))?;
+                sink.create_symlink(sym, Path::new(&target_str), SymlinkTargetKind::File)?;
             }
         }
 
-        // Request files from server.
-        for file in plan.files.new.iter().chain(&plan.files.changed) {
-            let raw_path = if prefix.is_empty() {
+        // Request files from server. Small files are requested as one
+        // coalesced batch, so their segments stream back continuously instead
+        // of costing a request round trip each.
+        let remote_path = |file: &FileEntry| -> String {
+            if prefix.is_empty() {
                 file.path.clone()
             } else {
                 file.path
                     .strip_prefix(&format!("{prefix}/"))
                     .unwrap_or(&file.path)
                     .to_owned()
-            };
+            }
+        };
+        let small_files: Vec<&FileEntry> = plan
+            .files
+            .new
+            .iter()
+            .chain(&plan.files.changed)
+            .filter(|file| file.size <= SMALL_FILE_LIMIT)
+            .collect();
+        let mut cursor = 0usize;
+        while cursor < small_files.len() {
+            let mut batch: Vec<&FileEntry> = Vec::new();
+            let mut batch_bytes = 0u64;
+            while cursor < small_files.len()
+                && batch.len() < MAX_BATCH_FILES
+                && (batch.is_empty()
+                    || batch_bytes.saturating_add(small_files[cursor].size) <= BATCH_TARGET_SIZE)
+            {
+                batch_bytes = batch_bytes.saturating_add(small_files[cursor].size);
+                batch.push(small_files[cursor]);
+                cursor += 1;
+            }
+
+            let entries = batch
+                .iter()
+                .map(|file| {
+                    let mut rec = entry_record_from_file_entry(file);
+                    rec.path = remote_path(file).into_bytes();
+                    rec
+                })
+                .collect();
+            let batch_id = alloc_id();
+            let bytes = encode_frame(
+                batch_id,
+                &Message::FileBatch {
+                    batch_id: 1,
+                    entries,
+                },
+            )?;
+            writer.write_all(&bytes)?;
+            writer.flush()?;
+
+            for file in &batch {
+                let seg_frame = decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?;
+                report.wire_bytes = report
+                    .wire_bytes
+                    .saturating_add(decoder.last_wire_bytes() as u64);
+                let data = match seg_frame.message {
+                    Message::FileSegment { data, .. } => data,
+                    other => {
+                        return Err(ServerError::UnexpectedMessage(format!(
+                            "expected FileSegment, got {other:?}"
+                        )))
+                    }
+                };
+                let hash = blake3::hash(&data);
+                sink.write_file_with_retry(file, &hash, |_attempt| Ok(data.clone()))?;
+                if options.paranoid {
+                    let committed_path = sink.path_for(&file.path)?;
+                    let readback = fs::read(&committed_path)?;
+                    if blake3::hash(&readback) != hash {
+                        return Err(ServerError::Sink(SinkError::VerificationFailed {
+                            path: file.path.clone(),
+                            attempts: 2,
+                        }));
+                    }
+                }
+                let ack = Message::Ack {
+                    acknowledged_id: seg_frame.message_id,
+                    acknowledged_type: 4,
+                };
+                let msg_id = alloc_id();
+                let bytes = encode_frame(msg_id, &ack)?;
+                writer.write_all(&bytes)?;
+                writer.flush()?;
+
+                report.transferred_files = report.transferred_files.saturating_add(1);
+                report.transferred_bytes = report.transferred_bytes.saturating_add(file.size);
+                report.physical_bytes = report.physical_bytes.saturating_add(file.size);
+                report.byte_copies = report.byte_copies.saturating_add(1);
+                emit(LocalEvent::Transferred {
+                    path: file.path.clone(),
+                    bytes: file.size,
+                    physical_bytes: file.size,
+                    method: TransferMethod::ByteCopy,
+                });
+            }
+
+            let batch_ack = decoder
+                .read(&mut reader)
+                .map_err(|e| map_transport_error(e, 0))?;
+            if !matches!(batch_ack.message, Message::Ack { .. }) {
+                return Err(ServerError::UnexpectedMessage(format!(
+                    "expected Ack for FileBatch, got {:?}",
+                    batch_ack.message
+                )));
+            }
+        }
+
+        for file in plan.files.new.iter().chain(&plan.files.changed) {
+            if file.size <= SMALL_FILE_LIMIT {
+                // Already retrieved by the coalesced small-file pass above.
+                continue;
+            }
+            let raw_path = remote_path(file);
 
             if file.size <= MAX_DATA_SEGMENT as u64 {
                 let mut rec = entry_record_from_file_entry(file);
@@ -2216,7 +2719,12 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 writer.flush()?;
 
                 // Server sends FileSegment.
-                let seg_frame = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                let seg_frame = decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?;
+                report.wire_bytes = report
+                    .wire_bytes
+                    .saturating_add(decoder.last_wire_bytes() as u64);
                 let data = match seg_frame.message {
                     Message::FileSegment { data, .. } => data,
                     other => {
@@ -2252,7 +2760,9 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 writer.flush()?;
 
                 // Read batch Ack.
-                let batch_ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                let batch_ack = decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?;
                 if !matches!(batch_ack.message, Message::Ack { .. }) {
                     return Err(ServerError::UnexpectedMessage(format!(
                         "expected Ack for FileBatch, got {:?}",
@@ -2292,8 +2802,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     sink.prepare_large(file)?;
                 }
                 let mut track = verified_ranges.clone();
-                let resumed_bytes: u64 =
-                    verified_ranges.iter().map(|r| r.length).sum();
+                let resumed_bytes: u64 = verified_ranges.iter().map(|r| r.length).sum();
                 resumed_bytes_total = resumed_bytes_total.saturating_add(resumed_bytes);
                 if resumed_bytes > 0 {
                     restarted_files_total += 1;
@@ -2315,7 +2824,9 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 writer.write_all(&b)?;
                 writer.flush()?;
 
-                let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                let ack = decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?;
                 if !matches!(ack.message, Message::Ack { .. }) {
                     return Err(ServerError::UnexpectedMessage(format!(
                         "expected Ack for LargeFilePrepare, got {:?}",
@@ -2340,8 +2851,12 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     writer.write_all(&b)?;
                     writer.flush()?;
 
-                    let seg_frame =
-                        decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                    let seg_frame = decoder
+                        .read(&mut reader)
+                        .map_err(|e| map_transport_error(e, 0))?;
+                    report.wire_bytes = report
+                        .wire_bytes
+                        .saturating_add(decoder.last_wire_bytes() as u64);
                     let data = match seg_frame.message {
                         Message::FileSegment { data, .. } => data,
                         other => {
@@ -2371,18 +2886,29 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     writer.flush()?;
 
                     // Read range Ack.
-                    let range_ack =
-                        decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                    let range_ack = decoder
+                        .read(&mut reader)
+                        .map_err(|e| map_transport_error(e, 0))?;
                     if !matches!(range_ack.message, Message::Ack { .. }) {
                         return Err(ServerError::UnexpectedMessage(format!(
                             "expected Ack for LargeFileRange, got {:?}",
                             range_ack.message
                         )));
                     }
+                    emit(LocalEvent::Progress {
+                        path: file.path.clone(),
+                        stream: 0,
+                        completed: verified_ranges
+                            .iter()
+                            .map(|r| r.length)
+                            .sum::<u64>()
+                            .saturating_add(sent_bytes),
+                        total: file.size,
+                    });
                 }
                 retransmitted_bytes_total = retransmitted_bytes_total.saturating_add(sent_bytes);
-                checkpoint_bytes_total = checkpoint_bytes_total
-                    .saturating_add(resumed_bytes.saturating_add(sent_bytes));
+                checkpoint_bytes_total =
+                    checkpoint_bytes_total.saturating_add(resumed_bytes.saturating_add(sent_bytes));
 
                 sink.finish_large(file)?;
                 resume_journal.clear(&identity)?;
@@ -2402,7 +2928,9 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 writer.write_all(&b)?;
                 writer.flush()?;
 
-                let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+                let ack = decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?;
                 if !matches!(ack.message, Message::Ack { .. }) {
                     return Err(ServerError::UnexpectedMessage(format!(
                         "expected Ack for LargeFileFinish, got {:?}",
@@ -2464,6 +2992,19 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         }
     }
 
+    emit(LocalEvent::Phase {
+        name: "transfer",
+        started: false,
+    });
+    emit(LocalEvent::Phase {
+        name: "metadata",
+        started: true,
+    });
+    emit(LocalEvent::Phase {
+        name: "metadata",
+        started: false,
+    });
+
     // Send Stats.
     let stats_msg = Message::Stats {
         files: report.transferred_files as u64,
@@ -2477,14 +3018,18 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     writer.write_all(&b)?;
     writer.flush()?;
 
-    let ack = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let ack = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
     if !matches!(ack.message, Message::Ack { .. }) {
         return Err(ServerError::UnexpectedMessage(format!(
             "expected Ack for Stats, got {:?}",
             ack.message
         )));
     }
-    let _server_stats = decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?;
+    let _server_stats = decoder
+        .read(&mut reader)
+        .map_err(|e| map_transport_error(e, 0))?;
 
     report.resumed_bytes = resumed_bytes_total;
     report.restarted_files = restarted_files_total;
@@ -2492,9 +3037,11 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     report.checkpoint_bytes = checkpoint_bytes_total;
 
     emit(LocalEvent::Finished {
+        transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
+        wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
         failed_entries: report.failed_entries,
         warnings: report.warnings,
@@ -2522,6 +3069,29 @@ pub fn session_job_id(left: &str, right: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
     out.copy_from_slice(&digest.as_bytes()[..16]);
     out
+}
+
+fn encode_exclude_patterns(patterns: &[String]) -> Vec<Vec<u8>> {
+    patterns
+        .iter()
+        .map(|pattern| pattern.as_bytes().to_vec())
+        .collect()
+}
+
+fn excluded_path(patterns: &[Vec<u8>], path: &str) -> bool {
+    let mut candidate = Some(path);
+    while let Some(value) = candidate {
+        if patterns.iter().any(|pattern| {
+            std::str::from_utf8(pattern)
+                .ok()
+                .and_then(|glob| globset::Glob::new(glob).ok())
+                .is_some_and(|glob| glob.compile_matcher().is_match(value))
+        }) {
+            return true;
+        }
+        candidate = value.rsplit_once('/').map(|(parent, _)| parent);
+    }
+    false
 }
 
 fn map_transport_error(err: ProtocolError, stream: usize) -> ServerError {
@@ -2588,16 +3158,33 @@ fn write_frame<W: Write>(writer: &mut W, id: u64, msg: &Message) -> Result<(), S
     Ok(())
 }
 
+fn write_data_frame<W: Write>(
+    writer: &mut W,
+    id: u64,
+    msg: &Message,
+    compress: bool,
+    level: i32,
+) -> Result<usize, ServerError> {
+    let mode = if compress {
+        CompressionMode::Zstd
+    } else {
+        CompressionMode::None
+    };
+    let bytes = encode_frame_with_compression(id, msg, mode, level)?;
+    writer.write_all(&bytes)?;
+    writer.flush()?;
+    Ok(bytes.len())
+}
+
 /// Read and verify one `Ack` frame.
 ///
 /// # Errors
 /// Returns [`ServerError`] if the next frame is not an `Ack`, or a protocol/
 /// transport error.
-fn expect_ack<R: Read>(
-    decoder: &mut FrameDecoder,
-    reader: &mut R,
-) -> Result<(), ServerError> {
-    let frame = decoder.read(reader).map_err(|e| map_transport_error(e, 0))?;
+fn expect_ack<R: Read>(decoder: &mut FrameDecoder, reader: &mut R) -> Result<(), ServerError> {
+    let frame = decoder
+        .read(reader)
+        .map_err(|e| map_transport_error(e, 0))?;
     if !matches!(frame.message, Message::Ack { .. }) {
         return Err(ServerError::UnexpectedMessage(format!(
             "expected Ack, got {:?}",
@@ -2633,10 +3220,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     mut emit: F,
 ) -> Result<LocalSyncReport, ServerError> {
     let streams = options.streams.max(1);
-    let job_id = session_job_id(
-        source_path.to_string_lossy().as_ref(),
-        dest_path,
-    );
+    let job_id = session_job_id(source_path.to_string_lossy().as_ref(), dest_path);
 
     // ---- Control session: handshake, destination scan, plan ----
     let mut control = spawn_server_child(dest_path, rsh, host)?;
@@ -2648,19 +3232,17 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             buf
         })
     });
-    let cstdin = control
-        .stdin
+    let cstdin = control.stdin.take().ok_or_else(|| ServerError::Transport {
+        stream: 0,
+        message: "failed to open control stdin".to_owned(),
+    })?;
+    let cstdout = control
+        .stdout
         .take()
         .ok_or_else(|| ServerError::Transport {
             stream: 0,
-            message: "failed to open control stdin".to_owned(),
-        })?;
-    let cstdout = control.stdout.take().ok_or_else(|| {
-        ServerError::Transport {
-            stream: 0,
             message: "failed to open control stdout".to_owned(),
-        }
-    })?;
+        })?;
     let mut cwriter = BufWriter::new(cstdin);
     let mut creader = BufReader::new(cstdout);
     let mut cdec = FrameDecoder::new();
@@ -2687,13 +3269,18 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
             job_id,
             compression: CompressionMode::None,
+            compression_level: 3,
         },
     )?;
     if !matches!(
-        cdec.read(&mut creader).map_err(|e| map_transport_error(e, 0))?.message,
+        cdec.read(&mut creader)
+            .map_err(|e| map_transport_error(e, 0))?
+            .message,
         Message::Handshake { .. }
     ) {
-        return Err(ServerError::UnexpectedMessage("control handshake".to_owned()));
+        return Err(ServerError::UnexpectedMessage(
+            "control handshake".to_owned(),
+        ));
     }
     expect_ack(&mut cdec, &mut creader)?;
 
@@ -2708,6 +3295,8 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             delete: options.delete,
             checksum: false,
             paranoid: options.paranoid,
+            dry_run: options.dry_run,
+            exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
         },
     )?;
     expect_ack(&mut cdec, &mut creader)?;
@@ -2715,7 +3304,9 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     // Destination scan pages from the control server.
     let mut dest_entries = Vec::new();
     loop {
-        let frame = cdec.read(&mut creader).map_err(|e| map_transport_error(e, 0))?;
+        let frame = cdec
+            .read(&mut creader)
+            .map_err(|e| map_transport_error(e, 0))?;
         match frame.message {
             Message::Scan {
                 final_page,
@@ -2725,10 +3316,14 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                 for rec in entries {
                     dest_entries.push(file_entry_from_entry_record(&rec)?);
                 }
-                write_frame(&mut cwriter, calloc(), &Message::Ack {
-                    acknowledged_id: frame.message_id,
-                    acknowledged_type: 9,
-                })?;
+                write_frame(
+                    &mut cwriter,
+                    calloc(),
+                    &Message::Ack {
+                        acknowledged_id: frame.message_id,
+                        acknowledged_type: 9,
+                    },
+                )?;
                 if final_page {
                     break;
                 }
@@ -2816,29 +3411,41 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         let mut dirs = plan.directories.new.clone();
         dirs.sort_by_key(|d| d.path.len());
         for dir in dirs {
-            write_frame(&mut cwriter, calloc(), &Message::Metadata {
-                operation: MetadataOperation::CreateDirectory,
-                path: dir.path.as_bytes().to_vec(),
-                target: Vec::new(),
-                mode: dir.mode,
-                mtime_ns: system_time_to_nanos(dir.mtime),
-            })?;
+            write_frame(
+                &mut cwriter,
+                calloc(),
+                &Message::Metadata {
+                    operation: MetadataOperation::CreateDirectory,
+                    path: dir.path.as_bytes().to_vec(),
+                    target: Vec::new(),
+                    mode: dir.mode,
+                    mtime_ns: system_time_to_nanos(dir.mtime),
+                },
+            )?;
             expect_ack(&mut cdec, &mut creader)?;
         }
         for sym in plan.symlinks.new.iter().chain(&plan.symlinks.changed) {
             let local = if prefix.is_empty() {
                 source_path.join(&sym.path)
             } else {
-                source_path.join(sym.path.strip_prefix(&format!("{prefix}/")).unwrap_or(&sym.path))
+                source_path.join(
+                    sym.path
+                        .strip_prefix(&format!("{prefix}/"))
+                        .unwrap_or(&sym.path),
+                )
             };
             let target = fs::read_link(&local)?;
-            write_frame(&mut cwriter, calloc(), &Message::Metadata {
-                operation: MetadataOperation::CreateSymlink,
-                path: sym.path.as_bytes().to_vec(),
-                target: target.into_os_string().into_encoded_bytes(),
-                mode: sym.mode,
-                mtime_ns: system_time_to_nanos(sym.mtime),
-            })?;
+            write_frame(
+                &mut cwriter,
+                calloc(),
+                &Message::Metadata {
+                    operation: MetadataOperation::CreateSymlink,
+                    path: sym.path.as_bytes().to_vec(),
+                    target: target.into_os_string().into_encoded_bytes(),
+                    mode: sym.mode,
+                    mtime_ns: system_time_to_nanos(sym.mtime),
+                },
+            )?;
             expect_ack(&mut cdec, &mut creader)?;
         }
     }
@@ -2864,19 +3471,25 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     for file in &large_files {
         let file_id = calloc();
         let rec = entry_record_from_file_entry(file);
-        write_frame(&mut cwriter, calloc(), &Message::LargeFilePrepare {
-            file_id,
-            path: file.path.as_bytes().to_vec(),
-            size: file.size,
-            mtime_ns: rec.mtime_ns,
-            mode: file.mode,
-            fingerprint: rec.fingerprint,
-        })?;
+        write_frame(
+            &mut cwriter,
+            calloc(),
+            &Message::LargeFilePrepare {
+                file_id,
+                path: file.path.as_bytes().to_vec(),
+                size: file.size,
+                mtime_ns: rec.mtime_ns,
+                mode: file.mode,
+                fingerprint: rec.fingerprint,
+            },
+        )?;
         expect_ack(&mut cdec, &mut creader)?;
         let mut verified = Vec::new();
         let mut final_page = false;
         while !final_page {
-            let frame = cdec.read(&mut creader).map_err(|e| map_transport_error(e, 0))?;
+            let frame = cdec
+                .read(&mut creader)
+                .map_err(|e| map_transport_error(e, 0))?;
             match frame.message {
                 Message::ResumePage {
                     final_page: fp,
@@ -2924,17 +3537,25 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         let mut rec = entry_record_from_file_entry(file);
         rec.path = file.path.as_bytes().to_vec();
         let batch_id = calloc();
-        write_frame(&mut cwriter, batch_id, &Message::FileBatch {
-            batch_id: 1,
-            entries: vec![rec],
-        })?;
+        write_frame(
+            &mut cwriter,
+            batch_id,
+            &Message::FileBatch {
+                batch_id: 1,
+                entries: vec![rec],
+            },
+        )?;
         expect_ack(&mut cdec, &mut creader)?;
         let sfile_id = (batch_id << 16) | 0;
-        write_frame(&mut cwriter, calloc(), &Message::FileSegment {
-            file_id: sfile_id,
-            offset: 0,
-            data: stable.bytes,
-        })?;
+        write_frame(
+            &mut cwriter,
+            calloc(),
+            &Message::FileSegment {
+                file_id: sfile_id,
+                offset: 0,
+                data: stable.bytes,
+            },
+        )?;
         expect_ack(&mut cdec, &mut creader)?;
 
         report.transferred_files = report.transferred_files.saturating_add(1);
@@ -2958,7 +3579,10 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     let mut assigned_by_path: HashMap<String, Vec<ByteRange>> = HashMap::new();
     let mut round = 0usize;
     for file in &large_files {
-        let verified = verified_by_path.get(&file.path).cloned().unwrap_or_default();
+        let verified = verified_by_path
+            .get(&file.path)
+            .cloned()
+            .unwrap_or_default();
         let missing = crate::journal::missing_chunks(file.size, chunk, &verified);
         for range in missing {
             let slot = grouped[round % streams]
@@ -2982,6 +3606,8 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     let data_threads = {
         let dest = dest_path.to_owned();
         let job_id_copy = job_id;
+        let compress = options.compress;
+        let compression_level = options.compress_level;
         let mut handles = Vec::new();
         let work_by_thread: Vec<(std::process::Child, Vec<(FileEntry, Vec<ByteRange>)>)> =
             data_work
@@ -2996,20 +3622,43 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             let prefix_copy = prefix.clone();
             let job = job_id_copy;
             handles.push(std::thread::spawn(move || {
-                run_data_thread(child, &sp, &prefix_copy, job, work)
+                run_data_thread(
+                    child,
+                    &sp,
+                    &prefix_copy,
+                    job,
+                    work,
+                    compress,
+                    compression_level,
+                )
             }));
         }
         handles
     };
 
-    let written: Vec<Result<Vec<(String, Vec<ByteRange>)>, ServerError>> =
-        data_threads.into_iter().map(|h| h.join().unwrap_or_else(|_| {
-            Err(ServerError::UnexpectedMessage("data thread panicked".to_owned()))
-        })).collect();
+    let written: Vec<Result<(Vec<(String, Vec<ByteRange>)>, u64), ServerError>> = data_threads
+        .into_iter()
+        .map(|h| {
+            h.join().unwrap_or_else(|_| {
+                Err(ServerError::UnexpectedMessage(
+                    "data thread panicked".to_owned(),
+                ))
+            })
+        })
+        .collect();
     let mut written_by_path: HashMap<String, Vec<ByteRange>> = HashMap::new();
     for result in written {
-        let ranges = result?;
+        let (ranges, wire_bytes) = result?;
+        report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes);
         for (path, mut rs) in ranges {
+            if let Some(file) = large_files.iter().find(|file| file.path == path) {
+                emit(LocalEvent::Progress {
+                    path: path.clone(),
+                    stream: 0,
+                    completed: rs.iter().map(|range| range.length).sum(),
+                    total: file.size,
+                });
+            }
             written_by_path.entry(path).or_default().append(&mut rs);
         }
     }
@@ -3018,8 +3667,14 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     let mut resumed_bytes_total = 0u64;
     let mut retransmitted_total = 0u64;
     for file in &large_files {
-        let verified = verified_by_path.get(&file.path).cloned().unwrap_or_default();
-        let assigned = assigned_by_path.get(&file.path).cloned().unwrap_or_default();
+        let verified = verified_by_path
+            .get(&file.path)
+            .cloned()
+            .unwrap_or_default();
+        let assigned = assigned_by_path
+            .get(&file.path)
+            .cloned()
+            .unwrap_or_default();
         let union = crate::journal::merge_ranges(&verified, &assigned);
         let covered: u64 = union.iter().map(|r| r.length).sum();
         if covered != file.size {
@@ -3030,9 +3685,8 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         }
         let resumed: u64 = verified.iter().map(|r| r.length).sum();
         resumed_bytes_total = resumed_bytes_total.saturating_add(resumed);
-        retransmitted_total = retransmitted_total.saturating_add(
-            assigned.iter().map(|r| r.length).sum::<u64>(),
-        );
+        retransmitted_total =
+            retransmitted_total.saturating_add(assigned.iter().map(|r| r.length).sum::<u64>());
 
         // Count the large file once, reporting physical bytes actually sent.
         let physical: u64 = assigned.iter().map(|r| r.length).sum();
@@ -3054,10 +3708,14 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         // the per-range journal checkpoints, not an end-of-transfer whole-file
         // readback (which would buffer the entire file).
         for (file_id, _file) in &control_large_ids {
-            write_frame(&mut cwriter, calloc(), &Message::LargeFileFinish {
-                file_id: *file_id,
-                digest: [0u8; 32],
-            })?;
+            write_frame(
+                &mut cwriter,
+                calloc(),
+                &Message::LargeFileFinish {
+                    file_id: *file_id,
+                    digest: [0u8; 32],
+                },
+            )?;
             expect_ack(&mut cdec, &mut creader)?;
         }
 
@@ -3071,23 +3729,31 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             .collect();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
         for dir in dirs {
-            write_frame(&mut cwriter, calloc(), &Message::Metadata {
-                operation: MetadataOperation::SetDirectory,
-                path: dir.path.as_bytes().to_vec(),
-                target: Vec::new(),
-                mode: dir.mode,
-                mtime_ns: system_time_to_nanos(dir.mtime),
-            })?;
+            write_frame(
+                &mut cwriter,
+                calloc(),
+                &Message::Metadata {
+                    operation: MetadataOperation::SetDirectory,
+                    path: dir.path.as_bytes().to_vec(),
+                    target: Vec::new(),
+                    mode: dir.mode,
+                    mtime_ns: system_time_to_nanos(dir.mtime),
+                },
+            )?;
             expect_ack(&mut cdec, &mut creader)?;
         }
         if source_is_dir {
-            write_frame(&mut cwriter, calloc(), &Message::Metadata {
-                operation: MetadataOperation::SetDirectory,
-                path: Vec::new(),
-                target: Vec::new(),
-                mode: permission_mode(&source_metadata),
-                mtime_ns: system_time_to_nanos(source_metadata.modified()?),
-            })?;
+            write_frame(
+                &mut cwriter,
+                calloc(),
+                &Message::Metadata {
+                    operation: MetadataOperation::SetDirectory,
+                    path: Vec::new(),
+                    target: Vec::new(),
+                    mode: permission_mode(&source_metadata),
+                    mtime_ns: system_time_to_nanos(source_metadata.modified()?),
+                },
+            )?;
             expect_ack(&mut cdec, &mut creader)?;
         }
 
@@ -3100,28 +3766,38 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             ext_dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
             to_delete.extend(ext_dirs);
             for entry in to_delete {
-                write_frame(&mut cwriter, calloc(), &Message::Metadata {
-                    operation: MetadataOperation::Delete,
-                    path: entry.path.as_bytes().to_vec(),
-                    target: Vec::new(),
-                    mode: 0,
-                    mtime_ns: 0,
-                })?;
+                write_frame(
+                    &mut cwriter,
+                    calloc(),
+                    &Message::Metadata {
+                        operation: MetadataOperation::Delete,
+                        path: entry.path.as_bytes().to_vec(),
+                        target: Vec::new(),
+                        mode: 0,
+                        mtime_ns: 0,
+                    },
+                )?;
                 expect_ack(&mut cdec, &mut creader)?;
                 emit(LocalEvent::Deleted { path: entry.path });
             }
         }
 
         // Stats.
-        write_frame(&mut cwriter, calloc(), &Message::Stats {
-            files: report.transferred_files as u64,
-            bytes: report.transferred_bytes,
-            skipped: report.skipped_files as u64,
-            warnings: report.warnings as u64,
-            failed: report.failed_entries as u64,
-        })?;
+        write_frame(
+            &mut cwriter,
+            calloc(),
+            &Message::Stats {
+                files: report.transferred_files as u64,
+                bytes: report.transferred_bytes,
+                skipped: report.skipped_files as u64,
+                warnings: report.warnings as u64,
+                failed: report.failed_entries as u64,
+            },
+        )?;
         expect_ack(&mut cdec, &mut creader)?;
-        let _server_stats = cdec.read(&mut creader).map_err(|e| map_transport_error(e, 0))?;
+        let _server_stats = cdec
+            .read(&mut creader)
+            .map_err(|e| map_transport_error(e, 0))?;
     }
 
     report.resumed_bytes = resumed_bytes_total;
@@ -3144,9 +3820,11 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     }
 
     emit(LocalEvent::Finished {
+        transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
+        wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
         failed_entries: report.failed_entries,
         warnings: report.warnings,
@@ -3167,6 +3845,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
 
 /// Drive one data-only `--server` session (Story 4.2), handshaking with the
 /// `CAP_DATA_ONLY` capability bit and writing the assigned large-file ranges.
+type DataThreadResult = (Vec<(String, Vec<ByteRange>)>, u64);
 ///
 /// # Errors
 /// Returns [`ServerError`] on protocol or transport failure.
@@ -3177,7 +3856,9 @@ fn run_data_thread(
     prefix: &str,
     job_id: [u8; 16],
     work: Vec<(FileEntry, Vec<ByteRange>)>,
-) -> Result<Vec<(String, Vec<ByteRange>)>, ServerError> {
+    compress: bool,
+    compression_level: i32,
+) -> Result<DataThreadResult, ServerError> {
     let stdin = child.stdin.take().ok_or_else(|| ServerError::Transport {
         stream: 0,
         message: "failed to open data stdin".to_owned(),
@@ -3194,7 +3875,14 @@ fn run_data_thread(
         })
     });
     let result = run_data_inner(
-        stdin, stdout, source_path, prefix, job_id, &work,
+        stdin,
+        stdout,
+        source_path,
+        prefix,
+        job_id,
+        &work,
+        compress,
+        compression_level,
     );
     if let Some(handle) = stderr {
         let text = handle.join().unwrap_or_default();
@@ -3215,7 +3903,9 @@ fn run_data_inner(
     prefix: &str,
     job_id: [u8; 16],
     work: &[(FileEntry, Vec<ByteRange>)],
-) -> Result<Vec<(String, Vec<ByteRange>)>, ServerError> {
+    compress: bool,
+    compression_level: i32,
+) -> Result<DataThreadResult, ServerError> {
     let mut writer = BufWriter::new(stdin);
     let mut reader = BufReader::new(stdout);
     let mut decoder = FrameDecoder::new();
@@ -3226,35 +3916,54 @@ fn run_data_inner(
         x
     };
 
-    write_frame(&mut writer, alloc(), &Message::Handshake {
-        role: Role::Source,
-        capabilities: crate::protocol::CAP_DATA_ONLY,
-        max_payload: MAX_COMPLETE_PAYLOAD as u32,
-        max_segment: MAX_DATA_SEGMENT as u32,
-        window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-        job_id,
-        compression: CompressionMode::None,
-    })?;
+    write_frame(
+        &mut writer,
+        alloc(),
+        &Message::Handshake {
+            role: Role::Source,
+            capabilities: crate::protocol::CAP_DATA_ONLY,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id,
+            compression: if compress {
+                CompressionMode::Zstd
+            } else {
+                CompressionMode::None
+            },
+            compression_level,
+        },
+    )?;
     if !matches!(
-        decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?.message,
+        decoder
+            .read(&mut reader)
+            .map_err(|e| map_transport_error(e, 0))?
+            .message,
         Message::Handshake { .. }
     ) {
         return Err(ServerError::UnexpectedMessage("data handshake".to_owned()));
     }
     expect_ack(&mut decoder, &mut reader)?;
-    write_frame(&mut writer, alloc(), &Message::SessionConfig {
-        streams: 1,
-        batch_bytes: 32 * 1024 * 1024,
-        chunk_bytes: 16 * 1024 * 1024,
-        window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-        delete: false,
-        checksum: false,
-        paranoid: false,
-    })?;
+    write_frame(
+        &mut writer,
+        alloc(),
+        &Message::SessionConfig {
+            streams: 1,
+            batch_bytes: 32 * 1024 * 1024,
+            chunk_bytes: 16 * 1024 * 1024,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            delete: false,
+            checksum: false,
+            paranoid: false,
+            dry_run: false,
+            exclude_patterns: Vec::new(),
+        },
+    )?;
     expect_ack(&mut decoder, &mut reader)?;
 
     let source_reader = SourceReader::new(source_path);
     let mut written: Vec<(String, Vec<ByteRange>)> = Vec::new();
+    let mut wire_bytes = 0_u64;
     for (file, ranges) in work {
         // Read the file once as the source for this session's slices.
         let rel = if prefix.is_empty() {
@@ -3271,34 +3980,51 @@ fn run_data_inner(
 
         let rec = entry_record_from_file_entry(file);
         let file_id = alloc();
-        write_frame(&mut writer, alloc(), &Message::LargeFilePrepare {
-            file_id,
-            path: file.path.as_bytes().to_vec(),
-            size: file.size,
-            mtime_ns: rec.mtime_ns,
-            mode: file.mode,
-            fingerprint: rec.fingerprint,
-        })?;
+        write_frame(
+            &mut writer,
+            alloc(),
+            &Message::LargeFilePrepare {
+                file_id,
+                path: file.path.as_bytes().to_vec(),
+                size: file.size,
+                mtime_ns: rec.mtime_ns,
+                mode: file.mode,
+                fingerprint: rec.fingerprint,
+            },
+        )?;
         expect_ack(&mut decoder, &mut reader)?;
 
         for range in ranges {
             let start = usize::try_from(range.offset).unwrap_or(0);
             let len = usize::try_from(range.length).unwrap_or(0);
-            write_frame(&mut writer, alloc(), &Message::LargeFileRange {
-                file_id,
-                range: *range,
-            })?;
+            write_frame(
+                &mut writer,
+                alloc(),
+                &Message::LargeFileRange {
+                    file_id,
+                    range: *range,
+                },
+            )?;
             if !matches!(
-                decoder.read(&mut reader).map_err(|e| map_transport_error(e, 0))?.message,
+                decoder
+                    .read(&mut reader)
+                    .map_err(|e| map_transport_error(e, 0))?
+                    .message,
                 Message::Ack { .. }
             ) {
                 return Err(ServerError::UnexpectedMessage("data range ack".to_owned()));
             }
-            write_frame(&mut writer, alloc(), &Message::FileSegment {
-                file_id,
-                offset: range.offset,
-                data: stable.bytes[start..start + len].to_vec(),
-            })?;
+            wire_bytes = wire_bytes.saturating_add(write_data_frame(
+                &mut writer,
+                alloc(),
+                &Message::FileSegment {
+                    file_id,
+                    offset: range.offset,
+                    data: stable.bytes[start..start + len].to_vec(),
+                },
+                compress,
+                compression_level,
+            )? as u64);
             expect_ack(&mut decoder, &mut reader)?;
             written.push((file.path.clone(), vec![*range]));
         }
@@ -3306,7 +4032,7 @@ fn run_data_inner(
     // Signal EOF to end the data session cleanly.
     drop(writer);
     drop(reader);
-    Ok(written)
+    Ok((written, wire_bytes))
 }
 
 /// Spawn a local child `xsync --server <path>` process and execute pull.
@@ -3338,11 +4064,21 @@ pub fn sync_pull_server<F: FnMut(LocalEvent)>(
     })
 }
 
-/// Message reported when the remote `xsync` binary cannot be located.
-const MISSING_XSYNC_MSG: &str = "xsync not found on remote host — install it or check PATH";
-
 fn parse_rsh_command(rsh: &str) -> Vec<String> {
     shlex::split(rsh).unwrap_or_else(|| vec![rsh.to_owned()])
+}
+
+fn quote_remote_arg(argument: &str) -> String {
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+fn xsync_remote_command(remote_path: &str) -> String {
+    format!(
+        "{} {} {}",
+        quote_remote_arg("xsync"),
+        quote_remote_arg("--server"),
+        quote_remote_arg(remote_path)
+    )
 }
 
 /// Default remote shell; replaced only by an explicit `-e/--rsh`.
@@ -3351,17 +4087,15 @@ const DEFAULT_RSH: &str = "ssh";
 fn is_missing_xsync_stderr(stderr: &str, exit_code: Option<i32>) -> bool {
     let lower = stderr.to_lowercase();
     lower.contains("xsync: command not found")
-        || lower.contains("command not found")
-        || lower.contains("no such file")
-        || lower.contains("not found")
-        || exit_code == Some(127)
+        || lower.contains("xsync: not found")
+        || (exit_code == Some(127) && lower.contains("xsync"))
 }
 
 /// Compute `(program, args)` used to launch the remote `xsync --server`.
 ///
-/// - Explicit `-e CMD`: shell request parsed (shlex), then `{host}` and
-///   `xsync --server {path}` are appended.
-/// - No `-e` but a host: the default `ssh {host} xsync --server {path}`.
+/// - Explicit `-e CMD`: shell request parsed (shlex), then `{host}` and one
+///   injection-safe quoted remote command are appended.
+/// - No `-e` but a host: the default `ssh {host} '<quoted command>'`.
 /// - No host and no `-e`: an in-process/local child server via `current_exe`.
 #[must_use]
 pub fn remote_server_command(
@@ -3379,30 +4113,24 @@ pub fn remote_server_command(
         };
         if let Some(h) = host {
             args.push(h.to_owned());
+            args.push(xsync_remote_command(remote_path));
+        } else {
+            args.push("xsync".to_owned());
+            args.push("--server".to_owned());
+            args.push(remote_path.to_owned());
         }
-        args.push("xsync".to_owned());
-        args.push("--server".to_owned());
-        args.push(remote_path.to_owned());
         (program, args)
     } else if let Some(h) = host {
         (
             DEFAULT_RSH.to_owned(),
-            vec![
-                h.to_owned(),
-                "xsync".to_owned(),
-                "--server".to_owned(),
-                remote_path.to_owned(),
-            ],
+            vec![h.to_owned(), xsync_remote_command(remote_path)],
         )
     } else {
         let exe = std::env::current_exe()
             .unwrap_or_else(|_| PathBuf::from("xsync"))
             .to_string_lossy()
             .into_owned();
-        (
-            exe,
-            vec!["--server".to_owned(), remote_path.to_owned()],
-        )
+        (exe, vec!["--server".to_owned(), remote_path.to_owned()])
     }
 }
 
@@ -3426,12 +4154,9 @@ fn spawn_server_child(
 }
 
 /// Run a client protocol session against a spawned remote child, draining the
-/// child's stderr so a missing remote binary is reported as
-/// [`MISSING_XSYNC_MSG`] rather than as a raw broken-pipe error.
-fn run_server_child_session<F>(
-    child: Child,
-    f: F,
-) -> Result<LocalSyncReport, ServerError>
+/// child's stderr so a missing remote binary is reported as a typed selection
+/// result rather than as a raw broken-pipe error.
+fn run_server_child_session<F>(child: Child, f: F) -> Result<LocalSyncReport, ServerError>
 where
     F: FnOnce(
         &mut BufReader<std::process::ChildStdout>,
@@ -3443,13 +4168,10 @@ where
         stream: 0,
         message: "failed to open child stdin".to_owned(),
     })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| ServerError::Transport {
-            stream: 0,
-            message: "failed to open child stdout".to_owned(),
-        })?;
+    let stdout = child.stdout.take().ok_or_else(|| ServerError::Transport {
+        stream: 0,
+        message: "failed to open child stdout".to_owned(),
+    })?;
     let stderr = child.stderr.take();
 
     // Drain stderr on a background thread: it both unblocks the child should its
@@ -3486,9 +4208,16 @@ where
     let exit_code = status.and_then(|s| s.code());
 
     if is_missing_xsync_stderr(&stderr_text, exit_code) {
+        return Err(ServerError::MissingRemoteXsync);
+    }
+
+    if status.is_some_and(|status| !status.success()) && result.is_ok() {
         return Err(ServerError::Transport {
             stream: 0,
-            message: MISSING_XSYNC_MSG.to_owned(),
+            message: format!(
+                "remote xsync exited with status {}",
+                exit_code.map_or_else(|| "unknown".to_owned(), |code| code.to_string())
+            ),
         });
     }
 
@@ -3507,40 +4236,67 @@ mod tests {
         let mut input = Vec::new();
 
         // Handshake: client is the source (we are sending data at the sink).
-        input.extend_from_slice(&encode_frame(1, &Message::Handshake {
-            role: Role::Source,
-            capabilities: 0,
-            max_payload: MAX_COMPLETE_PAYLOAD as u32,
-            max_segment: MAX_DATA_SEGMENT as u32,
-            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-            job_id: [9u8; 16],
-            compression: CompressionMode::None,
-        }).unwrap());
+        input.extend_from_slice(
+            &encode_frame(
+                1,
+                &Message::Handshake {
+                    role: Role::Source,
+                    capabilities: 0,
+                    max_payload: MAX_COMPLETE_PAYLOAD as u32,
+                    max_segment: MAX_DATA_SEGMENT as u32,
+                    window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+                    job_id: [9u8; 16],
+                    compression: CompressionMode::None,
+                    compression_level: 3,
+                },
+            )
+            .unwrap(),
+        );
 
         // SessionConfig.
-        input.extend_from_slice(&encode_frame(2, &Message::SessionConfig {
-            streams: 1,
-            batch_bytes: 32 * 1024 * 1024,
-            chunk_bytes: 16 * 1024 * 1024,
-            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-            delete: false,
-            checksum: false,
-            paranoid: false,
-        }).unwrap());
+        input.extend_from_slice(
+            &encode_frame(
+                2,
+                &Message::SessionConfig {
+                    streams: 1,
+                    batch_bytes: 32 * 1024 * 1024,
+                    chunk_bytes: 16 * 1024 * 1024,
+                    window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+                    delete: false,
+                    checksum: false,
+                    paranoid: false,
+                    dry_run: false,
+                    exclude_patterns: Vec::new(),
+                },
+            )
+            .unwrap(),
+        );
 
         // Ack the (empty) destination Scan page the server sends after config.
-        input.extend_from_slice(&encode_frame(3, &Message::Ack {
-            acknowledged_id: 1002,
-            acknowledged_type: 9,
-        }).unwrap());
+        input.extend_from_slice(
+            &encode_frame(
+                3,
+                &Message::Ack {
+                    acknowledged_id: 1002,
+                    acknowledged_type: 9,
+                },
+            )
+            .unwrap(),
+        );
 
         // A FileSegment whose file_id was never prepared/batched: this must fail
         // loudly rather than report success while dropping the bytes.
-        input.extend_from_slice(&encode_frame(4, &Message::FileSegment {
-            file_id: 9_999,
-            offset: 0,
-            data: b"must not be silently dropped".to_vec(),
-        }).unwrap());
+        input.extend_from_slice(
+            &encode_frame(
+                4,
+                &Message::FileSegment {
+                    file_id: 9_999,
+                    offset: 0,
+                    data: b"must not be silently dropped".to_vec(),
+                },
+            )
+            .unwrap(),
+        );
 
         let mut server = Server::new(dst.path());
         let mut output = Vec::new();
@@ -3553,10 +4309,7 @@ mod tests {
             "unregistered FileSegment must be rejected, got {result:?}"
         );
         // No file may be published for the dropped segment.
-        let count = dst
-            .path()
-            .read_dir()
-            .map_or(0, |iter| iter.count());
+        let count = dst.path().read_dir().map_or(0, |iter| iter.count());
         assert_eq!(count, 0);
     }
 
@@ -3566,45 +4319,86 @@ mod tests {
         let mut input = Vec::new();
 
         // Handshake requesting a data-only session.
-        input.extend_from_slice(&encode_frame(1, &Message::Handshake {
-            role: Role::Source,
-            capabilities: crate::protocol::CAP_DATA_ONLY,
-            max_payload: MAX_COMPLETE_PAYLOAD as u32,
-            max_segment: MAX_DATA_SEGMENT as u32,
-            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-            job_id: [12u8; 16],
-            compression: CompressionMode::None,
-        }).unwrap());
-        input.extend_from_slice(&encode_frame(2, &Message::SessionConfig {
-            streams: 1,
-            batch_bytes: 32 * 1024 * 1024,
-            chunk_bytes: 16 * 1024 * 1024,
-            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
-            delete: false, checksum: false, paranoid: false,
-        }).unwrap());
+        input.extend_from_slice(
+            &encode_frame(
+                1,
+                &Message::Handshake {
+                    role: Role::Source,
+                    capabilities: crate::protocol::CAP_DATA_ONLY,
+                    max_payload: MAX_COMPLETE_PAYLOAD as u32,
+                    max_segment: MAX_DATA_SEGMENT as u32,
+                    window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+                    job_id: [12u8; 16],
+                    compression: CompressionMode::None,
+                    compression_level: 3,
+                },
+            )
+            .unwrap(),
+        );
+        input.extend_from_slice(
+            &encode_frame(
+                2,
+                &Message::SessionConfig {
+                    streams: 1,
+                    batch_bytes: 32 * 1024 * 1024,
+                    chunk_bytes: 16 * 1024 * 1024,
+                    window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+                    delete: false,
+                    checksum: false,
+                    paranoid: false,
+                    dry_run: false,
+                    exclude_patterns: Vec::new(),
+                },
+            )
+            .unwrap(),
+        );
         // Prepare a 9-byte large file, then write its first 5 bytes.
-        input.extend_from_slice(&encode_frame(3, &Message::LargeFilePrepare {
-            file_id: 501,
-            path: b"big.bin".to_vec(),
-            size: 9,
-            mtime_ns: 1_000_000_000,
-            mode: 0o644,
-            fingerprint: [1u8; 32],
-        }).unwrap());
-        input.extend_from_slice(&encode_frame(4, &Message::LargeFileRange {
-            file_id: 501,
-            range: ByteRange { offset: 0, length: 5 },
-        }).unwrap());
-        input.extend_from_slice(&encode_frame(5, &Message::FileSegment {
-            file_id: 501,
-            offset: 0,
-            data: b"hello".to_vec(),
-        }).unwrap());
+        input.extend_from_slice(
+            &encode_frame(
+                3,
+                &Message::LargeFilePrepare {
+                    file_id: 501,
+                    path: b"big.bin".to_vec(),
+                    size: 9,
+                    mtime_ns: 1_000_000_000,
+                    mode: 0o644,
+                    fingerprint: [1u8; 32],
+                },
+            )
+            .unwrap(),
+        );
+        input.extend_from_slice(
+            &encode_frame(
+                4,
+                &Message::LargeFileRange {
+                    file_id: 501,
+                    range: ByteRange {
+                        offset: 0,
+                        length: 5,
+                    },
+                },
+            )
+            .unwrap(),
+        );
+        input.extend_from_slice(
+            &encode_frame(
+                5,
+                &Message::FileSegment {
+                    file_id: 501,
+                    offset: 0,
+                    data: b"hello".to_vec(),
+                },
+            )
+            .unwrap(),
+        );
 
         let mut server = Server::new(dst.path());
         let mut output = Vec::new();
         let result = server.run(Cursor::new(&input), &mut output);
-        assert!(result.is_ok(), "data session must terminate cleanly: {result:?}");
+        assert!(
+            result.is_ok(),
+            "data session must terminate cleanly: {result:?}"
+        );
 
         // The data-only server must not have sent a destination Scan, and it
         // must have acknowledged the segment.
@@ -3623,7 +4417,10 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(!saw_scan, "data-only session must skip the destination scan");
+        assert!(
+            !saw_scan,
+            "data-only session must skip the destination scan"
+        );
         assert!(saw_seg_ack, "segment must be acknowledged");
 
         // The range landed in the shared stage at offset 0.
@@ -3636,17 +4433,27 @@ mod tests {
     fn default_remote_shell_is_ssh_over_host() {
         let (program, args) = remote_server_command("/dest", None, Some("user@mars"));
         assert_eq!(program, "ssh");
-        assert_eq!(
-            args,
-            ["user@mars", "xsync", "--server", "/dest"]
-        );
+        assert_eq!(args, ["user@mars", "'xsync' '--server' '/dest'"]);
     }
 
     #[test]
     fn explicit_rsh_replaces_the_shell_but_preserves_host_and_args() {
         let (program, args) = remote_server_command("/dest", Some("myrsh -oK=1"), Some("host"));
         assert_eq!(program, "myrsh");
-        assert_eq!(args, ["-oK=1", "host", "xsync", "--server", "/dest"]);
+        assert_eq!(args, ["-oK=1", "host", "'xsync' '--server' '/dest'"]);
+    }
+
+    #[test]
+    fn remote_path_is_shell_quoted_as_one_command() {
+        let (_, args) =
+            remote_server_command("/dst'; touch XSYNC_INJECTION; echo '", None, Some("host"));
+        assert_eq!(
+            args,
+            [
+                "host",
+                "'xsync' '--server' '/dst'\\''; touch XSYNC_INJECTION; echo '\\'''"
+            ]
+        );
     }
 
     #[test]
@@ -3869,6 +4676,7 @@ mod tests {
             window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
             job_id: [0u8; 16],
             compression: CompressionMode::None,
+            compression_level: 3,
         };
         client_to_server.extend_from_slice(&encode_frame(1, &hs).unwrap());
 
@@ -3881,6 +4689,8 @@ mod tests {
             delete: false,
             checksum: false,
             paranoid: false,
+            dry_run: false,
+            exclude_patterns: Vec::new(),
         };
         client_to_server.extend_from_slice(&encode_frame(2, &sc).unwrap());
 
@@ -3932,7 +4742,9 @@ mod tests {
         let mut cursor = Cursor::new(&server_output);
         let mut frame_count = 0;
         while cursor.position() < server_output.len() as u64 {
-            let frame = decoder.read(&mut cursor).expect("all bytes must form valid frames");
+            let frame = decoder
+                .read(&mut cursor)
+                .expect("all bytes must form valid frames");
             frame_count += 1;
             assert!(frame.message_id >= 1000);
         }

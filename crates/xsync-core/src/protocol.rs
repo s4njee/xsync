@@ -25,6 +25,10 @@ pub const DEFAULT_UNACKNOWLEDGED_WINDOW: usize = 32 * 1024 * 1024;
 pub const MAX_DECOMPRESSED_PAYLOAD: usize = MAX_COMPLETE_PAYLOAD;
 /// Maximum entries in a batch or scan message.
 pub const MAX_COLLECTION_COUNT: usize = 65_536;
+/// Maximum number of exclude patterns in one session.
+pub const MAX_EXCLUDE_PATTERNS: usize = 256;
+/// Maximum bytes in one exclude pattern.
+pub const MAX_EXCLUDE_PATTERN_BYTES: usize = 4 * 1024;
 /// Maximum ranges in one resume page.
 pub const MAX_RESUME_RANGES: usize = 65_536;
 /// Maximum error text length in bytes.
@@ -42,7 +46,7 @@ pub const CAP_DATA_ONLY: u32 = 1 << 0;
 /// Envelope flag indicating that the payload uses zstd compression.
 pub const FRAME_FLAG_ZSTD: u8 = 0x01;
 const MAX_HANDSHAKE_PAYLOAD: usize = 128;
-const MAX_SESSION_CONFIG_PAYLOAD: usize = 32;
+const MAX_SESSION_CONFIG_PAYLOAD: usize = 8 * 1024;
 
 /// The role of an endpoint in a synchronization session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +139,8 @@ pub enum Message {
         job_id: [u8; 16],
         /// Compression selected for payloads.
         compression: CompressionMode,
+        /// zstd level selected for payloads.
+        compression_level: i32,
     },
     /// Per-session strategy and behavior configuration.
     SessionConfig {
@@ -152,6 +158,10 @@ pub enum Message {
         checksum: bool,
         /// Whether published output receives readback verification.
         paranoid: bool,
+        /// Do discovery and classification without destination mutation.
+        dry_run: bool,
+        /// Relative-path glob patterns applied by both endpoints.
+        exclude_patterns: Vec<Vec<u8>>,
     },
     /// A bounded collection of metadata records.
     FileBatch {
@@ -290,6 +300,7 @@ impl Default for EncodeOptions {
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     seen_ids: HashSet<u64>,
+    last_wire_bytes: usize,
 }
 
 impl FrameDecoder {
@@ -297,6 +308,12 @@ impl FrameDecoder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Return the encoded size of the most recently read frame.
+    #[must_use]
+    pub fn last_wire_bytes(&self) -> usize {
+        self.last_wire_bytes
     }
 
     /// Decode one complete in-memory frame and reject a duplicate message ID.
@@ -331,6 +348,7 @@ impl FrameDecoder {
             .read_exact(&mut payload)
             .map_err(ProtocolError::Read)?;
         let frame = decode_parts(parsed, &payload)?;
+        self.last_wire_bytes = FRAME_HEADER_LEN.saturating_add(payload.len());
         self.remember(frame.message_id)?;
         Ok(frame)
     }
@@ -377,15 +395,50 @@ pub fn encode_frame_with_options(
         });
     }
 
-    let (flags, wire_payload) = if options.compression == CompressionMode::Zstd {
-        let compressed = compress_zstd(&payload)?;
-        if compressed.len() < payload.len() {
+    encode_payload_frame(message_id, message, &payload, options.compression, 3)
+}
+
+/// Encode a frame using a caller-selected zstd level.
+///
+/// # Errors
+/// Returns [`ProtocolError`] when the message exceeds a protocol limit or
+/// compression fails.
+pub fn encode_frame_with_compression(
+    message_id: u64,
+    message: &Message,
+    compression: CompressionMode,
+    level: i32,
+) -> Result<Vec<u8>, ProtocolError> {
+    let payload_capacity = validate_message(message)?;
+    let mut payload = Vec::with_capacity(payload_capacity);
+    encode_message_payload(message, &mut payload)?;
+    if payload.len() > MAX_DECOMPRESSED_PAYLOAD {
+        return Err(ProtocolError::PayloadTooLarge {
+            length: payload.len(),
+            maximum: MAX_DECOMPRESSED_PAYLOAD,
+        });
+    }
+    encode_payload_frame(message_id, message, &payload, compression, level)
+}
+
+fn encode_payload_frame(
+    message_id: u64,
+    message: &Message,
+    payload: &[u8],
+    compression: CompressionMode,
+    level: i32,
+) -> Result<Vec<u8>, ProtocolError> {
+    let (flags, wire_payload) = if compression == CompressionMode::Zstd {
+        let decision =
+            crate::compression::decide([payload], level).map_err(ProtocolError::Compression)?;
+        if decision.use_compression {
+            let compressed = compress_zstd(payload, level)?;
             (FRAME_FLAG_ZSTD, compressed)
         } else {
-            (0, payload.clone())
+            (0, payload.to_owned())
         }
     } else {
-        (0, payload.clone())
+        (0, payload.to_owned())
     };
     if wire_payload.len() > MAX_COMPLETE_PAYLOAD {
         return Err(ProtocolError::PayloadTooLarge {
@@ -552,12 +605,12 @@ fn parse_header(header: &[u8]) -> Result<ParsedHeader, ProtocolError> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn compress_zstd(payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
-    zstd::bulk::compress(payload, 3).map_err(ProtocolError::Compression)
+fn compress_zstd(payload: &[u8], level: i32) -> Result<Vec<u8>, ProtocolError> {
+    zstd::bulk::compress(payload, level).map_err(ProtocolError::Compression)
 }
 
 #[cfg(target_os = "windows")]
-fn compress_zstd(_payload: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+fn compress_zstd(_payload: &[u8], _level: i32) -> Result<Vec<u8>, ProtocolError> {
     Err(ProtocolError::CompressionUnavailable)
 }
 
@@ -700,19 +753,40 @@ fn validate_message(message: &Message) -> Result<usize, ProtocolError> {
             max_payload,
             max_segment,
             window,
+            compression,
+            compression_level,
             ..
         } => {
             validate_handshake(*max_payload, *max_segment, *window)?;
-            size = 34;
+            validate_compression(*compression, *compression_level)?;
+            size = 38;
         }
         Message::SessionConfig {
-            streams, window, ..
+            streams,
+            window,
+            exclude_patterns,
+            ..
         } => {
             if *streams == 0 || *streams > 16 {
                 return Err(ProtocolError::InvalidValue { field: "streams" });
             }
             validate_window(*window)?;
-            size = 16;
+            size = 19;
+            if exclude_patterns.len() > MAX_EXCLUDE_PATTERNS {
+                return Err(ProtocolError::CountTooLarge {
+                    count: exclude_patterns.len(),
+                    maximum: MAX_EXCLUDE_PATTERNS,
+                });
+            }
+            for pattern in exclude_patterns {
+                if pattern.len() > MAX_EXCLUDE_PATTERN_BYTES {
+                    return Err(ProtocolError::PayloadTooLarge {
+                        length: pattern.len(),
+                        maximum: MAX_EXCLUDE_PATTERN_BYTES,
+                    });
+                }
+                size = add_payload_size(size, prefixed_len(pattern.len())?)?;
+            }
         }
         Message::FileBatch { entries, .. } => {
             if entries.len() > MAX_COLLECTION_COUNT {
@@ -727,7 +801,7 @@ fn validate_message(message: &Message) -> Result<usize, ProtocolError> {
             }
         }
         Message::FileSegment { data, .. } => {
-            if data.is_empty() || data.len() > MAX_DATA_SEGMENT {
+            if data.len() > MAX_DATA_SEGMENT {
                 return Err(ProtocolError::DataSegmentTooLarge { length: data.len() });
             }
             size = add_payload_size(20, data.len())?;
@@ -862,6 +936,7 @@ fn encode_message_payload(message: &Message, output: &mut Vec<u8>) -> Result<(),
             window,
             job_id,
             compression,
+            compression_level,
         } => {
             writer.u8(role_to_wire(*role));
             writer.u32(*capabilities);
@@ -870,7 +945,9 @@ fn encode_message_payload(message: &Message, output: &mut Vec<u8>) -> Result<(),
             writer.u32(*window);
             writer.array(job_id);
             writer.u8(compression_to_wire(*compression));
+            writer.i32(*compression_level);
             validate_handshake(*max_payload, *max_segment, *window)?;
+            validate_compression(*compression, *compression_level)?;
         }
         Message::SessionConfig {
             streams,
@@ -880,6 +957,8 @@ fn encode_message_payload(message: &Message, output: &mut Vec<u8>) -> Result<(),
             delete,
             checksum,
             paranoid,
+            dry_run,
+            exclude_patterns,
         } => {
             if *streams == 0 || *streams > 16 {
                 return Err(ProtocolError::InvalidValue { field: "streams" });
@@ -892,6 +971,11 @@ fn encode_message_payload(message: &Message, output: &mut Vec<u8>) -> Result<(),
             writer.bool(*delete);
             writer.bool(*checksum);
             writer.bool(*paranoid);
+            writer.bool(*dry_run);
+            writer.count(exclude_patterns.len(), MAX_EXCLUDE_PATTERNS)?;
+            for pattern in exclude_patterns {
+                writer.blob(pattern, MAX_EXCLUDE_PATTERN_BYTES)?;
+            }
         }
         Message::FileBatch { batch_id, entries } => {
             writer.u64(*batch_id);
@@ -905,7 +989,7 @@ fn encode_message_payload(message: &Message, output: &mut Vec<u8>) -> Result<(),
             offset,
             data,
         } => {
-            if data.is_empty() || data.len() > MAX_DATA_SEGMENT {
+            if data.len() > MAX_DATA_SEGMENT {
                 return Err(ProtocolError::DataSegmentTooLarge { length: data.len() });
             }
             writer.u64(*file_id);
@@ -1038,6 +1122,7 @@ fn decode_message_payload(message_type: u8, payload: &[u8]) -> Result<Message, P
             let window = reader.u32()?;
             let job_id = reader.array::<16>()?;
             let compression = compression_from_wire(reader.u8()?)?;
+            let compression_level = reader.i32()?;
             validate_handshake(max_payload, max_segment, window)?;
             if payload.len() > MAX_HANDSHAKE_PAYLOAD {
                 return Err(ProtocolError::PayloadTooLarge {
@@ -1053,6 +1138,7 @@ fn decode_message_payload(message_type: u8, payload: &[u8]) -> Result<Message, P
                 window,
                 job_id,
                 compression,
+                compression_level,
             }
         }
         MessageType::SessionConfig => {
@@ -1063,6 +1149,12 @@ fn decode_message_payload(message_type: u8, payload: &[u8]) -> Result<Message, P
             let delete = reader.bool()?;
             let checksum = reader.bool()?;
             let paranoid = reader.bool()?;
+            let dry_run = reader.bool()?;
+            let count = reader.count(MAX_EXCLUDE_PATTERNS)?;
+            let mut exclude_patterns = Vec::with_capacity(count);
+            for _ in 0..count {
+                exclude_patterns.push(reader.blob(MAX_EXCLUDE_PATTERN_BYTES)?);
+            }
             if payload.len() > MAX_SESSION_CONFIG_PAYLOAD {
                 return Err(ProtocolError::PayloadTooLarge {
                     length: payload.len(),
@@ -1081,6 +1173,8 @@ fn decode_message_payload(message_type: u8, payload: &[u8]) -> Result<Message, P
                 delete,
                 checksum,
                 paranoid,
+                dry_run,
+                exclude_patterns,
             }
         }
         MessageType::FileBatch => {
@@ -1096,11 +1190,6 @@ fn decode_message_payload(message_type: u8, payload: &[u8]) -> Result<Message, P
             let file_id = reader.u64()?;
             let offset = reader.u64()?;
             let data = reader.blob(MAX_DATA_SEGMENT)?;
-            if data.is_empty() {
-                return Err(ProtocolError::InvalidValue {
-                    field: "segment data",
-                });
-            }
             Message::FileSegment {
                 file_id,
                 offset,
@@ -1286,6 +1375,15 @@ fn validate_handshake(
     validate_window(window)
 }
 
+fn validate_compression(compression: CompressionMode, level: i32) -> Result<(), ProtocolError> {
+    if compression == CompressionMode::Zstd && !(1..=22).contains(&level) {
+        return Err(ProtocolError::InvalidValue {
+            field: "compression level",
+        });
+    }
+    Ok(())
+}
+
 fn validate_window(window: u32) -> Result<(), ProtocolError> {
     if window == 0 || window as usize > DEFAULT_UNACKNOWLEDGED_WINDOW {
         return Err(ProtocolError::InvalidValue { field: "window" });
@@ -1400,6 +1498,10 @@ impl Writer<'_> {
         self.output.extend_from_slice(&value.to_le_bytes());
     }
 
+    fn i32(&mut self, value: i32) {
+        self.output.extend_from_slice(&value.to_le_bytes());
+    }
+
     fn u64(&mut self, value: u64) {
         self.output.extend_from_slice(&value.to_le_bytes());
     }
@@ -1491,6 +1593,12 @@ impl<'a> Reader<'a> {
         ))
     }
 
+    fn i32(&mut self) -> Result<i32, ProtocolError> {
+        Ok(i32::from_le_bytes(
+            self.take(4)?.try_into().unwrap_or([0; 4]),
+        ))
+    }
+
     fn u64(&mut self) -> Result<u64, ProtocolError> {
         Ok(u64::from_le_bytes(
             self.take(8)?.try_into().unwrap_or([0; 8]),
@@ -1578,7 +1686,7 @@ pub enum ProtocolError {
     /// A declared decompressed payload exceeds the session budget.
     #[error("declared decompressed length {length} exceeds maximum {maximum}")]
     DecompressedTooLarge { length: usize, maximum: usize },
-    /// A data segment is empty or larger than the segment budget.
+    /// A data segment exceeds the segment budget.
     #[error("data segment length {length} exceeds the allowed segment bounds")]
     DataSegmentTooLarge { length: usize },
     /// A collection count exceeds its bounded page size.
@@ -1714,6 +1822,7 @@ mod tests {
                 window: u32::try_from(DEFAULT_UNACKNOWLEDGED_WINDOW).unwrap(),
                 job_id: [1; 16],
                 compression: CompressionMode::Zstd,
+                compression_level: 3,
             },
             Message::SessionConfig {
                 streams: 4,
@@ -1723,6 +1832,8 @@ mod tests {
                 delete: true,
                 checksum: true,
                 paranoid: false,
+                dry_run: true,
+                exclude_patterns: vec![b"*.log".to_vec(), b"cache".to_vec()],
             },
             Message::FileBatch {
                 batch_id: 8,
@@ -1815,14 +1926,15 @@ mod tests {
             window: 0x000a_0b0c,
             job_id: [0x10; 16],
             compression: CompressionMode::None,
+            compression_level: 3,
         };
         let frame = encode_frame(0x0102_0304_0506_0708, &message).unwrap();
         let expected = [
             0x78, 0x73, 0x6e, 0x31, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
-            0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05,
+            0x00, 0x00, 0x26, 0x00, 0x00, 0x00, 0x26, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05,
             0x04, 0x03, 0x02, 0x01, 0x01, 0x44, 0x33, 0x22, 0x11, 0x04, 0x03, 0x02, 0x00, 0x08,
             0x07, 0x06, 0x00, 0x0c, 0x0b, 0x0a, 0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
-            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00,
+            0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x03, 0x00, 0x00, 0x00,
         ];
         assert_eq!(frame, expected);
     }
@@ -1957,6 +2069,43 @@ mod tests {
             decode_frame(&bomb),
             Err(ProtocolError::DecompressedTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn compression_is_selected_per_frame_and_level_is_negotiated() {
+        let text = Message::FileSegment {
+            file_id: 1,
+            offset: 0,
+            data: vec![b't'; 256 * 1024],
+        };
+        let mut random = Vec::with_capacity(256 * 1024);
+        let mut state = 0x1234_5678_u32;
+        for _ in 0..256 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            random.push(u8::try_from(state & 0xff).expect("test byte fits"));
+        }
+        let incompressible = Message::FileSegment {
+            file_id: 2,
+            offset: 0,
+            data: random,
+        };
+        let compressed = encode_frame_with_compression(1, &text, CompressionMode::Zstd, 9).unwrap();
+        let raw =
+            encode_frame_with_compression(2, &incompressible, CompressionMode::Zstd, 9).unwrap();
+        assert_ne!(compressed[13] & FRAME_FLAG_ZSTD, 0);
+        assert_eq!(raw[13] & FRAME_FLAG_ZSTD, 0);
+        assert!(compressed.len() < text_data_len(&text));
+        assert_eq!(decode_frame(&compressed).unwrap().message, text);
+        assert_eq!(decode_frame(&raw).unwrap().message, incompressible);
+    }
+
+    fn text_data_len(message: &Message) -> usize {
+        match message {
+            Message::FileSegment { data, .. } => FRAME_HEADER_LEN + 20 + data.len(),
+            _ => unreachable!(),
+        }
     }
 
     #[test]

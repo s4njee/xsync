@@ -194,7 +194,7 @@ fn worker_sample(
     let config = IndexConfig::with_budget(memory_budget_bytes);
     let mut destination_index = DestinationIndex::with_config(config.clone())?;
     let destination_start = Instant::now();
-    let destination_queue_high_water =
+    let (destination_queue_high_water, destination_index_seconds) =
         scan_into_index(root, channel_capacity, &mut destination_index)?;
     let destination_scan_seconds = destination_start.elapsed().as_secs_f64();
     let item_count = destination_index.len();
@@ -219,7 +219,7 @@ fn worker_sample(
         source_scan_seconds,
         syscall_phase_seconds,
         scan_entries_per_second,
-        destination_index_seconds: 0.0,
+        destination_index_seconds,
         planner_seconds,
         queue_high_water: destination_queue_high_water.max(source_queue_high_water) as u64,
         peak_rss_bytes: process_peak_rss_bytes(),
@@ -231,8 +231,9 @@ fn scan_into_index(
     root: &Path,
     channel_capacity: usize,
     destination: &mut DestinationIndex,
-) -> Result<usize, BenchError> {
+) -> Result<(usize, f64), BenchError> {
     let scan = scan_with_capacity(root, channel_capacity)?;
+    let index_start = Instant::now();
     let consume = scan
         .entries()
         .iter()
@@ -241,7 +242,7 @@ fn scan_into_index(
     let finish = scan.finish();
     consume?;
     finish?;
-    Ok(queue_high_water)
+    Ok((queue_high_water, index_start.elapsed().as_secs_f64()))
 }
 
 fn scan_into_spool(

@@ -1,14 +1,14 @@
 # Rsync Receiver Wire Contract v1
 
-Status: research contract for Story 4.4. This document defines the subset that
-the Story 4.5 native `RsyncTransport` may implement. It is not a promise to
+Status: implemented v1 contract for Story 4.5. This document defines the
+subset implemented by the native `RsyncTransport`; it is not a promise to
 support every historical rsync extension.
 
 ## Dialects
 
 | Dialect ID | Wire protocol | Implementations | v1 status |
 |---|---:|---|---|
-| `gnu-32` | 32 | GNU rsync 3.4.x and 3.5.x | Supported target |
+| `gnu-32` | 32 | GNU rsync 3.4.x and 3.5.x | Implemented |
 | `apple-openrsync-29` | 29 | macOS `/usr/bin/rsync` | Conditional target |
 | `openbsd-openrsync-27` | 27 | OpenBSD/openrsync, when installed | Research target |
 
@@ -24,13 +24,13 @@ separate OpenBSD research target.
 For local-to-remote whole-file sending, the remote process is launched as:
 
 ```text
-rsync --server -logDtpre.iLsfxCIvu . DEST
+rsync --server -lptrW -e.Cv --dirs --force --no-inc-recursive . DEST
 ```
 
-The exact option letters are generated from the requested feature matrix; this
-example is the observed GNU rsync command for archive-like, whole-file, dry-run
-operation. The destination is passed as a separate remote-shell argument and
-must never be interpolated into a shell command string.
+The command enables links, permissions, mtimes, recursion, whole-file mode,
+varint/checksum capabilities, directory entries, and type replacement. The
+destination is passed as a separate remote-shell argument and must never be
+interpolated into a shell command string.
 
 The remote server speaks binary protocol on stdout. Stderr is diagnostic only
 and remains separate from the binary stream. The local codec must treat a
@@ -39,17 +39,21 @@ frame as failure.
 
 ## Common wire stages
 
-1. Client and server exchange their maximum protocol integer. The negotiated
-   protocol is the lower value; protocol 32 is observed on both research hosts.
-2. The server sends a per-session checksum seed. The seed is a signed 32-bit
-   wire integer and is nondeterministic; transcript fixtures represent it as
-   `<seed>` and validate its position and use, not its literal value.
+1. Client and server exchange their maximum protocol integer. v1 requires GNU
+   protocol 32 on both sides and rejects lower or unknown peers before the file
+   list. The negotiated protocol is therefore 32.
+2. The server sends compatibility flags. v1 requires non-incremental recursion,
+   corrected checksum seed support, and varint file-list flags.
+3. The sender offers `md5`; the receiver's checksum list must include `md5`.
+   The server then sends a per-session checksum seed. The seed is a signed
+   32-bit wire integer and is nondeterministic; transcript fixtures represent
+   it as `<seed>`.
 3. The sender transmits the exclusion list when the selected options require
    it, then a sorted file list terminated by the zero status byte.
 4. The receiver/generator returns file indexes and phase changes. Whole-file
    mode sends no basis-file block signature and uses a literal data stream for
    each selected regular file.
-5. The sender terminates each file with the negotiated whole-file checksum.
+5. The sender terminates each file with the negotiated MD5 whole-file checksum.
    Directory, symlink, and metadata records are handled through the file-list
    attributes and post-list update operations.
 6. A clean end is a protocol phase completion followed by process exit zero;
@@ -68,14 +72,14 @@ frame as failure.
   carries normal protocol data; other tags carry out-of-band messages. Tag `1`
   is a sender-side error and is fatal. The initial version/seed exchange is not
   multiplexed.
-- Protocol 32 may negotiate checksum/compression names. v1 whole-file mode
-  records the negotiated checksum and does not claim BLAKE3 semantics.
+- Protocol 32 negotiates checksum names. v1 requires MD5 and does not claim
+  BLAKE3 semantics. Compression is disabled and rejected if requested.
 
 ## v1 feature subset
 
 Supported: regular files, nested and empty directories, symlinks, relative
 paths, modes, mtimes, quick-check unchanged-file skipping, whole-file transfer,
-and clean receiver errors.
+raw Unix path bytes, type replacement, and clean receiver errors.
 
 Rejected before mutation unless separately implemented: delta-token transfer,
 hardlinks, ownership, ACLs, xattrs, sparse/in-place behavior, compression,

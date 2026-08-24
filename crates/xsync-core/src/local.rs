@@ -4,7 +4,7 @@
 //! planning remain metadata-only; worker threads read source bytes only after
 //! a file has been classified for transfer.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,15 +14,22 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::clone::{self, CloneKind};
+use crate::hash_cache::{HashCache, HashFingerprint};
 use crate::planner::{try_plan, DestinationIndex, EntryPlan, IndexConfig, Plan, PlannerError};
 use crate::scanner::{
     fingerprint_from_metadata, permission_mode, scan, EntryKind, FileEntry, ScanError,
 };
 use crate::sink::{Sink, SinkError, SymlinkTargetKind};
 use crate::source::{SourceReadError, SourceReader};
+use crate::transport::TransportSelection;
 
 /// Exit status used when a local job completed with per-entry failures.
 pub const PARTIAL_FAILURE_EXIT_CODE: u8 = 23;
+
+/// Minimum file size for the staged clone path. On APFS, the clone setup and
+/// validation cost more than a verified buffered copy for smaller files.
+/// This threshold is pinned by the paired T1.2 clone measurements.
+pub const FILE_CLONE_MIN_BYTES: u64 = 12 * 1024 * 1024;
 
 /// Default number of pending local file tasks per worker.
 pub const DEFAULT_LOCAL_QUEUE_CAPACITY: usize = 2;
@@ -38,9 +45,28 @@ pub enum TransferMethod {
     ByteCopy,
 }
 
+/// Policy for files whose contents may be resident in a cloud provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudFilesPolicy {
+    /// Read files normally, materializing them when required.
+    Download,
+    /// Omit detected placeholders from transfer.
+    Skip,
+    /// Refuse the job if placeholders are detected.
+    Error,
+}
+
 /// Events emitted by a local transfer.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalEvent {
+    /// A measurable pipeline phase boundary.
+    Phase {
+        /// Stable phase name: scan, plan, transfer, or metadata.
+        name: &'static str,
+        /// True for phase start and false for phase end.
+        started: bool,
+    },
     /// The local pipeline has started. `streams` is reported for observability
     /// but does not configure local worker scheduling.
     Started {
@@ -56,6 +82,15 @@ pub enum LocalEvent {
         /// Logical bytes in those files at discovery time.
         bytes: u64,
     },
+    /// Placeholder inventory discovered during scanning.
+    CloudPlaceholders {
+        /// Number of detected placeholder files.
+        files: usize,
+        /// Logical bytes represented by those files.
+        bytes: u64,
+        /// Whether platform detection is available.
+        detection_available: bool,
+    },
     /// A regular file was published successfully.
     Transferred {
         /// Destination-relative path.
@@ -68,10 +103,30 @@ pub enum LocalEvent {
         /// Selected local data path.
         method: TransferMethod,
     },
+    /// Bounded progress update for an active large-file transfer.
+    Progress {
+        /// Destination-relative path.
+        path: String,
+        /// Logical stream identifier.
+        stream: usize,
+        /// Bytes sent or written so far.
+        completed: u64,
+        /// Total logical file size.
+        total: u64,
+    },
     /// An unchanged regular file was not transferred.
     Skipped {
         /// Destination-relative path.
         path: String,
+    },
+    /// An action that would be performed by a real transfer. In dry-run mode
+    /// these are the complete mutation plan; normal runs emit them before
+    /// performing the corresponding action.
+    Action {
+        /// Destination-relative path.
+        path: String,
+        /// One of create, update, or delete.
+        action: &'static str,
     },
     /// A non-fatal source or destination warning was recorded.
     Warning {
@@ -94,6 +149,8 @@ pub enum LocalEvent {
     },
     /// The local pipeline has finished.
     Finished {
+        /// Selected backend and its capability contract.
+        transport: Option<TransportSelection>,
         /// Number of files published.
         transferred_files: usize,
         /// Logical bytes published.
@@ -106,6 +163,8 @@ pub enum LocalEvent {
         warnings: usize,
         /// Bytes physically moved through the streaming path.
         physical_bytes: u64,
+        /// Application-protocol bytes written to the transport, when known.
+        wire_bytes: u64,
         /// Number of directory clone operations.
         directory_clones: usize,
         /// Number of file clone operations.
@@ -131,6 +190,7 @@ pub enum LocalEvent {
 
 /// Options for an in-process local transfer.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct LocalSyncOptions {
     /// Number of local I/O workers. This is independent of `streams`.
     pub local_workers: usize,
@@ -138,15 +198,25 @@ pub struct LocalSyncOptions {
     pub streams: usize,
     /// Capacity of the shared local file queue.
     pub queue_capacity: usize,
+    /// Permit staged directory-clone fast paths.
+    pub directory_clones: bool,
     /// Plan without mutating the destination.
     pub dry_run: bool,
     /// Remove destination-only entries after all transfers succeed.
     pub delete: bool,
     /// Re-read clone output and verify content hashes.
     pub paranoid: bool,
+    /// Classify regular files by BLAKE3 content rather than metadata.
+    pub checksum: bool,
+    /// Cloud-placeholder materialization policy.
+    pub cloud_files: CloudFilesPolicy,
     /// Relative-path glob patterns that disable directory cloning and exclude
     /// matching source/destination entries.
     pub exclude_patterns: Vec<String>,
+    /// Enable adaptive zstd compression for data payloads.
+    pub compress: bool,
+    /// Requested zstd level, constrained to 1..=22 by the CLI.
+    pub compress_level: i32,
 }
 
 impl Default for LocalSyncOptions {
@@ -155,10 +225,15 @@ impl Default for LocalSyncOptions {
             local_workers: default_local_workers(),
             streams: 1,
             queue_capacity: DEFAULT_LOCAL_QUEUE_CAPACITY,
+            directory_clones: true,
             dry_run: false,
             delete: false,
             paranoid: false,
+            checksum: false,
+            cloud_files: CloudFilesPolicy::Download,
             exclude_patterns: Vec::new(),
+            compress: true,
+            compress_level: 3,
         }
     }
 }
@@ -172,6 +247,8 @@ pub struct LocalSyncReport {
     pub transferred_bytes: u64,
     /// Bytes physically moved through the streaming path.
     pub physical_bytes: u64,
+    /// Application-protocol bytes written to the transport, when known.
+    pub wire_bytes: u64,
     /// Number of unchanged files skipped.
     pub skipped_files: usize,
     /// Number of entries that failed.
@@ -269,6 +346,9 @@ pub enum LocalSyncError {
         /// Glob compiler error.
         message: String,
     },
+    /// The requested cloud policy cannot be implemented on this platform.
+    #[error("cloud placeholder detection is unavailable on this platform")]
+    CloudPolicyUnavailable,
 }
 
 /// Synchronize a local source to a local destination and emit events.
@@ -283,6 +363,7 @@ pub enum LocalSyncError {
 /// Returns an error when discovery, planning, sink setup, or worker lifecycle
 /// fails. Per-entry source races and write failures are reported as events and
 /// leave the returned report in partial-failure state.
+#[allow(clippy::too_many_lines)]
 pub fn sync<F>(
     source: impl AsRef<Path>,
     source_trailing_slash: bool,
@@ -320,7 +401,7 @@ where
         source_reader_root,
         source_root_entry,
         source_by_destination,
-        plan,
+        mut plan,
     } = prepared;
 
     let mut report = LocalSyncReport {
@@ -334,6 +415,9 @@ where
             path: entry.path.clone(),
         });
     }
+    if options.dry_run {
+        emit_plan_actions(&plan, &mut emit);
+    }
     for entry in plan.other.new.iter().chain(&plan.other.changed) {
         record_failure(
             &mut report,
@@ -344,6 +428,21 @@ where
     }
 
     if !options.dry_run {
+        emit(LocalEvent::Phase {
+            name: "transfer",
+            started: true,
+        });
+        if options.directory_clones {
+            apply_directory_clones(
+                &source_reader_root,
+                &destination_sink,
+                &source_by_destination,
+                &mut plan,
+                options.paranoid,
+                &mut report,
+                &mut emit,
+            )?;
+        }
         transfer_directories(&destination_sink, &plan.directories, &mut report, &mut emit);
         transfer_symlinks(
             &destination_sink,
@@ -363,22 +462,43 @@ where
             &mut emit,
         )?;
 
+        if options.delete && !report.partial_failure() {
+            delete_extraneous(&destination_sink, &plan, &mut report, &mut emit);
+        }
+
+        emit(LocalEvent::Phase {
+            name: "transfer",
+            started: false,
+        });
+        // Deletions update parent directory mtimes, so restore source metadata last.
+        emit(LocalEvent::Phase {
+            name: "metadata",
+            started: true,
+        });
         if let Some(root_entry) = source_root_entry {
             if let Err(error) = destination_sink.finish_root_directory(&root_entry) {
                 record_failure(&mut report, &mut emit, String::from("."), error.to_string());
             }
         }
-        finish_directories(&destination_sink, &plan.directories, &mut report, &mut emit);
-
-        if options.delete && !report.partial_failure() {
-            delete_extraneous(&destination_sink, &plan, &mut report, &mut emit);
-        }
+        finish_directories(
+            &destination_sink,
+            &plan,
+            options.delete,
+            &mut report,
+            &mut emit,
+        );
+        emit(LocalEvent::Phase {
+            name: "metadata",
+            started: false,
+        });
     }
 
     emit(LocalEvent::Finished {
+        transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
+        wire_bytes: report.wire_bytes,
         directory_clones: report.directory_clones,
         file_clones: report.file_clones,
         byte_copies: report.byte_copies,
@@ -396,6 +516,112 @@ where
     Ok(report)
 }
 
+/// Clone maximal directory subtrees that are wholly absent from an existing
+/// destination. A directory clone is attempted only for entries classified as
+/// new, so a partially-present or changed subtree stays on the normal planned
+/// path and retains per-entry correctness checks.
+fn apply_directory_clones(
+    source_root: &Path,
+    sink: &Sink,
+    paths: &SourcePathMap,
+    plan: &mut Plan,
+    paranoid: bool,
+    report: &mut LocalSyncReport,
+    emit: &mut impl FnMut(LocalEvent),
+) -> Result<(), LocalSyncError> {
+    let mut candidates = plan.directories.new.clone();
+    candidates.sort_by_key(|entry| (path_depth(&entry.path), entry.path.clone()));
+
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        if candidate.path.is_empty()
+            || selected.iter().any(|parent: &String| {
+                candidate.path.starts_with(parent)
+                    && candidate.path.as_bytes().get(parent.len()) == Some(&b'/')
+            })
+        {
+            continue;
+        }
+        selected.push(candidate.path.clone());
+    }
+
+    for candidate_path in selected {
+        let Some(source_relative) = paths.source_for_destination.get(&candidate_path) else {
+            continue;
+        };
+        let source_path = source_root.join(source_relative);
+        let target_path = sink.path_for(&candidate_path)?;
+        let root = plan
+            .directories
+            .new
+            .iter()
+            .find(|entry| entry.path == candidate_path)
+            .cloned()
+            .ok_or_else(|| LocalSyncError::PathMapping {
+                path: candidate_path.clone(),
+            })?;
+        let entries = clone_entries_for_subtree(plan, &candidate_path);
+        let file_count = entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::File)
+            .count();
+        let logical_bytes: u64 = entries
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::File)
+            .map(|entry| entry.size)
+            .sum();
+
+        let Some(outcome) =
+            clone::try_clone_directory(&source_path, &target_path, &root, &entries, paranoid)?
+        else {
+            continue;
+        };
+
+        remove_subtree_entries(plan, &candidate_path);
+        report.directory_clones += usize::from(outcome.kind == CloneKind::Directory);
+        report.transferred_files += file_count;
+        report.transferred_bytes = report.transferred_bytes.saturating_add(logical_bytes);
+        emit(LocalEvent::Transferred {
+            path: candidate_path,
+            bytes: logical_bytes,
+            physical_bytes: 0,
+            method: TransferMethod::DirectoryClone,
+        });
+    }
+    Ok(())
+}
+
+fn clone_entries_for_subtree(plan: &Plan, root: &str) -> Vec<FileEntry> {
+    let prefix = format!("{root}/");
+    let mut entries = Vec::new();
+    for group in [&plan.directories, &plan.files, &plan.symlinks, &plan.other] {
+        for entry in &group.new {
+            let Some(relative) = entry.path.strip_prefix(&prefix) else {
+                continue;
+            };
+            let mut relative_entry = entry.clone();
+            relative.clone_into(&mut relative_entry.path);
+            entries.push(relative_entry);
+        }
+    }
+    entries
+}
+
+fn remove_subtree_entries(plan: &mut Plan, root: &str) {
+    let prefix = format!("{root}/");
+    for group in [
+        &mut plan.directories,
+        &mut plan.files,
+        &mut plan.symlinks,
+        &mut plan.other,
+    ] {
+        group
+            .new
+            .retain(|entry| entry.path != root && !entry.path.starts_with(&prefix));
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn try_directory_fast_path(
     source: &Path,
     source_trailing_slash: bool,
@@ -425,7 +651,15 @@ fn try_directory_fast_path(
     if layout.destination_root.exists() {
         return Ok(None);
     }
+    emit(LocalEvent::Phase {
+        name: "scan",
+        started: true,
+    });
     let entries = collect_scan(source)?;
+    emit(LocalEvent::Phase {
+        name: "scan",
+        started: false,
+    });
     let root = root_entry(source, EntryKind::Directory)?;
     let file_count = entries
         .iter()
@@ -436,6 +670,18 @@ fn try_directory_fast_path(
         .filter(|entry| entry.kind == EntryKind::File)
         .map(|entry| entry.size)
         .sum();
+    emit(LocalEvent::Phase {
+        name: "plan",
+        started: true,
+    });
+    emit(LocalEvent::Phase {
+        name: "plan",
+        started: false,
+    });
+    emit(LocalEvent::Phase {
+        name: "transfer",
+        started: true,
+    });
     let Some(outcome) = clone::try_clone_directory(
         source,
         &layout.destination_root,
@@ -444,12 +690,20 @@ fn try_directory_fast_path(
         options.paranoid,
     )?
     else {
+        emit(LocalEvent::Phase {
+            name: "transfer",
+            started: false,
+        });
         return Ok(None);
     };
-
     emit(LocalEvent::Started {
         local_workers: options.local_workers,
         streams: options.streams,
+    });
+    emit(LocalEvent::CloudPlaceholders {
+        files: 0,
+        bytes: 0,
+        detection_available: cfg!(target_os = "macos"),
     });
     emit(LocalEvent::Planned {
         files: file_count,
@@ -469,10 +723,24 @@ fn try_directory_fast_path(
         physical_bytes: 0,
         method: TransferMethod::DirectoryClone,
     });
+    emit(LocalEvent::Phase {
+        name: "transfer",
+        started: false,
+    });
+    emit(LocalEvent::Phase {
+        name: "metadata",
+        started: true,
+    });
+    emit(LocalEvent::Phase {
+        name: "metadata",
+        started: false,
+    });
     emit(LocalEvent::Finished {
+        transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
+        wire_bytes: report.wire_bytes,
         directory_clones: report.directory_clones,
         file_clones: report.file_clones,
         byte_copies: report.byte_copies,
@@ -536,6 +804,7 @@ impl ExcludeMatcher {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn prepare_transfer(
     source: &Path,
     source_trailing_slash: bool,
@@ -564,7 +833,16 @@ fn prepare_transfer(
         local_workers: options.local_workers,
         streams: options.streams,
     });
+    emit(LocalEvent::CloudPlaceholders {
+        files: 0,
+        bytes: 0,
+        detection_available: cfg!(target_os = "macos"),
+    });
 
+    emit(LocalEvent::Phase {
+        name: "scan",
+        started: true,
+    });
     let source_entries: Vec<_> = collect_scan(source)?
         .into_iter()
         .filter(|entry| !excludes.matches(&entry.path))
@@ -595,6 +873,14 @@ fn prepare_transfer(
     for entry in destination_entries {
         destination_index.insert(entry)?;
     }
+    emit(LocalEvent::Phase {
+        name: "scan",
+        started: false,
+    });
+    emit(LocalEvent::Phase {
+        name: "plan",
+        started: true,
+    });
     let planned_source: Result<Vec<_>, _> = source_entries
         .iter()
         .map(|entry| {
@@ -609,11 +895,23 @@ fn prepare_transfer(
             Ok::<FileEntry, LocalSyncError>(planned)
         })
         .collect();
-    let plan = try_plan(planned_source?, destination_index)?;
+    let mut plan = try_plan(planned_source?, destination_index)?;
+    if options.checksum {
+        apply_checksum_classification(
+            &mut plan,
+            &destination_sink,
+            &source_reader_root,
+            &source_by_destination,
+        );
+    }
     let (planned_files, planned_bytes) = transfer_totals(&plan.files);
     emit(LocalEvent::Planned {
         files: planned_files,
         bytes: planned_bytes,
+    });
+    emit(LocalEvent::Phase {
+        name: "plan",
+        started: false,
     });
     Ok(PreparedTransfer {
         destination_sink,
@@ -637,6 +935,9 @@ fn validate_options(options: &LocalSyncOptions) -> Result<(), LocalSyncError> {
         return Err(LocalSyncError::InvalidOption {
             field: "queue_capacity",
         });
+    }
+    if options.cloud_files != CloudFilesPolicy::Download && !cfg!(target_os = "macos") {
+        return Err(LocalSyncError::CloudPolicyUnavailable);
     }
     Ok(())
 }
@@ -816,6 +1117,110 @@ fn transfer_totals(entries: &EntryPlan) -> (usize, u64) {
     (entries.new.len() + entries.changed.len(), bytes)
 }
 
+fn apply_checksum_classification(
+    plan: &mut Plan,
+    sink: &Sink,
+    source_root: &Path,
+    paths: &SourcePathMap,
+) {
+    let cache = HashCache::open(HashCache::default_path()).ok();
+    let mut unchanged = Vec::new();
+    let candidates = plan.files.changed.len() + plan.files.unchanged.len();
+    let mut entries = std::mem::take(&mut plan.files.changed);
+    entries.append(&mut plan.files.unchanged);
+    let mut changed = Vec::with_capacity(candidates);
+    for entry in entries {
+        let Some(source_relative) = paths.source_for_destination.get(&entry.path) else {
+            changed.push(entry);
+            continue;
+        };
+        let source_path = source_root.join(source_relative);
+        let Ok(destination_path) = sink.path_for(&entry.path) else {
+            changed.push(entry);
+            continue;
+        };
+        let source_hash = cache_hash(
+            cache.as_ref(),
+            &source_path,
+            HashFingerprint {
+                device: entry.fingerprint.identity.device,
+                file: entry.fingerprint.identity.file,
+                size: entry.fingerprint.size,
+                mtime: entry.fingerprint.mtime,
+                ctime: entry.fingerprint.ctime,
+            },
+        );
+        let destination_hash = fs::symlink_metadata(&destination_path)
+            .ok()
+            .and_then(|metadata| {
+                let mtime = metadata.modified().ok()?;
+                let fingerprint =
+                    crate::scanner::fingerprint_from_metadata(&metadata, EntryKind::File, mtime)
+                        .ok()?;
+                cache_hash(
+                    cache.as_ref(),
+                    &destination_path,
+                    HashFingerprint {
+                        device: fingerprint.identity.device,
+                        file: fingerprint.identity.file,
+                        size: fingerprint.size,
+                        mtime: fingerprint.mtime,
+                        ctime: fingerprint.ctime,
+                    },
+                )
+            });
+        if source_hash.is_some() && source_hash == destination_hash {
+            unchanged.push(entry);
+        } else {
+            changed.push(entry);
+        }
+    }
+    plan.files.changed = changed;
+    plan.files.unchanged.extend(unchanged);
+    plan.files
+        .unchanged
+        .sort_by(|left, right| left.path.cmp(&right.path));
+}
+
+fn cache_hash(
+    cache: Option<&HashCache>,
+    path: &Path,
+    fingerprint: HashFingerprint,
+) -> Option<blake3::Hash> {
+    if let Some(cache) = cache {
+        if let Ok(hash) = cache.hash_file(path, fingerprint) {
+            return Some(hash);
+        }
+    }
+    let bytes = fs::read(path).ok()?;
+    Some(blake3::hash(&bytes))
+}
+
+pub(crate) fn emit_plan_actions(plan: &Plan, emit: &mut impl FnMut(LocalEvent)) {
+    for entries in [&plan.directories, &plan.symlinks, &plan.files, &plan.other] {
+        for entry in entries.new.iter().chain(&entries.changed) {
+            emit(LocalEvent::Action {
+                path: entry.path.clone(),
+                action: if entries
+                    .changed
+                    .iter()
+                    .any(|changed| changed.path == entry.path)
+                {
+                    "update"
+                } else {
+                    "create"
+                },
+            });
+        }
+        for entry in &entries.extraneous {
+            emit(LocalEvent::Action {
+                path: entry.path.clone(),
+                action: "delete",
+            });
+        }
+    }
+}
+
 fn transfer_directories(
     sink: &Sink,
     directories: &EntryPlan,
@@ -941,6 +1346,12 @@ fn transfer_files(
         };
         match outcome.result {
             Ok(transfer) => {
+                emit(LocalEvent::Progress {
+                    path: outcome.path.clone(),
+                    stream: 0,
+                    completed: transfer.bytes,
+                    total: transfer.bytes,
+                });
                 report.transferred_files += 1;
                 report.transferred_bytes = report.transferred_bytes.saturating_add(transfer.bytes);
                 report.physical_bytes = report
@@ -994,18 +1405,20 @@ fn transfer_one_file(
     let destination_path = sink
         .path_for(&task.destination.path)
         .map_err(|error| error.to_string())?;
-    match clone::try_clone_file(&task.source_path, &destination_path, &task.source, paranoid) {
-        Ok(Some(outcome)) => {
-            if outcome.kind == CloneKind::File {
-                return Ok(FileTransfer {
-                    bytes: task.source.size,
-                    physical_bytes: 0,
-                    method: TransferMethod::FileClone,
-                });
+    if task.source.size >= FILE_CLONE_MIN_BYTES {
+        match clone::try_clone_file(&task.source_path, &destination_path, &task.source, paranoid) {
+            Ok(Some(outcome)) => {
+                if outcome.kind == CloneKind::File {
+                    return Ok(FileTransfer {
+                        bytes: task.source.size,
+                        physical_bytes: 0,
+                        method: TransferMethod::FileClone,
+                    });
+                }
             }
+            Ok(None) | Err(clone::CloneError::WrongKind { .. }) => {}
+            Err(error) => return Err(error.to_string()),
         }
-        Ok(None) | Err(clone::CloneError::WrongKind { .. }) => {}
-        Err(error) => return Err(error.to_string()),
     }
     let stable = source_reader
         .read(&task.source)
@@ -1016,6 +1429,19 @@ fn transfer_one_file(
     let length = u64::try_from(bytes.len()).map_err(|_| "file is too large".to_owned())?;
     sink.write_file_with_retry(&destination, &stable.blake3, |_| Ok(bytes.clone()))
         .map_err(|error| error.to_string())?;
+    if paranoid {
+        let verified = fs::read(&destination_path)
+            .is_ok_and(|written| blake3::hash(&written) == stable.blake3);
+        if !verified {
+            sink.write_file_with_retry(&destination, &stable.blake3, |_| Ok(bytes.clone()))
+                .map_err(|error| error.to_string())?;
+            let retry_verified = fs::read(&destination_path)
+                .is_ok_and(|written| blake3::hash(&written) == stable.blake3);
+            if !retry_verified {
+                return Err("destination readback hash mismatch after retry".to_owned());
+            }
+        }
+    }
     Ok(FileTransfer {
         bytes: length,
         physical_bytes: length,
@@ -1030,13 +1456,70 @@ fn join_workers(workers: Vec<JoinHandle<()>>) -> Result<(), LocalSyncError> {
     Ok(())
 }
 
+/// Directories whose mtime the kernel may have bumped during this transfer.
+///
+/// Creating, rewriting, or removing an entry updates the mtime of the directory
+/// that *directly contains* it. Such a parent is frequently classified
+/// `unchanged`, so restoring only `new` and `changed` directories leaves it with
+/// a stale mtime. Collecting the touched parents keeps the final metadata pass
+/// proportional to the work actually performed instead of to the whole tree,
+/// which matters because an unchanged-directory sweep would add a syscall per
+/// directory to every no-op sync.
+fn touched_parent_directories(plan: &Plan, delete: bool) -> HashSet<String> {
+    let mut touched = HashSet::new();
+    {
+        let mut note = |path: &str| {
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                touched.insert(parent.to_owned());
+            }
+        };
+        for entry in plan.files.new.iter().chain(&plan.files.changed) {
+            note(&entry.path);
+        }
+        for entry in plan.symlinks.new.iter().chain(&plan.symlinks.changed) {
+            note(&entry.path);
+        }
+        // `changed` includes a destination entry whose type was replaced, which
+        // mutates its parent just as a creation does.
+        for entry in plan.directories.new.iter().chain(&plan.directories.changed) {
+            note(&entry.path);
+        }
+        if delete {
+            for entry in plan
+                .files
+                .extraneous
+                .iter()
+                .chain(&plan.symlinks.extraneous)
+                .chain(&plan.directories.extraneous)
+                .chain(&plan.other.extraneous)
+            {
+                note(&entry.path);
+            }
+        }
+    }
+    touched
+}
+
 fn finish_directories(
     sink: &Sink,
-    directories: &EntryPlan,
+    plan: &Plan,
+    delete: bool,
     report: &mut LocalSyncReport,
     emit: &mut impl FnMut(LocalEvent),
 ) {
-    let mut entries: Vec<_> = directories.new.iter().chain(&directories.changed).collect();
+    let touched = touched_parent_directories(plan, delete);
+    let directories = &plan.directories;
+    let mut entries: Vec<_> = directories
+        .new
+        .iter()
+        .chain(&directories.changed)
+        .chain(
+            directories
+                .unchanged
+                .iter()
+                .filter(|entry| touched.contains(&entry.path)),
+        )
+        .collect();
     entries.sort_by_key(|entry| std::cmp::Reverse(path_depth(&entry.path)));
     for entry in entries {
         if let Err(error) = sink.finish_directories(std::slice::from_ref(entry)) {
@@ -1105,11 +1588,56 @@ mod tests {
             local_workers: 2,
             streams: 7,
             queue_capacity: 1,
+            directory_clones: true,
             dry_run: false,
             delete: false,
             paranoid: false,
+            checksum: false,
+            cloud_files: CloudFilesPolicy::Download,
             exclude_patterns: Vec::new(),
+            compress: true,
+            compress_level: 3,
         }
+    }
+
+    #[test]
+    fn rewriting_a_file_restores_its_unchanged_parent_directory_mtime() {
+        // A directory containing a rewritten file is classified `unchanged`,
+        // but the kernel bumps its mtime when the child is republished. The
+        // final metadata pass must restore it, or a churn sync leaves the
+        // destination differing from the source.
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("group")).unwrap();
+        fs::write(source.join("group/file"), b"original").unwrap();
+
+        let fixed = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+        filetime::set_file_mtime(source.join("group/file"), fixed).unwrap();
+        filetime::set_file_mtime(source.join("group"), fixed).unwrap();
+        sync(&source, true, &destination, false, &options(), |_| {}).unwrap();
+
+        // Rewrite the file with different content and a newer mtime, leaving
+        // the containing directory's own metadata untouched.
+        fs::write(source.join("group/file"), b"rewritten!").unwrap();
+        let newer = filetime::FileTime::from_unix_time(1_700_000_500, 0);
+        filetime::set_file_mtime(source.join("group/file"), newer).unwrap();
+        filetime::set_file_mtime(source.join("group"), fixed).unwrap();
+
+        let report = sync(&source, true, &destination, false, &options(), |_| {}).unwrap();
+        assert_eq!(report.transferred_files, 1);
+        assert_eq!(
+            fs::read(destination.join("group/file")).unwrap(),
+            b"rewritten!"
+        );
+
+        let source_dir = fs::metadata(source.join("group")).unwrap();
+        let destination_dir = fs::metadata(destination.join("group")).unwrap();
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(&source_dir),
+            filetime::FileTime::from_last_modification_time(&destination_dir),
+            "an unchanged parent directory must keep the source mtime after a child is rewritten"
+        );
     }
 
     #[test]
@@ -1169,6 +1697,16 @@ mod tests {
                 streams: 7
             }
         )));
+        for phase in ["scan", "plan", "transfer", "metadata"] {
+            assert!(first_events.iter().any(|event| matches!(
+                event,
+                LocalEvent::Phase { name, started: true } if *name == phase
+            )));
+            assert!(first_events.iter().any(|event| matches!(
+                event,
+                LocalEvent::Phase { name, started: false } if *name == phase
+            )));
+        }
     }
 
     #[test]
@@ -1210,6 +1748,65 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn incremental_sync_clones_absent_subtree_and_plans_existing_subtree() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("existing")).unwrap();
+        fs::create_dir_all(source.join("new/deep")).unwrap();
+        fs::write(source.join("existing/file"), b"existing").unwrap();
+        fs::write(source.join("new/deep/file"), b"new subtree").unwrap();
+
+        fs::create_dir_all(destination.join("existing")).unwrap();
+        fs::copy(
+            source.join("existing/file"),
+            destination.join("existing/file"),
+        )
+        .unwrap();
+        let source_file_mtime = filetime::FileTime::from_system_time(
+            fs::metadata(source.join("existing/file"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+        );
+        filetime::set_file_mtime(destination.join("existing/file"), source_file_mtime).unwrap();
+        let source_dir_mtime = filetime::FileTime::from_system_time(
+            fs::metadata(source.join("existing"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+        );
+        filetime::set_file_mtime(destination.join("existing"), source_dir_mtime).unwrap();
+
+        let mut events = Vec::new();
+        let report = sync(&source, true, &destination, false, &options(), |event| {
+            events.push(event);
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read(destination.join("existing/file")).unwrap(),
+            b"existing"
+        );
+        assert_eq!(
+            fs::read(destination.join("new/deep/file")).unwrap(),
+            b"new subtree"
+        );
+        assert_eq!(report.transferred_files, 1);
+        assert!(report.directory_clones <= 1);
+        if report.directory_clones == 1 {
+            assert!(events.iter().any(|event| matches!(
+                event,
+                LocalEvent::Transferred {
+                    path,
+                    method: TransferMethod::DirectoryClone,
+                    ..
+                } if path == "new"
+            )));
+        }
     }
 
     #[test]
