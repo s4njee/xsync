@@ -92,6 +92,16 @@ length violations. A future incompatible layout must increment the version;
 it must not reinterpret a v1 field. A future compatible message type requires a
 new version because v1 rejects unknown types.
 
+Capability bits are carried in the `Handshake.capabilities: u32` field and are
+deliberately un-masked, so a receiver that does not recognize a bit simply
+ignores it. `CAP_DATA_ONLY = 1 << 0` requests a data-only receiver session for
+multi-stream (Story 4.2): the server skips the destination scan, rejects
+metadata/large-file-finish messages, and only accepts `FileBatch`/`FileSegment`
+and `LargeFilePrepare`/`LargeFileRange`/`FileSegment` traffic against the shared
+stage. A server that does not understand the bit still answers as an ordinary
+single-session sink, so an old peer against a new client degrades to single
+stream rather than failing.
+
 Malformed compression, a compressed output larger than the declared bounded
 length, or a declared decompressed length over 16 MiB is rejected before any
 filesystem publication. Protocol decoding does not write destination files;

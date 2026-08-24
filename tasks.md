@@ -771,7 +771,7 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   strict Clippy `-D warnings` is clean.
 
 ### Story 4.2 — Multi-stream striping
-- [~] `--streams N` opens one persistent control session plus N persistent data sessions. Batches
+- [x] `--streams N` opens one persistent control session plus N persistent data sessions. Batches
   and whole files are partitioned across data sessions; large files use disjoint ranges. Control
   owns prepare/finalize and durable checkpoint coordination. Data workers have no in-memory IPC but
   share the receiver's staged file and journal.
@@ -789,38 +789,44 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   `min(cpus, 8)`; provisional four-stream behavior ships only if its cross-host gate passes.
 - User-specified stream count is always honored within 1..=16 even if the automatic policy differs.
 
-**Status: v1-expressible; coordination rests on client sequencing + a journal merge fix.**
-- Revisited after review: protocol v2 is **not** required for multi-stream. All three originally-flagged
-  needs are expressible in v1. (1) A data-only session is just `Role::Sink` plus a dedicated bit in
-  the existing `Handshake.capabilities: u32` — decoded with no known-bits mask, so arbitrary bits
-  round-trip today; the server honors it by skipping the destination scan. (2) A data session can own
-  a stage it did not "prepare": its own v1 `LargeFilePrepare` populates its local `large_files` map
-  so ranges route to `write_chunk_with_retry`, and the idempotent `Sink::prepare_large` preserves a
-  matching-size stage instead of wiping peers' work. (3) `CheckpointRanges` is unnecessary: all
-  sessions share one job-id/relative-path journal record, so the receiver's disk is the merge point.
-- The one genuine gap is **multi-stream resume**: `journal::checkpoint` blindly overwrites with the
-  caller's in-memory list (`journal.rs::165`), so the last writer's ranges survive and the rest are
-  lost (content stays correct; the next run just retransmits them). Closing it is a local, testable
-  change in one crate: make `checkpoint` `load → merge → write` using the already-written-and-tested
-  `merge_ranges` union primitive, guarded by a real cross-process lock — `read-merge-write` is not
-  atomic even with the atomic final rename, and `clear`/`invalidate` must be safe against a
-  concurrent `checkpoint`. No wire change.
-- The actual bulk of 4.2 is **client-side sequencing**, not protocol: a barrier before
-  `LargeFileFinish`, control-only ownership of directories/symlinks/deletes, and drain-on-failure
-  semantics. These are implementable in the orchestration layer.
-- Defects fixed/handled along the way: `server.rs` no longer silently acks a `FileSegment` whose
-  `file_id` is unregistered (was the exact drop path for a mis-sequenced data session) — it is now a
-  hard `UnexpectedMessage` error, with a regression test.
-- **Shipped now:** idempotent `Sink::prepare_large`; the silent-ack→loud-error fix + test;
-  `--streams` parsing (1..=16) unchanged and Story 0.5's default of one stream intact (fully tested),
-  so nothing unverified is claimed.
-- **Sequencing decision:** measure before building. Run Story 4.3 first — if four sessions cost four
-  SSH handshakes plus four destination scans, striping may not pay for small/medium jobs, and the
-  crossover point should drive whether/when the coordination complexity is worth it. If it pays,
-  build 4.2 on v1 as: capability bit → data-only sessions, idempotent prepare (done), merge-on-checkpoint
-  under a lock, and client-side finish/metadata/delete barriers. Keep protocol v2 in reserve for
-  something that genuinely needs new message types (e.g. delta transfer's chunk index), where the
-  v1/v2 compatibility matrix cost is actually justified.
+**Status: implemented on v1.**
+- A data-only session is expressed in v1 via a dedicated bit in the existing
+  `Handshake.capabilities: u32` (`CAP_DATA_ONLY`, documented in `protocol.md`); a server that does
+  not recognize it degrades to an ordinary sink rather than failing. A data session skips the
+  destination scan and only writes `FileBatch`/`FileSegment` and prepare/range/segment traffic; the
+  control session owns planning, metadata, prepare/finish, and journal clearing.
+- A data session owns a stage it did not "prepare": its v1 `LargeFilePrepare` populates its local
+  `large_files` map so ranges route to `write_chunk_with_retry`, and the idempotent `Sink::prepare_large`
+  preserves a matching-size stage instead of wiping peers' work.
+- `CheckpointRanges` is unnecessary: all sessions share one job-id/relative-path journal record, so
+  the receiver's disk is the merge point. `ResumeJournal::checkpoint` now does `load → merge → write`
+  (using the tested `merge_ranges` union primitive) under a real cross-process `fslock` lock shared
+  by `checkpoint`/`clear`/`invalidate`, so the record is the union of every writer's verified ranges
+  rather than the last writer's list — the multi-stream resume gap is closed locally, with no wire
+  change.
+- `sync_push_server_streams` (routed by `sync_push_server` when `--streams > 1`) opens one control
+  `--server` session plus N data-only sessions. Control plans, creates directories/symlinks,
+  prepares each large file (loading its resume pages), writes the small/medium files itself, then
+  raises a finish barrier: all N data threads run to completion, the client merges the control
+  resume ranges and every data session's written ranges, and asserts each large file is *fully*
+  covered before any `LargeFileFinish` commits it — converting any dropped/overlapping range from
+  silent corruption into a loud `UnexpectedMessage`. Data sessions durably merge checkpoint each of
+  their ranges into the union journal.
+- `--streams 1` remains the fully tested single-session path; user-specified values within 1..=16
+  are honored (provisional, per the Story 4.3 measurement gate). `write_frame`/`expect_ack` helpers
+  factor the per-session client protocol driving.
+- Tests: journal merge-across-concurrent-writers; a data-only server session that skips the scan and
+  writes a prepared range into the shared stage; and
+  `test_multi_stream_push_stripes_large_file_and_is_byte_identical` — a 24 MiB file striped across
+  three data sessions plus 20 small files over `--streams 3` via fake-rsh produces a destination
+  byte-identical (manifest-equal) to the single-stream local baseline. 138 workspace tests pass;
+  strict Clippy `-D warnings` clean.
+- **Known limitations (recorded, not claimed):** the barrier is global (all data threads finish
+  before any `LargeFileFinish`), so multiple staged large files can occupy disk simultaneously;
+  `--paranoid` on a striped file is not supported (finish digest is zeroed, since durability is owned
+  by per-range journal checkpoints, not an end-of-transfer whole-file readback); and an errored data
+  thread returns a loud failure without actively cancelling its in-flight sibling children (no hang —
+  all threads are joined — but a child is not reaped on the error path).
 
 ### Story 4.3 — SSH startup and connection-model decision
 - [x] Measure and document fresh SSH sessions, user-provided ControlMaster reuse, and persistent

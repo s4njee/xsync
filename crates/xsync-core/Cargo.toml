@@ -14,6 +14,7 @@ workspace = true
 blake3 = { version = "1", features = ["prefer_intrinsics"] }
 crossbeam-channel = "0.5"
 filetime = "0.2"
+fslock = "0.2"
 globset = "0.4"
 ignore = "0.4"
 libc = "0.2"

@@ -435,6 +435,66 @@ fn test_ssh_default_transport_reports_remote_stderr_on_failure() {
 }
 
 #[test]
+fn test_multi_stream_push_stripes_large_file_and_is_byte_identical() {
+    let src = tempdir().unwrap();
+    fs::create_dir_all(src.path().join("nested")).unwrap();
+    for i in 0..20 {
+        fs::write(src.path().join("nested").join(format!("f{i:02}.bin")), vec![0x33 + i; 4096])
+            .unwrap();
+    }
+    // 24 MiB -> three 8 MiB chunks so three data sessions each carry one.
+    fs::write(src.path().join("big.bin"), vec![0xEE; 24 * 1024 * 1024]).unwrap();
+
+    let dst_local = tempdir().unwrap();
+    let dst_multi = tempdir().unwrap();
+    let script_dir = tempdir().unwrap();
+    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
+
+    // Local baseline.
+    let status_local = Command::new(xsync_bin())
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("{}", dst_local.path().display()))
+        .status()
+        .unwrap();
+    assert!(status_local.success());
+
+    // Multi-stream push with --streams 3 over a fake-rsh (no sshd, no network).
+    let output = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg("--streams")
+        .arg("3")
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}", dst_multi.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "multi-stream push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Byte-identical to the single-stream local baseline.
+    let m_local = build_manifest(dst_local.path()).unwrap();
+    let m_multi = build_manifest(dst_multi.path()).unwrap();
+    assert_eq!(m_local.manifest_digest, m_multi.manifest_digest);
+    assert_eq!(m_local.entries.len(), m_multi.entries.len());
+
+    // The large file is intact despite being striped across three sessions.
+    assert_eq!(
+        fs::read(dst_multi.path().join("big.bin")).unwrap(),
+        vec![0xEE; 24 * 1024 * 1024]
+    );
+
+    // The Finished event reports the file count and byte accounting.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("finished:") && stdout.contains("21 transferred"),
+        "expected 21 transferred (20 small + 1 striped large), got: {stdout}"
+    );
+}
+
+#[test]
 fn test_server_crash_mid_transfer_surfaces_stream_transport_error() {
     let src = tempdir().unwrap();
     // Create large file so transfer takes several messages

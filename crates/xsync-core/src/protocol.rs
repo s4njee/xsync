@@ -32,6 +32,13 @@ pub const MAX_ERROR_MESSAGE: usize = 64 * 1024;
 /// Maximum frame IDs retained by a stateful decoder.
 pub const MAX_TRACKED_MESSAGE_IDS: usize = 1_048_576;
 
+/// Capability bit requesting a data-only receiver session (multi-stream,
+/// Story 4.2): the session skips the destination scan and only accepts
+/// file/range segment traffic, leaving metadata, prepare/finish steps, and
+/// journal ownership to the control session. v1 already carries arbitrary,
+/// un-masked capability bits, so using one is not a wire change.
+pub const CAP_DATA_ONLY: u32 = 1 << 0;
+
 /// Envelope flag indicating that the payload uses zstd compression.
 pub const FRAME_FLAG_ZSTD: u8 = 0x01;
 const MAX_HANDSHAKE_PAYLOAD: usize = 128;

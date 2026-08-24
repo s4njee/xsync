@@ -136,6 +136,15 @@ impl ResumeJournal {
     /// # Errors
     /// Returns [`JournalError::Io`] on a read failure.
     pub fn load(&self, identity: &ResumeIdentity) -> Result<Option<JournalRecord>, JournalError> {
+        self.load_unlocked(identity)
+    }
+
+    /// Load without acquiring the journal lock (for use inside a locked
+    /// critical section). Reads of an atomically-renamed record are consistent.
+    fn load_unlocked(
+        &self,
+        identity: &ResumeIdentity,
+    ) -> Result<Option<JournalRecord>, JournalError> {
         let path = self.path_for(&identity.path);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -160,60 +169,92 @@ impl ResumeJournal {
     /// Persist `ranges` for `identity`, atomically, so the new record is
     /// durable before the corresponding acknowledgement is sent.
     ///
+    /// Under a cross-process lock the stored ranges are merged with whatever a
+    /// concurrent writer (e.g. another stream in a multi-stream job) has already
+    /// persisted, so the record is the *union* of every writer's verified
+    /// ranges rather than the last writer's list. `load → merge → write` is not
+    /// atomic on its own, which is why every checkpoint, clear, and invalidate
+    /// takes the same lock.
+    ///
     /// # Errors
-    /// Returns [`JournalError::Io`] on a write or durability failure.
+    /// Returns [`JournalError::Io`] on a write, lock, or durability failure.
     pub fn checkpoint(
         &self,
         identity: &ResumeIdentity,
         ranges: &[ByteRange],
     ) -> Result<(), JournalError> {
-        let path = self.path_for(&identity.path);
-        let mut sorted_ranges = ranges.to_vec();
-        sorted_ranges.sort_by_key(|range| range.offset);
+        self.with_lock(|| {
+            let existing = self.load_unlocked(identity)?;
+            let mut merged_ranges =
+                existing.map_or_else(Vec::new, |record| record.ranges);
+            let mut merged = merge_ranges(&merged_ranges, ranges);
+            std::mem::swap(&mut merged_ranges, &mut merged);
+            let mut sorted_ranges = merged_ranges;
+            sorted_ranges.sort_by_key(|range| range.offset);
 
-        let record = JournalRecord {
-            size: identity.fingerprint.size,
-            mtime_ns: timestamp_nanos(identity.fingerprint.mtime),
-            ctime_ns: identity.fingerprint.ctime.map_or(0, timestamp_nanos),
-            identity_device: identity.fingerprint.identity.device,
-            identity_file: identity.fingerprint.identity.file,
-            kind: identity.fingerprint.kind,
-            ranges: sorted_ranges,
-        };
-        let bytes = encode_record(&record)?;
+            let record = JournalRecord {
+                size: identity.fingerprint.size,
+                mtime_ns: timestamp_nanos(identity.fingerprint.mtime),
+                ctime_ns: identity.fingerprint.ctime.map_or(0, timestamp_nanos),
+                identity_device: identity.fingerprint.identity.device,
+                identity_file: identity.fingerprint.identity.file,
+                kind: identity.fingerprint.kind,
+                ranges: sorted_ranges,
+            };
+            let bytes = encode_record(&record)?;
 
-        let tmp = path.with_extension(format!("tmp{FILE_SUFFIX}"));
-        {
-            let mut file = File::create(&tmp)
-                .map_err(|source| journal_io("create resume journal temp", &tmp, source))?;
-            write_all(&mut file, &tmp, &bytes)?;
-            file.sync_all()
-                .map_err(|source| journal_io("sync resume journal temp", &tmp, source))?;
-        }
-        fs::rename(&tmp, &path)
-            .map_err(|source| journal_io("commit resume journal record", &path, source))?;
-        sync_parent(&path)
+            let path = self.path_for(&identity.path);
+            let tmp = path.with_extension(format!("tmp{FILE_SUFFIX}"));
+            {
+                let mut file = File::create(&tmp)
+                    .map_err(|source| journal_io("create resume journal temp", &tmp, source))?;
+                write_all(&mut file, &tmp, &bytes)?;
+                file.sync_all()
+                    .map_err(|source| journal_io("sync resume journal temp", &tmp, source))?;
+            }
+            fs::rename(&tmp, &path)
+                .map_err(|source| journal_io("commit resume journal record", &path, source))?;
+            sync_parent(&path)
+        })
     }
 
     /// Remove the stored record for `identity` after a file finishes.
     ///
     /// # Errors
-    /// Returns [`JournalError::Io`] on a removal failure.
+    /// Returns [`JournalError::Io`] on a removal or lock failure.
     pub fn clear(&self, identity: &ResumeIdentity) -> Result<(), JournalError> {
-        let path = self.path_for(&identity.path);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(journal_io("remove resume journal record", &path, source)),
-        }
+        self.with_lock(|| {
+            let path = self.path_for(&identity.path);
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(source) => {
+                    Err(journal_io("remove resume journal record", &path, source))
+                }
+            }
+        })
     }
 
     /// Remove a stale record whose fingerprint no longer matches `identity`.
     ///
     /// # Errors
-    /// Returns [`JournalError::Io`] on a removal failure.
+    /// Returns [`JournalError::Io`] on a removal or lock failure.
     pub fn invalidate(&self, identity: &ResumeIdentity) -> Result<(), JournalError> {
         self.clear(identity)
+    }
+
+    /// Run `f` with an exclusive lock on this journal's shared lock file, so
+    /// cross-process load-merge-write is atomic. The lock file itself is the
+    /// only artifact that is never removed.
+    fn with_lock<T>(&self, f: impl FnOnce() -> Result<T, JournalError>) -> Result<T, JournalError> {
+        let lock_path = self.root.join("lock");
+        let mut lock = fslock::LockFile::open(&lock_path)
+            .map_err(|source| journal_io("open resume journal lock", &lock_path, source))?;
+        lock.lock()
+            .map_err(|source| journal_io("acquire resume journal lock", &lock_path, source))?;
+        let result = f();
+        drop(lock); // fslock releases the lock on drop
+        result
     }
 
     fn path_for(&self, path: &[u8]) -> PathBuf {
@@ -568,6 +609,40 @@ mod tests {
         // Same path, changed source fingerprint: ranges must not be reused.
         assert!(journal.load(&identity_b).unwrap().is_none());
         assert!(journal.load(&identity_a).unwrap().is_some());
+    }
+
+    #[test]
+    fn checkpoint_merges_across_concurrent_writers() {
+        let job_id = [11u8; 16];
+        let journal = ResumeJournal::new(&job_id).unwrap();
+        let identity = file("big.bin", 100);
+        let chunk = 8 * 1024 * 1024u64;
+
+        // Two "writers" (streams) checkpoint disjoint ranges; the stored record
+        // must be the union, not the last writer's list.
+        journal
+            .checkpoint(
+                &identity,
+                &[ByteRange {
+                    offset: 0,
+                    length: chunk,
+                }],
+            )
+            .unwrap();
+        journal
+            .checkpoint(
+                &identity,
+                &[ByteRange {
+                    offset: chunk,
+                    length: chunk,
+                }],
+            )
+            .unwrap();
+
+        let loaded = journal.load(&identity).unwrap().expect("record present");
+        assert_eq!(loaded.ranges.len(), 2);
+        assert_eq!(loaded.ranges[0].offset, 0);
+        assert_eq!(loaded.ranges[1].offset, chunk);
     }
 
     #[test]
