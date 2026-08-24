@@ -1,6 +1,6 @@
 {
   "schema": "xsync.connection-bench.v1",
-  "repetitions": 5,
+  "repetitions": 1,
   "stream_counts": [
     1,
     2,
@@ -8,38 +8,38 @@
     8
   ],
   "setup_kind": "pipe-child (same transport line as production ssh)",
-  "per_session_setup_ms_1": 3.026666,
-  "reference_transfer_ms": 22.012957999999998,
+  "per_session_setup_ms_1": 3.784458,
+  "reference_transfer_ms": 180.07891700000002,
   "reference_files": 201,
   "reference_bytes": 1867776,
   "results": [
     {
       "streams": 1,
-      "setup_ms_median": 3.026666,
-      "setup_ms_mad": 0.296999,
-      "delta_setup_vs_previous_ms": 3.026666,
-      "transfer_over_setup_ratio": 7.273005346476948
+      "setup_ms_median": 3.784458,
+      "setup_ms_mad": 0.0,
+      "delta_setup_vs_previous_ms": 3.784458,
+      "transfer_over_setup_ratio": 47.58380645260167
     },
     {
       "streams": 2,
-      "setup_ms_median": 3.5044160000000004,
-      "setup_ms_mad": 0.22083399999999953,
-      "delta_setup_vs_previous_ms": 0.47775000000000034,
-      "transfer_over_setup_ratio": 6.281491124341401
+      "setup_ms_median": 4.071,
+      "setup_ms_mad": 0.0,
+      "delta_setup_vs_previous_ms": 0.28654199999999985,
+      "transfer_over_setup_ratio": 44.2345657086711
     },
     {
       "streams": 4,
-      "setup_ms_median": 5.626125,
-      "setup_ms_mad": 0.610709,
-      "delta_setup_vs_previous_ms": 2.1217089999999996,
-      "transfer_over_setup_ratio": 3.9126322291097333
+      "setup_ms_median": 6.461083,
+      "setup_ms_mad": 0.0,
+      "delta_setup_vs_previous_ms": 2.3900830000000006,
+      "transfer_over_setup_ratio": 27.871320798695823
     },
     {
       "streams": 8,
-      "setup_ms_median": 8.989666,
-      "setup_ms_mad": 0.6894580000000001,
-      "delta_setup_vs_previous_ms": 3.3635409999999997,
-      "transfer_over_setup_ratio": 2.448695869234741
+      "setup_ms_median": 7.196166000000001,
+      "setup_ms_mad": 0.0,
+      "delta_setup_vs_previous_ms": 0.7350830000000004,
+      "transfer_over_setup_ratio": 25.02428612680697
     }
   ]
 }

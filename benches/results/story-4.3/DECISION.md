@@ -63,8 +63,30 @@ the trend is what matters:
    multiplexing. If connection multiplexing is ever added it must be opt-in,
    socket-in-owned-dir, restrictive-perm, deterministic-cleanup, and
    persistent-session fallback.
-3. Do not enable multi-stream until the Story 4.2 implementation demonstrates,
-   via this harness, that a workload's transfer phase dominates the added
-   per-session setup + scan cost. `--streams` continues to resolve to one until
-   then, and user-supplied values within 1..=16 remain honored only once the
-   cross-host gate passes.
+3. From the crossover measured against the real Story 4.2 implementation
+   (`xsync.stripe-bench.v1`, 5 reps, pipe-child = optimistic lower bound):
+
+   | corpus | 4x/1x speedup |
+   |---|---:|
+   | single 4 MiB file | 0.95x |
+   | single 16 MiB file | 1.35x |
+   | single 64 MiB file | 1.84x |
+   | many-small (1.6 MiB, 400 files) | 0.99x |
+
+   Stripping is a *large-single-file* win: it crosses over between ~4 MiB and
+   ~16 MiB per file and reaches ~1.8x at 64 MiB, while many-small and sub-cross
+   jobs are flat-to-slightly-worse (setup + per-session overhead dominates; real
+   ssh adds a per-session RTT only making this worse). Therefore:
+   - `--streams` **defaults to 1** (Story 0.5) and is fully tested; the
+     multi-stream path is provisional opt-in.
+   - An explicit `--streams N > 1` is honored within 1..=16 and pays only when a
+     job is dominated by a few very large files; it is not a speedup for
+     small/medium or many-small workloads, which should stay at one stream.
+
+4. Multi-stream (Story 4.2) is gated accordingly: its correctness path is tested
+   (a 64 MiB file striped across four sessions is byte-identical), but it is not
+   the default and is not claimed as a universal multiplier — matching the
+   evidence-driven policy established in plan.md.
+
+(1)–(3) restate the connection model and measurement; (4) is the concrete
+enablement rule this loop closes.

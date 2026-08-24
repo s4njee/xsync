@@ -442,8 +442,9 @@ fn test_multi_stream_push_stripes_large_file_and_is_byte_identical() {
         fs::write(src.path().join("nested").join(format!("f{i:02}.bin")), vec![0x33 + i; 4096])
             .unwrap();
     }
-    // 24 MiB -> three 8 MiB chunks so three data sessions each carry one.
-    fs::write(src.path().join("big.bin"), vec![0xEE; 24 * 1024 * 1024]).unwrap();
+    // 64 MiB -> eight 8 MiB chunks, so each of four data sessions carries
+    // multiple disjoint ranges and must prepare the file only once.
+    fs::write(src.path().join("big.bin"), vec![0xEE; 64 * 1024 * 1024]).unwrap();
 
     let dst_local = tempdir().unwrap();
     let dst_multi = tempdir().unwrap();
@@ -458,12 +459,12 @@ fn test_multi_stream_push_stripes_large_file_and_is_byte_identical() {
         .unwrap();
     assert!(status_local.success());
 
-    // Multi-stream push with --streams 3 over a fake-rsh (no sshd, no network).
+    // Multi-stream push with --streams 4 over a fake-rsh (no sshd, no network).
     let output = Command::new(xsync_bin())
         .arg("-e")
         .arg(&fake_rsh)
         .arg("--streams")
-        .arg("3")
+        .arg("4")
         .arg(format!("{}/", src.path().display()))
         .arg(format!("fakehost:{}", dst_multi.path().display()))
         .output()
@@ -480,10 +481,10 @@ fn test_multi_stream_push_stripes_large_file_and_is_byte_identical() {
     assert_eq!(m_local.manifest_digest, m_multi.manifest_digest);
     assert_eq!(m_local.entries.len(), m_multi.entries.len());
 
-    // The large file is intact despite being striped across three sessions.
+    // The large file is intact despite being striped across four sessions.
     assert_eq!(
         fs::read(dst_multi.path().join("big.bin")).unwrap(),
-        vec![0xEE; 24 * 1024 * 1024]
+        vec![0xEE; 64 * 1024 * 1024]
     );
 
     // The Finished event reports the file count and byte accounting.

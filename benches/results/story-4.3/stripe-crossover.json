@@ -1,0 +1,72 @@
+{
+  "schema": "xsync.stripe-bench.v1",
+  "repetitions": 5,
+  "stream_counts": [
+    1,
+    4
+  ],
+  "large_file_sizes_mib": [
+    4,
+    16,
+    64
+  ],
+  "many_small_ratio": 0.8990352273994224,
+  "results": [
+    {
+      "label": "large-4M",
+      "logical_bytes": 4194304,
+      "streams": 1,
+      "median_ms": 189.44608399999998,
+      "mad_ms": 1.6616659999999968
+    },
+    {
+      "label": "large-4M",
+      "logical_bytes": 4194304,
+      "streams": 4,
+      "median_ms": 193.58266700000001,
+      "mad_ms": 1.6078339999999969
+    },
+    {
+      "label": "large-16M",
+      "logical_bytes": 16777216,
+      "streams": 1,
+      "median_ms": 732.6012499999999,
+      "mad_ms": 4.242415999999935
+    },
+    {
+      "label": "large-16M",
+      "logical_bytes": 16777216,
+      "streams": 4,
+      "median_ms": 519.228333,
+      "mad_ms": 0.6558759999999211
+    },
+    {
+      "label": "large-64M",
+      "logical_bytes": 67108864,
+      "streams": 1,
+      "median_ms": 2922.672417,
+      "mad_ms": 35.667875000000095
+    },
+    {
+      "label": "large-64M",
+      "logical_bytes": 67108864,
+      "streams": 4,
+      "median_ms": 1504.3728330000001,
+      "mad_ms": 20.913166000000047
+    },
+    {
+      "label": "many-small",
+      "logical_bytes": 1638400,
+      "streams": 1,
+      "median_ms": 254.53875,
+      "mad_ms": 2.824874999999963
+    },
+    {
+      "label": "many-small",
+      "logical_bytes": 1638400,
+      "streams": 4,
+      "median_ms": 283.124334,
+      "mad_ms": 7.5979169999999385
+    }
+  ]
+}

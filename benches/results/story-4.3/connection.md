@@ -1,14 +1,14 @@
 # Story 4.3 — SSH connection-model benchmark
 
 - schema: `xsync.connection-bench.v1`
-- repetitions: 5
+- repetitions: 1
 - setup kind: pipe-child (same transport line as production ssh)
-- reference transfer: 201 files, 1867776 bytes, 22.01 ms
-- per-session setup (streams=1): 3.03 ms
+- reference transfer: 201 files, 1867776 bytes, 180.08 ms
+- per-session setup (streams=1): 3.78 ms
 
 | streams | setup median (ms) | MAD (ms) | delta vs prev (ms) | transfer/setup |
 |---:|---:|---:|---:|---:|
-| 1 | 3.03 | 0.30 | 3.03 | 7.27 |
-| 2 | 3.50 | 0.22 | 0.48 | 6.28 |
-| 4 | 5.63 | 0.61 | 2.12 | 3.91 |
-| 8 | 8.99 | 0.69 | 3.36 | 2.45 |
+| 1 | 3.78 | 0.00 | 3.78 | 47.58 |
+| 2 | 4.07 | 0.00 | 0.29 | 44.23 |
+| 4 | 6.46 | 0.00 | 2.39 | 27.87 |
+| 8 | 7.20 | 0.00 | 0.74 | 25.02 |

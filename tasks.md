@@ -865,8 +865,16 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   Story 4.2 shows a workload where transfer dominates the added session setup+scan cost. `--streams`
   continues to resolve to one (Story 0.5), and user values within 1..=16 are honored only after the
   cross-host gate passes.
+- **Loop closed:** once Story 4.2 landed, the crossover was measured against the real multi-stream
+  path (`xsync-stripe-bench.v1`, 5 reps, pipe-child = optimistic lower bound, in
+  `benches/results/story-4.3/`): single 4 MiB file 0.95x at 4 streams, single 16 MiB 1.35x, single
+  64 MiB 1.84x, and a many-small corpus 0.99x. Stripping is a *large-single-file* win crossing over
+  between ~4 and ~16 MiB per file and reaching ~1.8x at 64 MiB; small/medium and many-small jobs are
+  flat-to-slightly-worse. `DECISION.md` records the enablement rule: `--streams` defaults to one,
+  explicit `N` within 1..=16 is honored, and multi-stream is claimed only for large-file-dominated
+  jobs — matching the evidence-driven policy in plan.md.
 - `remote_server_command` was made `pub` so the benchmark (a sibling crate) can reuse the exact
-  production spawn line. Verification: 135 workspace tests pass; strict Clippy `-D warnings` clean.
+  production spawn line. Verification: 138 workspace tests pass; strict Clippy `-D warnings` clean.
 
 ### Story 4.4 — Rsync wire-protocol research and compatibility contract
 - [ ] Produce a clean, versioned compatibility specification for the receiver-side rsync wire

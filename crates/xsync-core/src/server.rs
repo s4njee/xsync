@@ -2640,6 +2640,14 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
 
     // ---- Control session: handshake, destination scan, plan ----
     let mut control = spawn_server_child(dest_path, rsh, host)?;
+    let control_stderr = control.stderr.take();
+    let cstderr_handle = control_stderr.map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = std::io::Read::read_to_string(&mut pipe, &mut buf);
+            buf
+        })
+    });
     let cstdin = control
         .stdin
         .take()
@@ -2943,17 +2951,20 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
 
     // ---- Partition large-file missing ranges across data sessions ----
     let chunk = 8 * 1024 * 1024u64;
-    // per data-session work: (entry, ranges)
-    let mut data_work: Vec<Vec<(FileEntry, Vec<ByteRange>)>> =
-        (0..streams).map(|_| Vec::new()).collect();
-    // A running assignment for coverage.
+    // Per data-session work grouped by file path, so each session prepares each
+    // file exactly once and then writes that file's disjoint ranges.
+    let mut grouped: Vec<HashMap<String, (FileEntry, Vec<ByteRange>)>> =
+        (0..streams).map(|_| HashMap::new()).collect();
     let mut assigned_by_path: HashMap<String, Vec<ByteRange>> = HashMap::new();
     let mut round = 0usize;
     for file in &large_files {
         let verified = verified_by_path.get(&file.path).cloned().unwrap_or_default();
         let missing = crate::journal::missing_chunks(file.size, chunk, &verified);
         for range in missing {
-            data_work[round % streams].push((file.clone(), vec![range]));
+            let slot = grouped[round % streams]
+                .entry(file.path.clone())
+                .or_insert_with(|| (file.clone(), Vec::new()));
+            slot.1.push(range);
             assigned_by_path
                 .entry(file.path.clone())
                 .or_default()
@@ -2961,6 +2972,10 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             round += 1;
         }
     }
+    let data_work: Vec<Vec<(FileEntry, Vec<ByteRange>)>> = grouped
+        .into_iter()
+        .map(|m| m.into_values().collect())
+        .collect();
 
     // ---- Spawn data threads ----
     let source_path_buf = source_path.to_path_buf();
@@ -3120,6 +3135,13 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     drop(cwriter);
     drop(creader);
     let _ = control.wait();
+    if let Some(handle) = cstderr_handle {
+        let text = handle.join().unwrap_or_default();
+        let trimmed = text.trim_end().to_owned();
+        if !trimmed.is_empty() {
+            eprintln!("{trimmed}");
+        }
+    }
 
     emit(LocalEvent::Finished {
         transferred_files: report.transferred_files,
@@ -3148,7 +3170,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
 ///
 /// # Errors
 /// Returns [`ServerError`] on protocol or transport failure.
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value)]
 fn run_data_thread(
     mut child: std::process::Child,
     source_path: &Path,
@@ -3164,6 +3186,36 @@ fn run_data_thread(
         stream: 0,
         message: "failed to open data stdout".to_owned(),
     })?;
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = std::io::Read::read_to_string(&mut pipe, &mut buf);
+            buf
+        })
+    });
+    let result = run_data_inner(
+        stdin, stdout, source_path, prefix, job_id, &work,
+    );
+    if let Some(handle) = stderr {
+        let text = handle.join().unwrap_or_default();
+        let trimmed = text.trim_end().to_owned();
+        if !trimmed.is_empty() {
+            eprintln!("{trimmed}");
+        }
+    }
+    let _ = child.wait();
+    result
+}
+
+/// Core of [`run_data_thread`], after its streams have been split out.
+fn run_data_inner(
+    stdin: std::process::ChildStdin,
+    stdout: std::process::ChildStdout,
+    source_path: &Path,
+    prefix: &str,
+    job_id: [u8; 16],
+    work: &[(FileEntry, Vec<ByteRange>)],
+) -> Result<Vec<(String, Vec<ByteRange>)>, ServerError> {
     let mut writer = BufWriter::new(stdin);
     let mut reader = BufReader::new(stdout);
     let mut decoder = FrameDecoder::new();
@@ -3203,7 +3255,7 @@ fn run_data_thread(
 
     let source_reader = SourceReader::new(source_path);
     let mut written: Vec<(String, Vec<ByteRange>)> = Vec::new();
-    for (file, ranges) in &work {
+    for (file, ranges) in work {
         // Read the file once as the source for this session's slices.
         let rel = if prefix.is_empty() {
             file.path.clone()
@@ -3254,7 +3306,6 @@ fn run_data_thread(
     // Signal EOF to end the data session cleanly.
     drop(writer);
     drop(reader);
-    let _ = child.wait();
     Ok(written)
 }
 
