@@ -24,6 +24,10 @@ path = "src/bin/xsync-remote-spike.rs"
 name = "xsync-strategy-bench"
 path = "src/bin/xsync-strategy-bench.rs"
 
+[[bin]]
+name = "xsync-connection-bench"
+path = "src/bin/xsync-connection-bench.rs"
+
 [lints]
 workspace = true
 

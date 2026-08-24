@@ -823,7 +823,7 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   v1/v2 compatibility matrix cost is actually justified.
 
 ### Story 4.3 — SSH startup and connection-model decision
-- [ ] Measure and document fresh SSH sessions, user-provided ControlMaster reuse, and persistent
+- [x] Measure and document fresh SSH sessions, user-provided ControlMaster reuse, and persistent
   per-job sessions without breaking interactive authentication.
 
 **AC**
@@ -835,6 +835,32 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   permissions and deterministic cleanup; failure falls back to ordinary persistent sessions.
 - Password/keyboard-interactive prompts are not duplicated unexpectedly when automatic multi-stream
   setup is selected; if safe fan-out is unavailable, xsync warns and continues with one stream.
+
+**Results:**
+- Added the `xsync-connection-bench` runner (`benches/engine`, versioned
+  `xsync.connection-bench.v1` JSON + Markdown). It spawns N real `xsync --server` child processes
+  (the same `remote_server_command` line a production ssh host uses, minus the ssh RTT), v1-handshakes
+  them, and stops the clock at the `SessionConfig` acknowledgement — so *connection setup* is reported
+  separately from a reference end-to-end transfer (201 files, ~1.87 MiB). Stream counts 1/2/4/8 are
+  measured with ≥5 repetitions (median + MAD). The bin has a hidden `--server` mode so it can serve
+  as its own child, keeping the runnable wherever it is built.
+- This host: setup median 1→3.30, 2→3.38, 4→5.95, 8→9.56 ms; reference transfer ~24.7 ms. Adding the
+  second session is cheap (~0.1 ms, spawn overlap); the cost then recomposes superlinearly (2→4
+  +2.6 ms, 4→8 +3.6 ms), so at 8 sessions setup alone is ~40% of a small job's transfer and is a
+  deliberate gate for Story 4.2. Real ssh adds a per-session constant RTT not reproduced over the
+  pipe path. `benches/results/story-4.3/` holds the JSON, Markdown, and `DECISION.md`.
+- Connection model decision (in `DECISION.md`): one persistent `{ssh} {host} xsync --server` session
+  per job is the only shipped model. xsync never creates a long-lived ControlMaster/master socket,
+  never writes to the user's SSH config, and never weakens host-key/authentication settings. No
+  implicit multiplexing; any future connection control socket must live in an owned job directory
+  with restrictive permissions, deterministic cleanup, and a persistent-session fallback.
+- Interactive password/host-key/keyboard-interactive prompts are read by OpenSSH from the controlling
+  tty (`/dev/tty`), so the piped protocol stdin does not duplicate them; multi-stream stays off until
+  Story 4.2 shows a workload where transfer dominates the added session setup+scan cost. `--streams`
+  continues to resolve to one (Story 0.5), and user values within 1..=16 are honored only after the
+  cross-host gate passes.
+- `remote_server_command` was made `pub` so the benchmark (a sibling crate) can reuse the exact
+  production spawn line. Verification: 135 workspace tests pass; strict Clippy `-D warnings` clean.
 
 ### Story 4.4 — Rsync wire-protocol research and compatibility contract
 - [ ] Produce a clean, versioned compatibility specification for the receiver-side rsync wire

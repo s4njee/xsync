@@ -2455,7 +2455,7 @@ fn is_missing_xsync_stderr(stderr: &str, exit_code: Option<i32>) -> bool {
 /// - No `-e` but a host: the default `ssh {host} xsync --server {path}`.
 /// - No host and no `-e`: an in-process/local child server via `current_exe`.
 #[must_use]
-fn remote_server_command(
+pub fn remote_server_command(
     remote_path: &str,
     rsh: Option<&str>,
     host: Option<&str>,

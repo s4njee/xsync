@@ -1,0 +1,45 @@
+{
+  "schema": "xsync.connection-bench.v1",
+  "repetitions": 5,
+  "stream_counts": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "setup_kind": "pipe-child (same transport line as production ssh)",
+  "per_session_setup_ms_1": 3.026666,
+  "reference_transfer_ms": 22.012957999999998,
+  "reference_files": 201,
+  "reference_bytes": 1867776,
+  "results": [
+    {
+      "streams": 1,
+      "setup_ms_median": 3.026666,
+      "setup_ms_mad": 0.296999,
+      "delta_setup_vs_previous_ms": 3.026666,
+      "transfer_over_setup_ratio": 7.273005346476948
+    },
+    {
+      "streams": 2,
+      "setup_ms_median": 3.5044160000000004,
+      "setup_ms_mad": 0.22083399999999953,
+      "delta_setup_vs_previous_ms": 0.47775000000000034,
+      "transfer_over_setup_ratio": 6.281491124341401
+    },
+    {
+      "streams": 4,
+      "setup_ms_median": 5.626125,
+      "setup_ms_mad": 0.610709,
+      "delta_setup_vs_previous_ms": 2.1217089999999996,
+      "transfer_over_setup_ratio": 3.9126322291097333
+    },
+    {
+      "streams": 8,
+      "setup_ms_median": 8.989666,
+      "setup_ms_mad": 0.6894580000000001,
+      "delta_setup_vs_previous_ms": 3.3635409999999997,
+      "transfer_over_setup_ratio": 2.448695869234741
+    }
+  ]
+}
