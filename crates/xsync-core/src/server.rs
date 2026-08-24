@@ -649,15 +649,14 @@ impl Server {
                         writer.write_all(&bytes)?;
                         writer.flush()?;
                     } else {
-                        // Fallback single-file segment: write directly
-                        let ack = Message::Ack {
-                            acknowledged_id: frame.message_id,
-                            acknowledged_type: 4,
-                        };
-                        let msg_id = self.next_id();
-                        let bytes = encode_frame(msg_id, &ack)?;
-                        writer.write_all(&bytes)?;
-                        writer.flush()?;
+                        // A data segment with no registered source must not be
+                        // silently acknowledged: with a singleton session it is
+                        // a protocol-ordering bug; under multi-stream it is the
+                        // drop path for a mis-sequenced data session. Make it a
+                        // loud failure instead of silent data loss.
+                        return Err(ServerError::UnexpectedMessage(format!(
+                            "FileSegment for unregistered file_id {file_id}"
+                        )));
                     }
                 }
                 Message::LargeFilePrepare {
@@ -2592,6 +2591,65 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use tempfile::tempdir;
+
+    #[test]
+    fn unrouted_segment_is_a_loud_error_not_a_silent_drop() {
+        let dst = tempdir().unwrap();
+        let mut input = Vec::new();
+
+        // Handshake: client is the source (we are sending data at the sink).
+        input.extend_from_slice(&encode_frame(1, &Message::Handshake {
+            role: Role::Source,
+            capabilities: 0,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [9u8; 16],
+            compression: CompressionMode::None,
+        }).unwrap());
+
+        // SessionConfig.
+        input.extend_from_slice(&encode_frame(2, &Message::SessionConfig {
+            streams: 1,
+            batch_bytes: 32 * 1024 * 1024,
+            chunk_bytes: 16 * 1024 * 1024,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            delete: false,
+            checksum: false,
+            paranoid: false,
+        }).unwrap());
+
+        // Ack the (empty) destination Scan page the server sends after config.
+        input.extend_from_slice(&encode_frame(3, &Message::Ack {
+            acknowledged_id: 1002,
+            acknowledged_type: 9,
+        }).unwrap());
+
+        // A FileSegment whose file_id was never prepared/batched: this must fail
+        // loudly rather than report success while dropping the bytes.
+        input.extend_from_slice(&encode_frame(4, &Message::FileSegment {
+            file_id: 9_999,
+            offset: 0,
+            data: b"must not be silently dropped".to_vec(),
+        }).unwrap());
+
+        let mut server = Server::new(dst.path());
+        let mut output = Vec::new();
+        let result = server.run(Cursor::new(&input), &mut output);
+        assert!(
+            matches!(
+                &result,
+                Err(ServerError::UnexpectedMessage(msg)) if msg.contains("unregistered file_id")
+            ),
+            "unregistered FileSegment must be rejected, got {result:?}"
+        );
+        // No file may be published for the dropped segment.
+        let count = dst
+            .path()
+            .read_dir()
+            .map_or(0, |iter| iter.count());
+        assert_eq!(count, 0);
+    }
 
     #[test]
     fn default_remote_shell_is_ssh_over_host() {

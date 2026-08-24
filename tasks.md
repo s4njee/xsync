@@ -789,35 +789,38 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   `min(cpus, 8)`; provisional four-stream behavior ships only if its cross-host gate passes.
 - User-specified stream count is always honored within 1..=16 even if the automatic policy differs.
 
-**Status: architectural blocker found (protocol v2 required).**
-- The frozen v1 protocol is per-session self-contained: the receiver's sink needs
-  `LargeFilePrepare`/scan/metadata on the *same* session that delivers that file's segments, and it
-  owns one resume journal. So a data session cannot write disjoint ranges into a stage it did not
-  prepare, and it cannot merge into a shared control-side union journal. `protocol.md` mandates a new
-  version for any new message type, and a new version must not reinterpret v1 fields.
-- Correct multi-stream therefore requires **protocol v2**, adding at minimum: (1) a way to mark a
-  session as `control` vs `data` (data sessions skip the destination scan and accept range/segment
-  traffic against a stage and identity handed over by control), and (2) a `CheckpointRanges` message
-  so the control session — the sole durable journal owner — records the union of ranges written by
-  all data sessions before the corresponding durable acknowledgement. A naive
-  last-writer-wins-per-session journal keeps content correct but reintroduces retransmission on
-  resume, and per-session planning races on symlink/directory-metadata/delete ownership.
-- **Shipped now:** `Sink::prepare_large` is now idempotent (a matching-size stage is preserved
-  rather than wiped), which is the exact stage contract every control/data writer must agree on and
-  is independently unit-tested. `--streams N` parsing (1..=16) and Story 0.5's default of one stream
-  are unchanged and already tested; extra sessions are not yet opened, so nothing is claimed that the
-  cross-host gate has not passed.
-- **Design decision:** range-striping multi-stream is left `[~]` with `--streams` still resolving to
-  one session (fully tested) until the protocol-v2 data/control split below is implemented as a
-  dedicated effort. This is intentional: it matches "provisional multi-stream ships only if the gate
-  passes" and keeps every shipped path verified.
-- **Proposed v2 design (not yet built):** control session drives handshake/scan/plan, creates
-  directories/symlinks, is the only writer of the resume journal, and owns `LargeFilePrepare`/finish;
-  N data sessions are marked data-only, receive `LargeFilePrepare` as a non-destructive
-  ensure-stage handoff, write disjoint 8 MiB ranges, and never contact the journal directly. The
-  client relays each data-range completion to control as `CheckpointRanges`, and control durably
-  checkpoints the union before the durable ack. Failure of a data stream cancels/drains peers using
-  the existing FrameDecoder/session boundaries and resumes through Story 3.4.
+**Status: v1-expressible; coordination rests on client sequencing + a journal merge fix.**
+- Revisited after review: protocol v2 is **not** required for multi-stream. All three originally-flagged
+  needs are expressible in v1. (1) A data-only session is just `Role::Sink` plus a dedicated bit in
+  the existing `Handshake.capabilities: u32` — decoded with no known-bits mask, so arbitrary bits
+  round-trip today; the server honors it by skipping the destination scan. (2) A data session can own
+  a stage it did not "prepare": its own v1 `LargeFilePrepare` populates its local `large_files` map
+  so ranges route to `write_chunk_with_retry`, and the idempotent `Sink::prepare_large` preserves a
+  matching-size stage instead of wiping peers' work. (3) `CheckpointRanges` is unnecessary: all
+  sessions share one job-id/relative-path journal record, so the receiver's disk is the merge point.
+- The one genuine gap is **multi-stream resume**: `journal::checkpoint` blindly overwrites with the
+  caller's in-memory list (`journal.rs::165`), so the last writer's ranges survive and the rest are
+  lost (content stays correct; the next run just retransmits them). Closing it is a local, testable
+  change in one crate: make `checkpoint` `load → merge → write` using the already-written-and-tested
+  `merge_ranges` union primitive, guarded by a real cross-process lock — `read-merge-write` is not
+  atomic even with the atomic final rename, and `clear`/`invalidate` must be safe against a
+  concurrent `checkpoint`. No wire change.
+- The actual bulk of 4.2 is **client-side sequencing**, not protocol: a barrier before
+  `LargeFileFinish`, control-only ownership of directories/symlinks/deletes, and drain-on-failure
+  semantics. These are implementable in the orchestration layer.
+- Defects fixed/handled along the way: `server.rs` no longer silently acks a `FileSegment` whose
+  `file_id` is unregistered (was the exact drop path for a mis-sequenced data session) — it is now a
+  hard `UnexpectedMessage` error, with a regression test.
+- **Shipped now:** idempotent `Sink::prepare_large`; the silent-ack→loud-error fix + test;
+  `--streams` parsing (1..=16) unchanged and Story 0.5's default of one stream intact (fully tested),
+  so nothing unverified is claimed.
+- **Sequencing decision:** measure before building. Run Story 4.3 first — if four sessions cost four
+  SSH handshakes plus four destination scans, striping may not pay for small/medium jobs, and the
+  crossover point should drive whether/when the coordination complexity is worth it. If it pays,
+  build 4.2 on v1 as: capability bit → data-only sessions, idempotent prepare (done), merge-on-checkpoint
+  under a lock, and client-side finish/metadata/delete barriers. Keep protocol v2 in reserve for
+  something that genuinely needs new message types (e.g. delta transfer's chunk index), where the
+  v1/v2 compatibility matrix cost is actually justified.
 
 ### Story 4.3 — SSH startup and connection-model decision
 - [ ] Measure and document fresh SSH sessions, user-provided ControlMaster reuse, and persistent
