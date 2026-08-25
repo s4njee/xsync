@@ -125,6 +125,8 @@ pub enum LocalEvent {
     Skipped {
         /// Destination-relative path.
         path: String,
+        /// Logical bytes already present at the destination.
+        bytes: u64,
     },
     /// An action that would be performed by a real transfer. In dry-run mode
     /// these are the complete mutation plan; normal runs emit them before
@@ -420,6 +422,7 @@ where
     for entry in &plan.files.unchanged {
         emit(LocalEvent::Skipped {
             path: entry.path.clone(),
+            bytes: entry.size,
         });
     }
     if options.dry_run {
@@ -1695,7 +1698,7 @@ mod tests {
         assert_eq!(second.skipped_files, 2);
         assert!(second_events.iter().any(|event| matches!(
             event,
-            LocalEvent::Skipped { path } if path == "nested/file"
+            LocalEvent::Skipped { path, .. } if path == "nested/file"
         )));
         assert!(first_events.iter().any(|event| matches!(
             event,
@@ -1869,7 +1872,7 @@ mod tests {
         for event in events {
             let path = match event {
                 LocalEvent::Transferred { path, .. }
-                | LocalEvent::Skipped { path }
+                | LocalEvent::Skipped { path, .. }
                 | LocalEvent::Warning { path, .. }
                 | LocalEvent::Failed { path, .. }
                 | LocalEvent::Deleted { path } => Some(path),

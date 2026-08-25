@@ -9,7 +9,7 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "xsync"
+name = "xs"
 path = "src/main.rs"
 
 [lints]

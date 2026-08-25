@@ -10,7 +10,7 @@ use xsync_bench::manifest::build_manifest;
 use xsync_core::protocol::FrameDecoder;
 
 fn xsync_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_xsync")
+    env!("CARGO_BIN_EXE_xs")
 }
 
 fn populate_test_tree(root: &Path) {
@@ -137,9 +137,9 @@ fn write_fake_rsync_rsh(script_dir: &Path, missing_xsync: bool) -> Option<PathBu
     let remote_path = Path::new(reference).parent().unwrap();
     let script = script_dir.join("fake_rsync_rsh.sh");
     let missing = if missing_xsync {
-        "case \"$1\" in *\"'xsync' '--server'\"*) echo 'xsync: command not found' >&2; exit 127;; esac"
+        "case \"$1\" in *\"'xs' '--server'\"*) echo 'xs: command not found' >&2; exit 127;; esac"
     } else {
-        "case \"$1\" in *\"'xsync' '--server'\"*) echo 'native xsync unexpectedly requested' >&2; exit 99;; esac"
+        "case \"$1\" in *\"'xs' '--server'\"*) echo 'native xs unexpectedly requested' >&2; exit 99;; esac"
     };
     fs::write(
         &script,
@@ -961,7 +961,7 @@ fn test_missing_remote_binary_reports_clear_error() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("xsync not found on remote host — install it or check PATH"),
+        stderr.contains("xs not found on remote host — install it or check PATH"),
         "missing remote binary must not surface as a raw broken-pipe error; got: {stderr}"
     );
 }

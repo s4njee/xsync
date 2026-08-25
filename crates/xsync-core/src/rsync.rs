@@ -600,6 +600,7 @@ fn run_session<R: Read, W: Write, F: FnMut(LocalEvent)>(
             report.skipped_files = report.skipped_files.saturating_add(1);
             emit(LocalEvent::Skipped {
                 path: display_wire_path(&entry.path),
+                bytes: entry.size,
             });
         }
     }
@@ -1112,9 +1113,25 @@ fn shell_command(args: &[&[u8]]) -> Result<OsString, RsyncError> {
         if index != 0 {
             command.push(b' ');
         }
-        command.extend_from_slice(&shell_quote(arg)?);
+        if index == args.len() - 1 {
+            command.extend_from_slice(&shell_quote_remote_path(arg)?);
+        } else {
+            command.extend_from_slice(&shell_quote(arg)?);
+        }
     }
     os_string(command)
+}
+
+fn shell_quote_remote_path(arg: &[u8]) -> Result<Vec<u8>, RsyncError> {
+    if arg == b"~" {
+        return Ok(b"\"$HOME\"".to_vec());
+    }
+    if let Some(relative) = arg.strip_prefix(b"~/") {
+        let mut quoted = b"\"$HOME\"/".to_vec();
+        quoted.extend_from_slice(&shell_quote(relative)?);
+        return Ok(quoted);
+    }
+    shell_quote(arg)
 }
 
 fn shell_quote(arg: &[u8]) -> Result<Vec<u8>, RsyncError> {
@@ -1454,6 +1471,22 @@ mod tests {
         assert_eq!(
             shell_command(&[b"rsync", b"name\xff"]).unwrap().as_bytes(),
             b"'rsync' 'name\xff'"
+        );
+    }
+
+    #[test]
+    fn shell_command_expands_remote_home_path() {
+        assert_eq!(
+            shell_command(&[b"rsync", b"--server", b"~"])
+                .unwrap()
+                .as_bytes(),
+            b"'rsync' '--server' \"$HOME\""
+        );
+        assert_eq!(
+            shell_command(&[b"rsync", b"--server", b"~/nested"])
+                .unwrap()
+                .as_bytes(),
+            b"'rsync' '--server' \"$HOME\"/'nested'"
         );
     }
 

@@ -276,7 +276,7 @@ destination five times per cell, and does not record the quantities the later ep
   failures without fabricating cold or shaped evidence.
 
 ### Story T0.7 — Mutation states for real corpora
-- [ ] Real corpora have no pinned "previous version" the way generated fixtures do, so
+- [x] Real corpora have no pinned "previous version" the way generated fixtures do, so
   `no-op`, `content-churn`, and `delete` workloads need a derivation rule.
 
 **AC**
@@ -293,9 +293,17 @@ destination five times per cell, and does not record the quantities the later ep
 - Churn/delete choose a deterministic 1% of destination files from a seed-derived ranking, and
   each sample records the selected relative paths. The remote route is explicitly blocked for
   these real-corpus mutations until remote destination preparation is implemented.
-- The implementation is syntax-checked, focused runner tests pass, and the benchmark crate
-  tests pass. A real-corpus end-to-end mutation run is still blocked here because the pinned
-  real corpora are absent.
+- Live `congress-10k` same-volume runs completed for `no-op-second-sync`, `content-churn`, and
+  `delete`, with five repetitions per workload. Every matrix cell passed, every repetition's
+  full oracle passed, and the pinned source digest remained
+  `f5607e4b7af5d73f793730deabbf38071d28356a0f1eefe8f06e7f844e1380a6`.
+- Evidence is in `/tmp/xsync-t0.7-no-op-second-sync-out/`,
+  `/tmp/xsync-t0.7-content-churn-out/`, and `/tmp/xsync-t0.7-delete-out/`.
+
+**Plain-English results:** The three real-world “already copied,” “some contents changed,”
+and “some files were deleted” cases now run end to end. They all finished correctly, and the
+source data stayed untouched. The SSH version is still deferred because the runner does not
+yet prepare a remote destination for these mutations.
 
 **Next Steps:**
 - Add a disposable real-corpus integration test that runs all three derived workloads twice and
@@ -405,8 +413,11 @@ the transfer faster in this five-run test, but every destination still matched t
 **Blocker:** The current measured `congress-10k` result is 0.471x paired wall speed for xsync
 against rsync-a and does not meet the 0.9 wall-ratio or 1.5x system-time targets. The 100k
 confirmation is intentionally deferred until the 10k prerequisite passes. This is an engineering
-gap, not a request for user action; the evidence and exact failed target are in
-`benches/results/tuning/T1/DECISION.md`.
+gap, not a request for user action. A fresh five-repetition rerun after the T1.2 changes still
+measured a 0.515 paired wall ratio (xsync median 5.977 s; rsync median 3.215 s), with all
+correctness oracles passing but xsync's wall samples exceeding the 15% noise threshold. The
+full report is in `/tmp/xsync-t1.3-current-out/`; the earlier system-time comparison and target
+analysis remain in `benches/results/tuning/T1/DECISION.md`.
 
 **Plain-English results:** The complete T1 performance target is not met yet. The current measured
 10k run is still slower than rsync and uses too much system CPU, so the larger 100k confirmation
@@ -577,16 +588,17 @@ sample on the available `congress-10k` corpus measured 22,567 entries, 0.209 s d
 build time, 0.141 s source scan time, and 0.019 s planner time. The prototype benchmark artifacts
 are in `benches/results/tuning/T4.1/`.
 
-**Blocker:** The pinned `congress-1m` corpus is not present, so the required 1,318,771-entry build,
-under-one-second sparse-plan measurement, and memory-budget result cannot be established. The
-five-repetition isolated benchmark also cannot publish its report on this macOS host because
-`/usr/bin/time -l` exits after `sysctl kern.clockrate: Operation not permitted`; the worker itself
-does emit scan/index/planner timings, but peak RSS is not available from that failed wrapper.
+**Blocker:** The full `congress-1m` measurement is now available, but it fails the performance
+acceptance criteria. Across five isolated repetitions the 1,787,545-entry tree measured median
+destination-index build `12.963047 s`, planner `2.697094 s`, and peak RSS `1,091,600,384`
+bytes, versus the required sub-one-second plan and 512 MiB budget. The full report is in
+`/tmp/xsync-t4.1-1m/report.md` and `report.json`. This establishes the gap; it does not justify
+integrating the persistent index yet.
 
-**Plain-English results:** The project has a bounded read-only index prototype, and it works on the
-small corpus available here. We cannot yet prove that it fits the required memory or speed budget
-at 1.3 million entries because that corpus is missing and the local peak-memory measurement tool
-is denied by macOS.
+**Plain-English results:** The prototype can scan and plan the full million-entry dataset, but it
+is currently too memory-hungry and too slow for the requested always-on index. It used about 1.09
+GB of memory and took about 2.7 seconds just to produce the plan, so the index needs a smaller
+representation or a different build strategy before it can be integrated.
 
 ### Story T4.2 — Change-feed correctness under loss
 - [~] FSEvents is lossy under load and *says so*. f2 observed `MustScanSubDirs` and

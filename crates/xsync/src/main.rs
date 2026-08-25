@@ -1,8 +1,8 @@
-//! The `xsync` binary — CLI frontend over the `xsync-core` engine.
+//! The `xs` binary — CLI frontend over the `xsync-core` engine.
 //!
 //! Story 1.2: full clap argument surface with rsync-familiar wording.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ enum CloudFilesArg {
 /// High-performance rsync replacement built on a parallel pipeline and BLAKE3.
 #[derive(Debug, Parser)]
 #[command(
-    name = "xsync",
+    name = "xs",
     version = xsync_core::version(),
     about = "High-performance rsync replacement",
     long_about = "xsync is an rsync-compatible file synchronization tool with a parallel \
@@ -115,7 +115,7 @@ fn main() -> std::process::ExitCode {
         Ok(RunOutcome::Complete) => ExitCode::SUCCESS,
         Ok(RunOutcome::Partial) => ExitCode::from(xsync_core::local::PARTIAL_FAILURE_EXIT_CODE),
         Err(e) => {
-            eprintln!("xsync: {e}");
+            eprintln!("xs: {e}");
             ExitCode::FAILURE
         }
     }
@@ -212,7 +212,7 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
                     progress_json,
                     quiet,
                     Some(&mut selection),
-                )
+                );
             },
         )?
     } else if dest.is_remote() {
@@ -302,7 +302,7 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
                     progress_json,
                     quiet,
                     Some(&mut selection),
-                )
+                );
             },
         )?
     };
@@ -480,10 +480,34 @@ struct ProgressRenderer {
     children: HashMap<(usize, String), ProgressBar>,
     started: Instant,
     last_plain: Instant,
+    transfer_started: Option<Instant>,
     total_files: Option<usize>,
     total_bytes: Option<u64>,
     files: usize,
     bytes: u64,
+    rate_bytes: u64,
+    progress_seen: HashSet<String>,
+    progress_offsets: HashMap<String, u64>,
+    progress_streams: HashMap<String, usize>,
+}
+
+fn format_rate(bytes_per_second: f64) -> String {
+    const UNITS: [&str; 5] = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"];
+    let mut value = if bytes_per_second.is_finite() {
+        bytes_per_second.max(0.0)
+    } else {
+        0.0
+    };
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 impl ProgressRenderer {
@@ -506,11 +530,24 @@ impl ProgressRenderer {
             children: HashMap::new(),
             started: Instant::now(),
             last_plain: Instant::now(),
+            transfer_started: None,
             total_files: None,
             total_bytes: None,
             files: 0,
             bytes: 0,
+            rate_bytes: 0,
+            progress_seen: HashSet::new(),
+            progress_offsets: HashMap::new(),
+            progress_streams: HashMap::new(),
         }
+    }
+
+    fn transfer_elapsed(&self) -> f64 {
+        self.transfer_started
+            .unwrap_or(self.started)
+            .elapsed()
+            .as_secs_f64()
+            .max(0.001)
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -527,19 +564,20 @@ impl ProgressRenderer {
                 if let Some(spinner) = self.spinner.take() {
                     spinner.finish_and_clear();
                 }
-                total.set_message(format!("{} files", self.files));
+                let rate = format_rate(self.rate_bytes as f64 / self.transfer_elapsed());
+                total.set_message(format!("{} files | {rate}", self.files));
                 total.set_position(self.bytes);
             }
             return;
         }
-        let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
+        let elapsed = self.transfer_elapsed();
         let files = self
             .total_files
             .map_or_else(|| "?".to_owned(), |n| n.to_string());
         let bytes = self
             .total_bytes
             .map_or_else(|| "?".to_owned(), |n| n.to_string());
-        let rate = self.bytes as f64 / elapsed / 1024.0;
+        let rate = format_rate(self.rate_bytes as f64 / elapsed);
         let line = if scanning {
             format!(
                 "scanning… | {}/{} files | {}/{} bytes",
@@ -547,7 +585,7 @@ impl ProgressRenderer {
             )
         } else {
             format!(
-                "transfer | {}/{} files | {}/{} bytes | {rate:.1} KiB/s",
+                "transfer | {}/{} files | {}/{} bytes | {rate}",
                 self.files, files, self.bytes, bytes
             )
         };
@@ -574,7 +612,7 @@ impl ProgressRenderer {
     #[allow(clippy::cast_precision_loss)]
     fn summary(&self, transferred_bytes: u64, failed_entries: usize) {
         if self.terminal {
-            let elapsed = self.started.elapsed().as_secs_f64().max(0.001);
+            let elapsed = self.transfer_elapsed();
             let rate = transferred_bytes as f64 / elapsed / 1024.0 / 1024.0;
             println!(
                 "elapsed: {:.2}s | throughput: {:.2} MiB/s | verification: {}",
@@ -590,6 +628,7 @@ impl ProgressRenderer {
     }
 
     fn plan(&mut self, files: usize, bytes: u64) {
+        self.transfer_started = Some(Instant::now());
         self.total_files = Some(files);
         self.total_bytes = Some(bytes);
         if self.terminal {
@@ -599,9 +638,11 @@ impl ProgressRenderer {
                 .expect("terminal progress owns a multiprogress")
                 .add(ProgressBar::new(bytes));
             total.set_style(
-                ProgressStyle::with_template("{bar:40.cyan/blue} {bytes}/{total_bytes} {msg}")
-                    .expect("valid progress template")
-                    .progress_chars("##-"),
+                ProgressStyle::with_template(
+                    "{bar:32.cyan} {percent:>3}%  {bytes}/{total_bytes}  {msg}",
+                )
+                .expect("valid progress template")
+                .progress_chars("━╸─"),
             );
             self.total = Some(total);
         }
@@ -609,10 +650,20 @@ impl ProgressRenderer {
     }
 
     fn file_progress(&mut self, path: &str, stream: usize, completed: u64, total: u64) {
+        let key = (stream, path.to_owned());
+        self.progress_streams.insert(path.to_owned(), stream);
+        let previous = self
+            .progress_offsets
+            .insert(path.to_owned(), completed)
+            .unwrap_or_default();
+        self.rate_bytes = self
+            .rate_bytes
+            .saturating_add(completed.saturating_sub(previous));
+        self.progress_seen.insert(path.to_owned());
+        self.draw(false);
         if !self.terminal || total < 1024 * 1024 {
             return;
         }
-        let key = (stream, path.to_owned());
         let bar = self.children.entry(key.clone()).or_insert_with(|| {
             let bar = self
                 .multi
@@ -620,11 +671,13 @@ impl ProgressRenderer {
                 .expect("terminal progress owns a multiprogress")
                 .add(ProgressBar::new(total));
             bar.set_style(
-                ProgressStyle::with_template("  {bar:32.green/black} {bytes}/{total_bytes} {msg}")
-                    .expect("valid progress template")
-                    .progress_chars("##-"),
+                ProgressStyle::with_template(
+                    "  {bar:24.green} {percent:>3}%  {bytes}/{total_bytes}  {msg}",
+                )
+                .expect("valid progress template")
+                .progress_chars("━╸─"),
             );
-            bar.set_message(format!("stream {stream}: {path}"));
+            bar.set_message(format!("stream {stream}"));
             bar
         });
         bar.set_position(completed.min(total));
@@ -632,6 +685,32 @@ impl ProgressRenderer {
             bar.finish_and_clear();
             self.children.remove(&key);
         }
+    }
+
+    fn print_file_status(&self, path: &str, status: &str) {
+        let line = self.progress_streams.get(path).map_or_else(
+            || format!("{path} | {status}"),
+            |stream| format!("stream {stream}: {path} | {status}"),
+        );
+        if self.terminal {
+            if let Some(multi) = &self.multi {
+                let _ = multi.println(&line);
+            }
+        } else {
+            println!("{line}");
+        }
+    }
+
+    fn skipped(&mut self, bytes: u64) {
+        self.files = self.files.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+        if let Some(total_bytes) = &mut self.total_bytes {
+            *total_bytes = total_bytes.saturating_add(bytes);
+        }
+        if let Some(total) = &self.total {
+            total.set_length(self.total_bytes.unwrap_or_default());
+        }
+        self.draw(false);
     }
 }
 
@@ -685,10 +764,14 @@ fn render_event(
         xsync_core::local::LocalEvent::Planned { files, bytes } => {
             progress.plan(*files, *bytes);
         }
-        xsync_core::local::LocalEvent::Transferred { bytes, .. } => {
+        xsync_core::local::LocalEvent::Transferred { path, bytes, .. } => {
             progress.files = progress.files.saturating_add(1);
             progress.bytes = progress.bytes.saturating_add(*bytes);
+            if !progress.progress_seen.contains(path) {
+                progress.rate_bytes = progress.rate_bytes.saturating_add(*bytes);
+            }
             progress.draw(false);
+            progress.print_file_status(path, "transferred");
         }
         xsync_core::local::LocalEvent::Progress {
             path,
@@ -696,6 +779,10 @@ fn render_event(
             completed,
             total,
         } => progress.file_progress(path, *stream, *completed, *total),
+        xsync_core::local::LocalEvent::Skipped { path, bytes } => {
+            progress.skipped(*bytes);
+            progress.print_file_status(path, "already present");
+        }
         xsync_core::local::LocalEvent::Finished {
             transferred_bytes,
             failed_entries,
@@ -848,9 +935,10 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "completed": completed,
             "total": total,
         }),
-        LocalEvent::Skipped { path } => serde_json::json!({
+        LocalEvent::Skipped { path, bytes } => serde_json::json!({
             "event": "skipped",
             "path": path,
+            "bytes": bytes,
         }),
         LocalEvent::Action { path, action } => serde_json::json!({
             "event": "action",
@@ -978,24 +1066,24 @@ mod tests {
     fn parse_failure_is_not_a_panic() {
         // Unknown flag.
         assert_eq!(
-            parse(&["xsync", "--bogus", "a", "b"]).unwrap_err().kind(),
+            parse(&["xs", "--bogus", "a", "b"]).unwrap_err().kind(),
             ErrorKind::UnknownArgument
         );
         // Missing SRC/DEST.
         assert_eq!(
-            parse(&["xsync", "only-a"]).unwrap_err().kind(),
+            parse(&["xs", "only-a"]).unwrap_err().kind(),
             ErrorKind::MissingRequiredArgument
         );
         // --streams out of range.
         assert_eq!(
-            parse(&["xsync", "--streams", "99", "a", "b"])
+            parse(&["xs", "--streams", "99", "a", "b"])
                 .unwrap_err()
                 .kind(),
             ErrorKind::ValueValidation
         );
         // --compress-level out of range.
         assert_eq!(
-            parse(&["xsync", "--compress-level", "0", "a", "b"])
+            parse(&["xs", "--compress-level", "0", "a", "b"])
                 .unwrap_err()
                 .kind(),
             ErrorKind::ValueValidation
@@ -1004,7 +1092,7 @@ mod tests {
 
     #[test]
     fn server_mode_does_not_require_paths() {
-        let cli = parse(&["xsync", "--server"]).unwrap();
+        let cli = parse(&["xs", "--server"]).unwrap();
         assert!(cli.server);
         assert!(cli.src.is_none());
         assert!(cli.dest.is_none());
@@ -1012,7 +1100,7 @@ mod tests {
 
     #[test]
     fn streams_is_optional_and_defaults_to_none() {
-        let cli = parse(&["xsync", "a", "b"]).unwrap();
+        let cli = parse(&["xs", "a", "b"]).unwrap();
         assert_eq!(cli.streams, None);
         assert_eq!(cli.transport, TransportArg::Auto);
     }
@@ -1024,7 +1112,7 @@ mod tests {
             ("xsync", TransportArg::Xsync),
             ("rsync", TransportArg::Rsync),
         ] {
-            let cli = parse(&["xsync", "--transport", name, "a", "host:b"]).unwrap();
+            let cli = parse(&["xs", "--transport", name, "a", "host:b"]).unwrap();
             assert_eq!(cli.transport, expected);
         }
     }
@@ -1045,5 +1133,13 @@ mod tests {
         assert_eq!(value["event"], "phase");
         assert_eq!(value["name"], "scan");
         assert_eq!(value["started"], true);
+    }
+
+    #[test]
+    fn formats_transfer_rates_using_readable_units() {
+        assert_eq!(format_rate(512.0), "512 B/s");
+        assert_eq!(format_rate(1024.0), "1.0 KiB/s");
+        assert_eq!(format_rate(1024.0 * 1024.0), "1.0 MiB/s");
+        assert_eq!(format_rate(1024.0 * 1024.0 * 1024.0), "1.0 GiB/s");
     }
 }

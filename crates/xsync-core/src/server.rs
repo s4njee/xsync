@@ -47,6 +47,12 @@ use crate::sink::{Sink, SinkError, SymlinkTargetKind};
 use crate::source::{SourceReadError, SourceReader};
 use crate::strategy::{BATCH_TARGET_SIZE, MAX_BATCH_FILES, SMALL_FILE_LIMIT};
 
+/// Emit server lifecycle diagnostics without contaminating the binary
+/// protocol on stdout. Stderr is intentionally safe for SSH diagnostics.
+fn server_log(message: impl std::fmt::Display) {
+    eprintln!("[xsync server] {message}");
+}
+
 /// Errors produced by server operations and remote protocol sessions.
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -92,7 +98,7 @@ pub enum ServerError {
         message: String,
     },
     /// The remote shell positively reported that xsync is unavailable.
-    #[error("xsync not found on remote host — install it or check PATH")]
+    #[error("xs not found on remote host — install it or check PATH")]
     MissingRemoteXsync,
     /// A transport error occurred on the named stream.
     #[error("transport error on stream {stream}: {message}")]
@@ -311,6 +317,10 @@ impl Server {
                     )))
                 }
             };
+        server_log(format_args!(
+            "received handshake: frame_id={}, role={client_role:?}, capabilities=0x{client_capabilities:x}",
+            frame.message_id
+        ));
         self.compression =
             negotiate_compression(compression, self.capabilities, client_capabilities);
         self.compression_level = compression_level;
@@ -370,6 +380,16 @@ impl Server {
                 )))
             }
         };
+        server_log(format_args!(
+            "received session config: frame_id={}, data_only={}, paranoid={}, delete={}, checksum={}, dry_run={}, excludes={}",
+            frame.message_id,
+            data_only,
+            paranoid,
+            delete,
+            checksum,
+            dry_run,
+            exclude_patterns.len()
+        ));
 
         // Send Ack for SessionConfig.
         let ack = Message::Ack {
@@ -1391,6 +1411,11 @@ impl Server {
 /// # Errors
 /// Returns [`ServerError`] on failure.
 pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
+    server_log(format_args!(
+        "process started: pid={}, root={}",
+        std::process::id(),
+        root.display()
+    ));
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut server = Server::new(root);
@@ -1398,7 +1423,13 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
     let stdout_lock = stdout.lock();
     let mut reader = BufReader::new(stdin_lock);
     let mut writer = BufWriter::new(stdout_lock);
-    server.run(&mut reader, &mut writer)
+    server_log("waiting for client handshake");
+    let result = server.run(&mut reader, &mut writer);
+    match &result {
+        Ok(()) => server_log("session finished successfully"),
+        Err(error) => server_log(format_args!("session failed: {error}")),
+    }
+    result
 }
 
 /// Frames the client may leave unacknowledged before it drains replies.
@@ -1445,7 +1476,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     source_path: &Path,
     source_trailing_slash: bool,
     dest_path: &str,
-    dest_trailing_slash: bool,
+    _dest_trailing_slash: bool,
     options: &LocalSyncOptions,
     mut reader: R,
     mut writer: W,
@@ -1614,13 +1645,26 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         dest_index.insert(entry)?;
     }
 
-    // Scan local source root.
+    // Scan local source root. A single-file source is scanned relative to its
+    // parent directory, so all subsequent reads must use that same root;
+    // otherwise `file` is incorrectly reopened as `file/file`.
+    let source_metadata = fs::symlink_metadata(source_path)?;
+    let source_is_dir = source_metadata.is_dir() && !source_metadata.file_type().is_symlink();
+    let source_reader_root = if source_is_dir {
+        source_path.to_path_buf()
+    } else {
+        source_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    };
     let source_scan = scan(source_path)?;
     let mut source_entries = Vec::new();
     for item in source_scan.entries() {
         let mut entry = item?;
         if options.checksum && entry.kind == ScanEntryKind::File {
-            entry.fingerprint.identity = content_identity(&source_path.join(&entry.path))?;
+            entry.fingerprint.identity = content_identity(&source_reader_root.join(&entry.path))?;
         }
         if !excluded_path(
             &encode_exclude_patterns(&options.exclude_patterns),
@@ -1636,8 +1680,6 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     });
 
     // Map source entries relative to destination root according to trailing-slash rules.
-    let source_metadata = fs::symlink_metadata(source_path)?;
-    let source_is_dir = source_metadata.is_dir() && !source_metadata.file_type().is_symlink();
     let prefix = if source_is_dir {
         if source_trailing_slash {
             String::new()
@@ -1649,15 +1691,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 .to_owned()
         }
     } else {
-        if dest_trailing_slash || dest_path.ends_with('/') {
-            source_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_owned()
-        } else {
-            String::new()
-        }
+        // A single-file scan already reports the basename as its relative
+        // path. Adding another basename here creates `file/file` when the
+        // destination is a directory.
+        String::new()
     };
 
     let mut mapped_source = Vec::new();
@@ -1707,6 +1744,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     for entry in &plan.files.unchanged {
         emit(LocalEvent::Skipped {
             path: entry.path.clone(),
+            bytes: entry.size,
         });
     }
     if options.dry_run {
@@ -1755,13 +1793,13 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         let mut pending = 0usize;
         for sym in plan.symlinks.new.iter().chain(&plan.symlinks.changed) {
             let local_sym_path = if prefix.is_empty() {
-                source_path.join(&sym.path)
+                source_reader_root.join(&sym.path)
             } else {
                 let stripped = sym
                     .path
                     .strip_prefix(&format!("{prefix}/"))
                     .unwrap_or(&sym.path);
-                source_path.join(stripped)
+                source_reader_root.join(stripped)
             };
             let target = fs::read_link(&local_sym_path)?;
             let target_bytes = target.into_os_string().into_encoded_bytes();
@@ -1791,7 +1829,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         drain_acks(&mut decoder, &mut reader, &mut pending, 0)?;
 
         // Transfer files.
-        let source_reader = SourceReader::new(source_path);
+        let source_reader = SourceReader::new(&source_reader_root);
 
         // Small files are coalesced and pipelined: one metadata frame describes
         // many files, and their segments are written without stopping for each
@@ -2590,6 +2628,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     for entry in &plan.files.unchanged {
         emit(LocalEvent::Skipped {
             path: entry.path.clone(),
+            bytes: entry.size,
         });
     }
     if options.dry_run {
@@ -3268,7 +3307,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     source_path: &Path,
     source_trailing_slash: bool,
     dest_path: &str,
-    dest_trailing_slash: bool,
+    _dest_trailing_slash: bool,
     options: &LocalSyncOptions,
     rsh: Option<&str>,
     host: Option<&str>,
@@ -3419,13 +3458,9 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                 .unwrap_or("")
                 .to_owned()
         }
-    } else if dest_trailing_slash || dest_path.ends_with('/') {
-        source_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_owned()
     } else {
+        // A single-file scan already reports the basename as its relative
+        // path; do not prepend it a second time.
         String::new()
     };
     let mut mapped = Vec::new();
@@ -3458,6 +3493,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     for entry in &plan.files.unchanged {
         emit(LocalEvent::Skipped {
             path: entry.path.clone(),
+            bytes: entry.size,
         });
     }
 
@@ -4127,12 +4163,22 @@ fn quote_remote_arg(argument: &str) -> String {
     format!("'{}'", argument.replace('\'', "'\\''"))
 }
 
+fn quote_remote_path(path: &str) -> String {
+    if path == "~" {
+        "\"$HOME\"".to_owned()
+    } else if let Some(relative) = path.strip_prefix("~/") {
+        format!("\"$HOME\"/{}", quote_remote_arg(relative))
+    } else {
+        quote_remote_arg(path)
+    }
+}
+
 fn xsync_remote_command(remote_path: &str) -> String {
     format!(
         "{} {} {}",
-        quote_remote_arg("xsync"),
+        quote_remote_arg("xs"),
         quote_remote_arg("--server"),
-        quote_remote_arg(remote_path)
+        quote_remote_path(remote_path)
     )
 }
 
@@ -4141,9 +4187,9 @@ const DEFAULT_RSH: &str = "ssh";
 
 fn is_missing_xsync_stderr(stderr: &str, exit_code: Option<i32>) -> bool {
     let lower = stderr.to_lowercase();
-    lower.contains("xsync: command not found")
-        || lower.contains("xsync: not found")
-        || (exit_code == Some(127) && lower.contains("xsync"))
+    lower.contains("xs: command not found")
+        || lower.contains("xs: not found")
+        || (exit_code == Some(127) && lower.contains("xs"))
 }
 
 /// Compute `(program, args)` used to launch the remote `xsync --server`.
@@ -4170,7 +4216,7 @@ pub fn remote_server_command(
             args.push(h.to_owned());
             args.push(xsync_remote_command(remote_path));
         } else {
-            args.push("xsync".to_owned());
+            args.push("xs".to_owned());
             args.push("--server".to_owned());
             args.push(remote_path.to_owned());
         }
@@ -4488,14 +4534,14 @@ mod tests {
     fn default_remote_shell_is_ssh_over_host() {
         let (program, args) = remote_server_command("/dest", None, Some("user@mars"));
         assert_eq!(program, "ssh");
-        assert_eq!(args, ["user@mars", "'xsync' '--server' '/dest'"]);
+        assert_eq!(args, ["user@mars", "'xs' '--server' '/dest'"]);
     }
 
     #[test]
     fn explicit_rsh_replaces_the_shell_but_preserves_host_and_args() {
         let (program, args) = remote_server_command("/dest", Some("myrsh -oK=1"), Some("host"));
         assert_eq!(program, "myrsh");
-        assert_eq!(args, ["-oK=1", "host", "'xsync' '--server' '/dest'"]);
+        assert_eq!(args, ["-oK=1", "host", "'xs' '--server' '/dest'"]);
     }
 
     #[test]
@@ -4506,9 +4552,18 @@ mod tests {
             args,
             [
                 "host",
-                "'xsync' '--server' '/dst'\\''; touch XSYNC_INJECTION; echo '\\'''"
+                "'xs' '--server' '/dst'\\''; touch XSYNC_INJECTION; echo '\\'''"
             ]
         );
+    }
+
+    #[test]
+    fn remote_home_path_is_expanded_by_the_remote_shell() {
+        let (_, args) = remote_server_command("~", None, Some("host"));
+        assert_eq!(args, ["host", "'xs' '--server' \"$HOME\""]);
+
+        let (_, args) = remote_server_command("~/nested", None, Some("host"));
+        assert_eq!(args, ["host", "'xs' '--server' \"$HOME\"/'nested'"]);
     }
 
     #[test]
