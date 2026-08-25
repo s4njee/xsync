@@ -485,6 +485,7 @@ struct ProgressRenderer {
     total_bytes: Option<u64>,
     files: usize,
     bytes: u64,
+    deleted_entries: usize,
     rate_bytes: u64,
     progress_seen: HashSet<String>,
     progress_offsets: HashMap<String, u64>,
@@ -535,6 +536,7 @@ impl ProgressRenderer {
             total_bytes: None,
             files: 0,
             bytes: 0,
+            deleted_entries: 0,
             rate_bytes: 0,
             progress_seen: HashSet::new(),
             progress_offsets: HashMap::new(),
@@ -610,18 +612,28 @@ impl ProgressRenderer {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn summary(&self, transferred_bytes: u64, failed_entries: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn summary(
+        &self,
+        transferred_files: usize,
+        transferred_bytes: u64,
+        wire_bytes: u64,
+        skipped_files: usize,
+        deleted_entries: usize,
+        failed_entries: usize,
+        partial_failure: bool,
+    ) {
         if self.terminal {
             let elapsed = self.transfer_elapsed();
             let rate = transferred_bytes as f64 / elapsed / 1024.0 / 1024.0;
             println!(
-                "elapsed: {:.2}s | throughput: {:.2} MiB/s | verification: {}",
+                "summary: {transferred_files} transferred, {skipped_files} skipped, {deleted_entries} deleted, {failed_entries} failed | {transferred_bytes} logical, {wire_bytes} wire bytes | elapsed: {:.2}s | throughput: {:.2} MiB/s | verification: {}",
                 elapsed,
                 rate,
-                if failed_entries == 0 {
-                    "passed"
+                if partial_failure {
+                    "partial"
                 } else {
-                    "failed"
+                    "passed"
                 }
             );
         }
@@ -784,17 +796,33 @@ fn render_event(
             progress.print_file_status(path, "already present");
         }
         xsync_core::local::LocalEvent::Finished {
+            transferred_files,
             transferred_bytes,
+            wire_bytes,
+            skipped_files,
             failed_entries,
+            partial_failure,
             ..
         } => {
             progress.finish();
-            progress.summary(*transferred_bytes, *failed_entries);
+            progress.summary(
+                *transferred_files,
+                *transferred_bytes,
+                *wire_bytes,
+                *skipped_files,
+                progress.deleted_entries,
+                *failed_entries,
+                *partial_failure,
+            );
+        }
+        xsync_core::local::LocalEvent::Deleted { .. } => {
+            progress.deleted_entries = progress.deleted_entries.saturating_add(1);
         }
         _ => {}
     }
     match event {
         xsync_core::local::LocalEvent::Negotiated { .. }
+        | xsync_core::local::LocalEvent::Metrics { .. }
         | xsync_core::local::LocalEvent::Phase { .. }
         | xsync_core::local::LocalEvent::Started { .. }
         | xsync_core::local::LocalEvent::Planned { .. }
@@ -825,6 +853,7 @@ fn render_event(
             physical_bytes,
             wire_bytes,
             skipped_files,
+            deleted_entries,
             failed_entries,
             local_workers,
             partial_failure,
@@ -833,7 +862,7 @@ fn render_event(
             checkpoint_bytes,
             ..
         } => println!(
-            "finished: {transferred_files} transferred ({transferred_bytes} logical, {physical_bytes} physical, {wire_bytes} wire bytes), {skipped_files} skipped, {failed_entries} failed, workers {local_workers}, resume: {restarted_files} restarted, {resumed_bytes} resumed, {checkpoint_bytes} checkpointed{}",
+            "finished: {transferred_files} transferred ({transferred_bytes} logical, {physical_bytes} physical, {wire_bytes} wire bytes), {skipped_files} skipped, {deleted_entries} deleted, {failed_entries} failed, workers {local_workers}, resume: {restarted_files} restarted, {resumed_bytes} resumed, {checkpoint_bytes} checkpointed{}",
             if partial_failure {
                 ", partial failure"
             } else {
@@ -847,6 +876,7 @@ fn event_type(event: &xsync_core::local::LocalEvent) -> &'static str {
     use xsync_core::local::LocalEvent;
     match event {
         LocalEvent::Phase { .. } => "phase",
+        LocalEvent::Metrics { .. } => "metrics",
         LocalEvent::Started { .. } => "started",
         LocalEvent::Negotiated { .. } => "negotiated",
         LocalEvent::Planned { .. } => "planned",
@@ -879,6 +909,16 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "event": "phase",
             "name": name,
             "started": started,
+        }),
+        LocalEvent::Metrics {
+            queue_high_water,
+            compression_algorithm,
+            compression_level,
+        } => serde_json::json!({
+            "event": "metrics",
+            "queue_high_water": queue_high_water,
+            "compression_algorithm": compression_algorithm,
+            "compression_level": compression_level,
         }),
         LocalEvent::Started {
             local_workers,
@@ -968,6 +1008,7 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             wire_bytes,
             skipped_files,
             failed_entries,
+            deleted_entries,
             warnings,
             local_workers,
             streams,
@@ -979,6 +1020,8 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             resumed_bytes,
             retransmitted_bytes,
             checkpoint_bytes,
+            checksum_cache_hits,
+            checksum_cache_misses,
         } => serde_json::json!({
             "event": "finished",
             "transferred_files": transferred_files,
@@ -987,6 +1030,7 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "wire_bytes": wire_bytes,
             "skipped_files": skipped_files,
             "failed_entries": failed_entries,
+            "deleted_entries": deleted_entries,
             "warnings": warnings,
             "local_workers": local_workers,
             "streams": streams,
@@ -998,6 +1042,8 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "resumed_bytes": resumed_bytes,
             "retransmitted_bytes": retransmitted_bytes,
             "checkpoint_bytes": checkpoint_bytes,
+            "checksum_cache_hits": checksum_cache_hits,
+            "checksum_cache_misses": checksum_cache_misses,
             "transport": transport.as_ref().map(|selection| selection.transport.as_str()),
             "remote_implementation": transport.as_ref().map(|selection| selection.remote_implementation.as_str()),
             "remote_version": transport.as_ref().and_then(|selection| selection.remote_version.as_deref()),

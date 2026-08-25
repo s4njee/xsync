@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tempfile::{Builder, TempDir};
 
+use crate::path::WirePath;
 use crate::scanner::{EntryKind, FileEntry, FileIdentity, SourceFingerprint};
 
 /// The default amount of memory reserved for the destination index.
@@ -118,7 +119,7 @@ pub struct DestinationIndex {
 }
 
 enum DestinationBackend {
-    Memory(BTreeMap<String, FileEntry>),
+    Memory(BTreeMap<WirePath, FileEntry>),
     Disk(DiskIndex),
 }
 
@@ -198,7 +199,7 @@ impl DestinationIndex {
     /// the per-run store fails.
     pub fn insert(&mut self, entry: FileEntry) -> Result<(), PlannerError> {
         if entry.path.len() > MAX_STORED_PATH_BYTES {
-            return Err(PlannerError::PathTooLong(entry.path));
+            return Err(PlannerError::PathTooLong(entry.path.to_string()));
         }
 
         let duplicate = match &self.backend {
@@ -206,7 +207,7 @@ impl DestinationIndex {
             DestinationBackend::Disk(_) => false,
         };
         if duplicate {
-            return Err(PlannerError::DuplicatePath(entry.path));
+            return Err(PlannerError::DuplicatePath(entry.path.to_string()));
         }
 
         let entry_bytes = estimated_entry_bytes(&entry);
@@ -221,7 +222,7 @@ impl DestinationIndex {
             DestinationBackend::Memory(entries) => {
                 let path = entry.path.clone();
                 if entries.insert(path.clone(), entry).is_some() {
-                    return Err(PlannerError::DuplicatePath(path));
+                    return Err(PlannerError::DuplicatePath(path.to_string()));
                 }
                 self.estimated_bytes = self.estimated_bytes.saturating_add(entry_bytes);
             }
@@ -878,7 +879,7 @@ fn marker_bytes() -> Vec<u8> {
 struct SortedEntries {
     source: EntrySource,
     _store: Option<RunStore>,
-    last_path: Option<String>,
+    last_path: Option<WirePath>,
 }
 
 enum EntrySource {
@@ -913,8 +914,8 @@ impl SortedEntries {
             Some(Err(error)) => return Err(error),
         };
         if let Some(entry) = &entry {
-            if self.last_path.as_deref() == Some(entry.path.as_str()) {
-                return Err(PlannerError::DuplicatePath(entry.path.clone()));
+            if self.last_path.as_ref() == Some(&entry.path) {
+                return Err(PlannerError::DuplicatePath(entry.path.to_string()));
             }
             self.last_path = Some(entry.path.clone());
         }
@@ -925,7 +926,7 @@ impl SortedEntries {
 fn validate_sorted_entries(entries: &[FileEntry]) -> Result<(), PlannerError> {
     for pair in entries.windows(2) {
         if pair[0].path == pair[1].path {
-            return Err(PlannerError::DuplicatePath(pair[0].path.clone()));
+            return Err(PlannerError::DuplicatePath(pair[0].path.to_string()));
         }
     }
     Ok(())
@@ -933,10 +934,10 @@ fn validate_sorted_entries(entries: &[FileEntry]) -> Result<(), PlannerError> {
 
 fn validate_sorted_file(path: &Path) -> Result<(), PlannerError> {
     let mut reader = open_reader(path)?;
-    let mut last_path = None;
+    let mut last_path: Option<WirePath> = None;
     while let Some(entry) = read_entry(&mut reader, path)? {
-        if last_path.as_deref() == Some(entry.path.as_str()) {
-            return Err(PlannerError::DuplicatePath(entry.path));
+        if last_path.as_ref() == Some(&entry.path) {
+            return Err(PlannerError::DuplicatePath(entry.path.to_string()));
         }
         last_path = Some(entry.path);
     }
@@ -1091,7 +1092,7 @@ fn remove_if_present(path: &Path) -> Result<(), PlannerError> {
 fn write_entry(writer: &mut impl Write, entry: &FileEntry) -> Result<(), PlannerError> {
     let path = entry.path.as_bytes();
     if path.len() > MAX_STORED_PATH_BYTES {
-        return Err(PlannerError::PathTooLong(entry.path.clone()));
+        return Err(PlannerError::PathTooLong(entry.path.to_string()));
     }
     let (mtime_seconds, mtime_nanos) = encode_mtime(entry.mtime)?;
     let ctime = entry.fingerprint.ctime.map(encode_mtime).transpose()?;
@@ -1105,9 +1106,9 @@ fn write_entry(writer: &mut impl Write, entry: &FileEntry) -> Result<(), Planner
         })
         .ok_or(PlannerError::TimestampOutOfRange)?;
     let body_len_u32 =
-        u32::try_from(body_len).map_err(|_| PlannerError::PathTooLong(entry.path.clone()))?;
+        u32::try_from(body_len).map_err(|_| PlannerError::PathTooLong(entry.path.to_string()))?;
     let path_len =
-        u32::try_from(path.len()).map_err(|_| PlannerError::PathTooLong(entry.path.clone()))?;
+        u32::try_from(path.len()).map_err(|_| PlannerError::PathTooLong(entry.path.to_string()))?;
     let mut body = Vec::with_capacity(body_len);
     body.extend_from_slice(&path_len.to_le_bytes());
     body.extend_from_slice(path);
@@ -1185,7 +1186,7 @@ fn decode_entry(body: &[u8], path: &Path) -> Result<FileEntry, PlannerError> {
         .read_exact(&mut path_bytes)
         .map_err(|source| io_error("read planning path", path, source))?;
     let path_string =
-        String::from_utf8(path_bytes).map_err(|_| corrupt(path, "planning path is not UTF-8"))?;
+        WirePath::from_wire(path_bytes).map_err(|_| corrupt(path, "invalid wire path"))?;
     let kind = entry_kind_from_byte(read_u8(&mut cursor, path)?, path)?;
     let size = read_u64(&mut cursor, path)?;
     let mtime_seconds = read_i64(&mut cursor, path)?;
@@ -1354,7 +1355,7 @@ mod tests {
 
     fn entry(path: &str, kind: EntryKind, size: u64, mtime_seconds: u64) -> FileEntry {
         FileEntry {
-            path: path.to_owned(),
+            path: WirePath::from(path),
             kind,
             size,
             mtime: UNIX_EPOCH + Duration::from_secs(mtime_seconds),
@@ -1396,6 +1397,20 @@ mod tests {
         assert!(plan.files.new.is_empty());
         assert!(plan.files.changed.is_empty());
         assert!(plan.files.extraneous.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_planning_preserves_invalid_utf8_path_bytes() {
+        let mut source = entry("placeholder", EntryKind::File, 3, 100);
+        source.path = WirePath::from_wire(b"bad-\xff-name".to_vec()).unwrap();
+        let destination = try_build_destination_index(
+            std::iter::empty(),
+            IndexConfig::with_budget(1).with_temp_root(tempdir().unwrap().path()),
+        )
+        .unwrap();
+        let plan = try_plan([source.clone()], destination).unwrap();
+        assert_eq!(plan.files.new[0].path.as_bytes(), b"bad-\xff-name");
     }
 
     #[test]
@@ -1518,7 +1533,7 @@ mod tests {
         let root = tempdir().unwrap();
         let mut spool = PlanningSpool::with_config(disk_config(root.path(), 1)).unwrap();
         let precise = FileEntry {
-            path: "precise".to_owned(),
+            path: WirePath::from("precise"),
             kind: EntryKind::Other,
             size: 42,
             mtime: UNIX_EPOCH - Duration::new(2, 500_000_000),

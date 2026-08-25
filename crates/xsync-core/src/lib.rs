@@ -12,6 +12,7 @@
 
 //! xsync-core's public modules.
 pub mod clone;
+pub mod cloud;
 pub mod compression;
 pub mod hash_cache;
 pub mod journal;

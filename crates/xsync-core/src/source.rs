@@ -2,8 +2,9 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
+use crate::path::WirePath;
 use crate::scanner::{
     fingerprint_from_metadata, permission_mode, EntryKind, FileEntry, SourceFingerprint,
 };
@@ -127,7 +128,7 @@ impl SourceReader {
     {
         if entry.kind != EntryKind::File {
             return Err(SourceReadError::WrongKind {
-                path: entry.path.clone(),
+                path: entry.path.to_string(),
                 kind: entry.kind,
             });
         }
@@ -145,13 +146,13 @@ impl SourceReader {
                 }
                 Err(AttemptFailure::Vanished) => {
                     return Err(SourceReadError::Vanished {
-                        path: entry.path.clone(),
+                        path: entry.path.to_string(),
                     });
                 }
                 Err(AttemptFailure::Io(error)) => return Err(error),
                 Err(AttemptFailure::Changed) if attempt == MAX_SOURCE_READ_ATTEMPTS => {
                     return Err(SourceReadError::Unstable {
-                        path: entry.path.clone(),
+                        path: entry.path.to_string(),
                         attempts: attempt,
                     });
                 }
@@ -161,7 +162,7 @@ impl SourceReader {
                         RefreshResult::Changed => current,
                         RefreshResult::Vanished => {
                             return Err(SourceReadError::Vanished {
-                                path: entry.path.clone(),
+                                path: entry.path.to_string(),
                             });
                         }
                     };
@@ -171,27 +172,13 @@ impl SourceReader {
         unreachable!("source read attempts are nonempty")
     }
 
-    fn source_path(&self, relative: &str) -> Result<PathBuf, SourceReadError> {
-        let mut path = self.root.clone();
+    fn source_path(&self, relative: &WirePath) -> Result<PathBuf, SourceReadError> {
         if relative.is_empty() {
             return Err(SourceReadError::InvalidPath {
-                path: relative.to_owned(),
+                path: relative.to_string(),
             });
         }
-        for component in Path::new(relative).components() {
-            match component {
-                Component::Normal(component) => path.push(component),
-                Component::CurDir
-                | Component::ParentDir
-                | Component::RootDir
-                | Component::Prefix(_) => {
-                    return Err(SourceReadError::InvalidPath {
-                        path: relative.to_owned(),
-                    });
-                }
-            }
-        }
-        Ok(path)
+        Ok(relative.to_native_path(&self.root))
     }
 
     fn read_attempt<F>(

@@ -460,7 +460,7 @@ impl DispatchState {
         for file in files {
             if file.kind != EntryKind::File {
                 return Err(DispatchError::NonFile {
-                    path: file.path,
+                    path: file.path.to_string(),
                     kind: file.kind,
                 });
             }
@@ -549,7 +549,7 @@ mod tests {
 
     fn file(path: impl Into<String>, size: u64) -> FileEntry {
         FileEntry {
-            path: path.into(),
+            path: crate::path::WirePath::from(path.into().as_str()),
             kind: EntryKind::File,
             size,
             mtime: UNIX_EPOCH,
@@ -748,7 +748,7 @@ mod tests {
         let (dispatcher, queues) = bounded_work_queues(1, 1).unwrap();
         let consumer = std::thread::spawn(move || queues[0].iter().count());
         let directory = FileEntry {
-            path: "dir".to_owned(),
+            path: crate::path::WirePath::from("dir"),
             kind: EntryKind::Directory,
             size: 0,
             mtime: UNIX_EPOCH,

@@ -490,15 +490,14 @@ memory. Story 2.1b supersedes those parts before protocol freeze.
   discovery.
 
 **Progress:** Source fingerprints, raw-byte protocol fields, rsync fallback path handling, traversal
-rejection, and Unix invalid-byte manifest coverage are implemented. The downstream planner, source
-reader, sink, journal, and native protocol already carry the fingerprint needed for stable reads and
-resume identity.
+rejection, Unix invalid-byte scan → plan → protocol → sink coverage, and the coordinated `WirePath`
+representation through scanner, planner, source reader, sink, journal, and native protocol are
+implemented. Exact duplicate paths are rejected before transfer, and symlink discovery remains
+non-following.
 
-**Blocker:** The scanner and planner still expose relative paths as UTF-8 `String` values and reject
-invalid Unix names before native xsync framing. Completing this story requires a coordinated
-`WirePath`/component representation through scanner → planner → protocol → sink, plus Windows-specific
-encoding and case/Unicode-normalization collision tests. No user action is required; this is the
-next implementation task before the protocol representation is frozen.
+**Remaining:** Windows-specific reversible encoding, reserved-prefix handling, and Windows case/
+Unicode-normalization collision tests require a Windows test environment. The story remains in
+progress until those platform-specific acceptance criteria are verified.
 
 ### Story 2.2 — Planner / diff classification
 - [x] Given source entries and a destination index, classify: new / changed (size or mtime differs) / unchanged / extraneous. Collect dirs and symlinks separately.
@@ -1149,7 +1148,7 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
 ## Epic 5 — Feature flags
 
 ### Story 5.1 — `--delete`
-- [~] After a fully successful transfer, remove dest files/dirs absent from source, files first then dirs deepest-first. Excluded paths are never deleted.
+- [x] After a fully successful transfer, remove dest files/dirs absent from source, files first then dirs deepest-first. Excluded paths are never deleted.
 
 **AC**
 - Extraneous dest files and empty extraneous dirs are removed; a failed transfer skips the delete phase entirely (with a warning).
@@ -1161,16 +1160,16 @@ The wire protocol and `xsync --server`, exercised over child-process stdio — b
   entries are omitted from the planning index, so they cannot be deleted.
 - The native remote sink has the same success gate and ordering, and its delete operations are
   represented by `LocalEvent::Deleted`.
-- Remaining work: remote dry-run/exclude policy is not yet negotiated in the wire `SessionConfig`,
-  and failed remote delete operations need a dedicated warning summary rather than only a partial
-  result.
-
-**Progress update:** `SessionConfig` now carries dry-run and bounded exclude policy; native remote
-push/pull planning filters excluded destination entries, and remote dry-runs do not send mutation
-frames. The remaining delete warning-summary work is still open.
+- `SessionConfig` carries dry-run and bounded exclude policy; native remote push/pull planning
+  filters excluded destination entries, and remote dry-runs do not send mutation frames.
+- Delete failures use a recoverable protocol warning, continue processing remaining candidates, and
+  appear in the final warning/failed-entry summary with `LocalEvent::Warning` and
+  `LocalEvent::Failed` events.
+- Tests cover delayed deletion, deepest-first ordering, exclusion safety, dry-run non-mutation, and
+  delete-failure partial reporting.
 
 ### Story 5.2 — `--exclude`
-- [~] Repeatable glob patterns applied to both source scan and dest scan (excluded dest files are invisible to `--delete`).
+- [x] Repeatable glob patterns applied to both source scan and dest scan (excluded dest files are invisible to `--delete`).
 
 **AC**
 - `--exclude target --exclude '*.log'` skips matches at any depth (rsync-style matching against the relative path).
@@ -1180,16 +1179,17 @@ frames. The remaining delete warning-summary work is still open.
 - Local planning accepts repeatable `globset` patterns, matches relative paths and ancestor
   directories, filters both source and destination entries, and disables the whole-tree clone
   fast path when exclusions are present.
-- Remaining work: scanning currently materializes the walk before filtering, so excluded-directory
-  children are not physically pruned; the remote protocol still needs to carry and apply patterns
-  on both endpoints, including raw-path-safe pattern encoding.
-
-**Progress update:** patterns are now encoded as bounded raw byte blobs in `SessionConfig` and
-applied to native remote source and destination planning. Physical directory-prune optimization and
-rsync fallback parity remain open.
+- Scanner-level filtering now prunes excluded directories before their children are walked, for both
+  source and destination scans.
+- Patterns are encoded as bounded raw byte blobs in `SessionConfig` and applied to native remote
+  source and destination planning.
+- The rsync fallback now filters its local file list and forwards `--exclude` rules to the remote
+  receiver, preserving the same name, glob, and descendant semantics.
+- Tests cover name matching, glob matching, directory pruning, native remote policy propagation, and
+  rsync fallback filtering.
 
 ### Story 5.3 — `--dry-run`
-- [~] Full scan + classification, zero writes; prints per-action lines (create/update/delete) and the summary that a real run would produce.
+- [x] Full scan + classification, zero writes; prints per-action lines (create/update/delete) and the summary that a real run would produce.
 
 **AC**
 - Dest tree is bit-identical before/after a dry run (including mtimes).
@@ -1199,15 +1199,14 @@ rsync fallback parity remain open.
 - Local dry runs complete scanning and planning without opening a mutating sink operation or using
   the clone fast path. They now emit explicit create/update/delete action events plus the planned
   file/byte totals; the destination remains untouched.
-- Remaining work: remote dry-run must be represented in `SessionConfig` and enforced before the
-  remote sink can mutate; action events also need to be emitted by the remote and rsync backends.
-
-**Progress update:** native remote dry-runs now carry the policy through the handshake, emit the
-same planned action events, and reject unexpected mutation frames before sink operations. The rsync
-fallback still needs equivalent action output.
+- Native remote dry-runs carry the policy through the handshake, emit the same planned action events,
+  and reject unexpected mutation frames before sink operations.
+- The rsync fallback now accepts dry-run, forwards the no-write policy to the receiver, and emits
+  create action events for its planned file list without reporting writes.
+- Tests cover destination non-mutation, planned action output, and backend policy propagation.
 
 ### Story 5.4 — `--checksum` + hash cache
-- [~] Classification by BLAKE3 content hash instead of size+mtime; both sides consult a versioned
+- [x] Classification by BLAKE3 content hash instead of size+mtime; both sides consult a versioned
   redb cache keyed by stable filesystem identity, size, precise mtime, and ctime/change-time where
   available. Misses populate the cache only after a stable read.
 
@@ -1225,17 +1224,19 @@ fallback still needs equivalent action output.
 - Local `--checksum` now reclassifies metadata-only regular-file changes by comparing BLAKE3
   content, so an mtime-only touch is skipped while changed bytes still transfer. The CLI option is
   wired into local options and the ordinary metadata planner remains unchanged when it is absent.
-- Remaining work: persistent versioned `redb` cache, stable file identity/ctime keys, cache repair
-  and concurrency guarantees, and remote-side checksum negotiation are still outstanding. Current
-  local checksum classification reads both file contents on every changed candidate.
-
-**Progress update:** added a versioned `redb` cache keyed by device/file identity, size, precise
-mtime, and ctime where available. Cache failures fall back to a stable read, and tests cover
-round-trip plus fingerprint invalidation. Remote checksum negotiation and explicit hit/miss event
-counters remain open.
+- A versioned `redb` cache is keyed by device/file identity, size, precise mtime, and ctime where
+  available. Corrupt databases are replaced, failed cache reads fall back to stable hashing, and
+  buffered commits are repairable and concurrency-safe.
+- Local and native remote checksum classification consult the persistent cache. Cache hit/miss
+  counters are exposed in the final report and JSON event, while cache misses are populated only
+  after hashing a stable file.
+- Native remote checksum negotiation is carried through `SessionConfig`; both source and destination
+  checksum scans use the cache without changing the normal metadata-only path.
+- Tests cover fingerprint invalidation, persistence across reopen, cache hit/miss accounting, and
+  checksum behavior across the workspace.
 
 ### Story 5.5 — `--paranoid`
-- [~] After rename, re-read every written file from destination disk and verify BLAKE3 (huge files verified per-chunk against the recorded chunk hashes).
+- [x] After rename, re-read every written file from destination disk and verify BLAKE3 (huge files verified per-chunk against the recorded chunk hashes).
 
 **AC**
 - Normal run: no post-rename reads. Paranoid run: every transferred file re-read and verified; mismatch → retransmit once, then failure.
@@ -1245,12 +1246,14 @@ counters remain open.
 - Local clone paths already verify staged and published names; byte-copy paths now perform a
   destination readback after publication and retry once before returning failure. Native push/pull
   paths retain their existing staged/chunk verification and paranoid readback behavior.
-- Remaining work: striped multi-stream whole-file verification still lacks a complete final digest
-  readback contract, and the rsync fallback must continue to reject `--paranoid` until it can offer
-  the same guarantee.
+- Striped multi-stream transfers now compute and send a complete final digest in paranoid mode after
+  all ranges are durably covered; the receiver verifies the committed file after the final rename.
+- The rsync fallback continues to reject `--paranoid`, since it cannot provide the same guarantee.
+- Tests cover local, native push/pull, and striped transfer verification while preserving the normal
+  mode's no-post-rename-read behavior.
 
 ### Story 5.6 — `--progress-json`
-- [~] Machine-readable JSONL event stream on stdout (scan progress, plan totals, per-file start/progress/done, total progress, warnings, final stats); progress bars suppressed.
+- [x] Machine-readable JSONL event stream on stdout (scan progress, plan totals, per-file start/progress/done, total progress, warnings, final stats); progress bars suppressed.
 
 **AC**
 - Every line is valid JSON with a `type` and schema version; a GUI can compute both bars from the
@@ -1266,15 +1269,15 @@ counters remain open.
   stable event-specific fields, and dry-run action events are available to consumers. Human output
   remains suppressed when `--progress-json` is selected.
 - Existing final events expose transfer, worker/stream, clone, wire/logical, resume, transport,
-  and guarantee fields. Remaining work: phase-duration/queue-high-water/compression decision fields
-  are not yet uniformly emitted by every backend, and the schema needs a checked-in README section.
+  and guarantee fields. Phase timing is derived from timestamped phase pairs; queue high-water and
+  compression decisions are emitted as structured metrics, including null values when unavailable.
 
 **Progress update:** cloud inventory events and remote dry-run action events now use the same JSONL
-  schema. The checked-in schema reference is `docs/progress-json-v1.md`; complete phase timing
-  fields remain open.
+  schema. The checked-in schema reference is `docs/progress-json-v1.md`, including timing,
+  telemetry, and forward-compatibility rules.
 
 ### Story 5.7 — Cloud-placeholder materialization policy
-- [~] Detect platform cloud/dataless placeholders where possible and make their materialization
+- [x] Detect platform cloud/dataless placeholders where possible and make their materialization
   visible and controllable instead of accidentally downloading a very large tree.
 
 **AC**
@@ -1291,9 +1294,14 @@ counters remain open.
   reports placeholder counts, logical bytes, and detector availability before planning. The default
   remains correctness-preserving download behavior; non-macOS `skip`/`error` requests fail before
   mutation instead of silently acting as download.
-- Remaining work: implement the macOS placeholder detector/materialization classification, skip
-  accounting and delete protection, and platform-isolated fixtures. The current macOS capability
-  flag is deliberately conservative and reports zero until the native detector is implemented.
+- The macOS detector now checks the File Provider placeholder xattr through the isolated cloud
+  capability module. Placeholder counts and logical bytes are emitted after scan and before plan.
+- `skip` removes placeholders from the transfer plan, records destination-relative skipped events,
+  marks the result partial, disables directory clone fast paths, and prevents delete from removing
+  protected destination paths. `error` aborts before mutation with the offending path.
+- Unsupported platforms report detection unavailable and reject `skip`/`error` before mutation;
+  `download` retains the normal correctness-preserving read path. Platform-specific probing is
+  isolated in `cloud.rs` for macOS fixtures and future providers.
 
 ---
 
@@ -1332,7 +1340,7 @@ counters remain open.
 ## Epic 7 — Progress UI
 
 ### Story 7.1 — Two-bar terminal UI
-- [~] Terminal progress renderer: one monotonic total status line (bytes + file counts,
+- [x] Terminal progress renderer: one monotonic total status line (bytes + file counts,
   "scanning…" until discovery completes, then rate), concise transfer summary, quiet/error-only
   mode, and plain periodic non-TTY output. JSONL remains machine-readable and suppresses terminal
   rendering. The renderer is dependency-free rather than using `indicatif`, which keeps the remote
@@ -1363,6 +1371,9 @@ counters remain open.
   every transfer route can drive the child-bar renderer without changing JSON or quiet semantics.
 - The multi-stream worker channel still coalesces updates at the range-group boundary; finer live
   updates would require a dedicated bounded cross-thread progress channel.
+- Final terminal summaries now include transferred, skipped, deleted, failed, logical, and wire
+  counters, elapsed time, throughput, and partial verification status. The JSON `done` event also
+  exposes deleted-entry counts.
 - Verification: formatting check, strict workspace Clippy, `cargo test --workspace --all-targets`,
   and `cargo build --workspace --release` all pass after the renderer change. A redirected-output
   smoke run produced no ANSI or carriage-return bytes.

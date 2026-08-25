@@ -14,7 +14,10 @@ use std::time::SystemTime;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState};
+
+use crate::path::WirePath;
 
 /// Maximum number of discovered entries waiting for a consumer by default.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1_024;
@@ -75,7 +78,7 @@ impl SourceFingerprint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     /// Protocol-canonical path relative to the scan root, using `/` separators.
-    pub path: String,
+    pub path: WirePath,
     /// The object's filesystem kind.
     pub kind: EntryKind,
     /// The metadata length in bytes.
@@ -201,6 +204,24 @@ pub fn scan(root: impl AsRef<Path>) -> Result<Scan, ScanError> {
     scan_with_capacity(root, DEFAULT_CHANNEL_CAPACITY)
 }
 
+/// Start a parallel scan that prunes excluded directories before walking their
+/// children. Patterns use the same relative-path glob semantics as local sync.
+///
+/// # Errors
+/// Returns an error when a pattern is invalid, the root cannot be inspected, or
+/// the coordinator thread cannot be started.
+pub fn scan_with_excludes(root: impl AsRef<Path>, patterns: &[String]) -> Result<Scan, ScanError> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).map_err(|error| ScanError::Walk(error.to_string()))?;
+        builder.add(glob);
+    }
+    let matcher = builder
+        .build()
+        .map_err(|error| ScanError::Walk(error.to_string()))?;
+    scan_with_capacity_and_matcher(root, DEFAULT_CHANNEL_CAPACITY, Some(matcher))
+}
+
 /// Start a parallel scan with an explicit bounded-channel capacity.
 ///
 /// # Errors
@@ -210,6 +231,14 @@ pub fn scan(root: impl AsRef<Path>) -> Result<Scan, ScanError> {
 pub fn scan_with_capacity(
     root: impl AsRef<Path>,
     channel_capacity: usize,
+) -> Result<Scan, ScanError> {
+    scan_with_capacity_and_matcher(root, channel_capacity, None)
+}
+
+fn scan_with_capacity_and_matcher(
+    root: impl AsRef<Path>,
+    channel_capacity: usize,
+    matcher: Option<GlobSet>,
 ) -> Result<Scan, ScanError> {
     if channel_capacity == 0 {
         return Err(ScanError::ZeroChannelCapacity);
@@ -224,6 +253,18 @@ pub fn scan_with_capacity(
 
     let mut builder = WalkBuilder::new(&root);
     builder.standard_filters(false).follow_links(false);
+    if let Some(matcher) = matcher {
+        let matcher_root = root.clone();
+        builder.filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(&matcher_root) else {
+                return true;
+            };
+            !excluded_relative_path(&matcher, relative)
+        });
+    }
     let walker = builder.build_parallel();
     let (sender, entries) = bounded(channel_capacity);
     let queue_high_water = Arc::new(AtomicUsize::new(0));
@@ -245,6 +286,21 @@ pub fn scan_with_capacity(
         channel_capacity,
         queue_high_water,
     })
+}
+
+fn excluded_relative_path(matcher: &GlobSet, relative: &Path) -> bool {
+    let display = relative.to_string_lossy();
+    if matcher.is_match(display.as_ref()) {
+        return true;
+    }
+    let mut prefix = display.as_ref();
+    while let Some((ancestor, _)) = prefix.rsplit_once('/') {
+        if matcher.is_match(ancestor) {
+            return true;
+        }
+        prefix = ancestor;
+    }
+    false
 }
 
 fn run_walker(
@@ -434,16 +490,8 @@ fn timestamp_error(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
-fn protocol_path(relative: &Path, full_path: &Path) -> Result<String, ScanError> {
-    relative
-        .iter()
-        .map(|component| {
-            component.to_str().ok_or_else(|| ScanError::NonUtf8Path {
-                path: full_path.to_path_buf(),
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|components| components.join("/"))
+fn protocol_path(relative: &Path, _full_path: &Path) -> Result<WirePath, ScanError> {
+    WirePath::from_native_relative(relative).map_err(|error| ScanError::Walk(error.to_string()))
 }
 
 #[cfg(unix)]
@@ -472,7 +520,7 @@ mod tests {
 
     use super::*;
 
-    fn collect(root: &Path) -> HashMap<String, FileEntry> {
+    fn collect(root: &Path) -> HashMap<WirePath, FileEntry> {
         let scan = scan(root).unwrap();
         let entries = scan
             .entries()
@@ -503,7 +551,10 @@ mod tests {
             "ignored.txt",
             ".hidden",
         ] {
-            assert!(entries.contains_key(path), "missing {path}");
+            assert!(
+                entries.contains_key(&WirePath::from(path)),
+                "missing {path}"
+            );
         }
     }
 
@@ -534,9 +585,31 @@ mod tests {
         }
         scan.finish().unwrap();
 
-        assert_eq!(entries["dir/loop"].kind, EntryKind::Symlink);
-        assert_eq!(entries["file-link"].kind, EntryKind::Symlink);
+        assert_eq!(
+            entries[&WirePath::from("dir/loop")].kind,
+            EntryKind::Symlink
+        );
+        assert_eq!(
+            entries[&WirePath::from("file-link")].kind,
+            EntryKind::Symlink
+        );
         assert_eq!(entries.len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_invalid_utf8_component_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempdir().unwrap();
+        let name = OsString::from_vec(b"bad-\xff-name".to_vec());
+        if fs::write(temp.path().join(&name), b"raw").is_err() {
+            // APFS rejects non-UTF-8 names; the same test runs on Linux ext4.
+            return;
+        }
+        let entries = collect(temp.path());
+        assert!(entries.contains_key(&WirePath::from_wire(b"bad-\xff-name".to_vec()).unwrap()));
     }
 
     #[test]
@@ -546,8 +619,27 @@ mod tests {
         fs::write(temp.path().join("one/two/file"), b"data").unwrap();
 
         let entries = collect(temp.path());
-        assert!(entries.contains_key("one/two/file"));
-        assert!(entries.keys().all(|path| !path.starts_with('/')));
+        assert!(entries.contains_key(&WirePath::from("one/two/file")));
+        assert!(entries.keys().all(|path| !path.starts_with(&b"/"[..])));
+    }
+
+    #[test]
+    fn prunes_excluded_directory_before_scanning_children() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("skip")).unwrap();
+        fs::write(temp.path().join("skip/child.txt"), b"excluded").unwrap();
+        fs::write(temp.path().join("keep.txt"), b"included").unwrap();
+
+        let scan = scan_with_excludes(temp.path(), &["skip".to_owned()]).unwrap();
+        let entries: Vec<_> = scan
+            .entries()
+            .iter()
+            .map(|result| result.unwrap())
+            .collect();
+        scan.finish().unwrap();
+
+        assert!(entries.iter().any(|entry| entry.path == "keep.txt"));
+        assert!(!entries.iter().any(|entry| entry.path.starts_with("skip")));
     }
 
     #[test]
@@ -585,8 +677,8 @@ mod tests {
         fs::write(&file, b"contents").unwrap();
 
         let entries = collect(&file);
-        assert_eq!(entries["source.txt"].kind, EntryKind::File);
-        assert_eq!(entries["source.txt"].size, 8);
+        assert_eq!(entries[&WirePath::from("source.txt")].kind, EntryKind::File);
+        assert_eq!(entries[&WirePath::from("source.txt")].size, 8);
     }
 
     #[test]

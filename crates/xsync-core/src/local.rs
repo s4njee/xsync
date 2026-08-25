@@ -14,7 +14,9 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::clone::{self, CloneKind};
+use crate::cloud;
 use crate::hash_cache::{HashCache, HashFingerprint};
+use crate::path::WirePath;
 use crate::planner::{try_plan, DestinationIndex, EntryPlan, IndexConfig, Plan, PlannerError};
 use crate::scanner::{
     fingerprint_from_metadata, permission_mode, scan, EntryKind, FileEntry, ScanError,
@@ -66,6 +68,15 @@ pub enum LocalEvent {
         name: &'static str,
         /// True for phase start and false for phase end.
         started: bool,
+    },
+    /// Backend telemetry that is not tied to a single transfer event.
+    Metrics {
+        /// Highest scanner/work queue occupancy observed.
+        queue_high_water: usize,
+        /// Compression selected by the backend, when applicable.
+        compression_algorithm: Option<&'static str>,
+        /// Compression level selected by the backend, when applicable.
+        compression_level: Option<i32>,
     },
     /// The local pipeline has started. `streams` is reported for observability
     /// but does not configure local worker scheduling.
@@ -168,6 +179,8 @@ pub enum LocalEvent {
         skipped_files: usize,
         /// Number of entries that failed.
         failed_entries: usize,
+        /// Number of extraneous entries deleted.
+        deleted_entries: usize,
         /// Number of warnings emitted.
         warnings: usize,
         /// Bytes physically moved through the streaming path.
@@ -194,6 +207,10 @@ pub enum LocalEvent {
         retransmitted_bytes: u64,
         /// Bytes durably checkpointed to the receiver journal this run.
         checkpoint_bytes: u64,
+        /// Content-hash cache hits during checksum classification.
+        checksum_cache_hits: usize,
+        /// Content-hash cache misses during checksum classification.
+        checksum_cache_misses: usize,
     },
 }
 
@@ -284,13 +301,19 @@ pub struct LocalSyncReport {
     pub retransmitted_bytes: u64,
     /// Bytes durably checkpointed to the receiver journal this run.
     pub checkpoint_bytes: u64,
+    /// Content-hash cache hits during checksum classification.
+    pub checksum_cache_hits: usize,
+    /// Content-hash cache misses during checksum classification.
+    pub checksum_cache_misses: usize,
+    /// Whether policy-controlled omissions made this a partial result.
+    pub partial_work: bool,
 }
 
 impl LocalSyncReport {
     /// Whether the job completed with any per-entry failure.
     #[must_use]
     pub fn partial_failure(&self) -> bool {
-        self.failed_entries != 0
+        self.failed_entries != 0 || self.partial_work
     }
 }
 
@@ -358,6 +381,15 @@ pub enum LocalSyncError {
     /// The requested cloud policy cannot be implemented on this platform.
     #[error("cloud placeholder detection is unavailable on this platform")]
     CloudPolicyUnavailable,
+    /// Reading platform placeholder metadata failed before mutation.
+    #[error("cannot detect cloud placeholder: {0}")]
+    CloudDetection(#[source] io::Error),
+    /// A placeholder was found under the refusing policy.
+    #[error("cloud placeholder found at '{path}'")]
+    CloudPlaceholderFound {
+        /// Source-relative placeholder path.
+        path: String,
+    },
 }
 
 /// Synchronize a local source to a local destination and emit events.
@@ -385,7 +417,7 @@ where
     F: FnMut(LocalEvent),
 {
     validate_options(options)?;
-    if !options.dry_run {
+    if !options.dry_run && options.cloud_files == CloudFilesPolicy::Download {
         if let Some(report) = try_directory_fast_path(
             source.as_ref(),
             source_trailing_slash,
@@ -411,17 +443,30 @@ where
         source_root_entry,
         source_by_destination,
         mut plan,
+        checksum_cache_hits,
+        checksum_cache_misses,
+        cloud_skipped,
     } = prepared;
 
     let mut report = LocalSyncReport {
         local_workers: options.local_workers,
         streams: options.streams,
+        checksum_cache_hits,
+        checksum_cache_misses,
+        partial_work: !cloud_skipped.is_empty(),
         ..LocalSyncReport::default()
     };
     report.skipped_files = plan.files.unchanged.len();
     for entry in &plan.files.unchanged {
         emit(LocalEvent::Skipped {
-            path: entry.path.clone(),
+            path: entry.path.to_string(),
+            bytes: entry.size,
+        });
+    }
+    for entry in &cloud_skipped {
+        report.skipped_files += 1;
+        emit(LocalEvent::Skipped {
+            path: entry.path.to_string(),
             bytes: entry.size,
         });
     }
@@ -432,7 +477,7 @@ where
         record_failure(
             &mut report,
             &mut emit,
-            entry.path.clone(),
+            entry.path.to_string(),
             "unsupported filesystem object".to_owned(),
         );
     }
@@ -442,7 +487,7 @@ where
             name: "transfer",
             started: true,
         });
-        if options.directory_clones {
+        if options.directory_clones && options.cloud_files == CloudFilesPolicy::Download {
             apply_directory_clones(
                 &source_reader_root,
                 &destination_sink,
@@ -473,6 +518,7 @@ where
         )?;
 
         if options.delete && !report.partial_failure() {
+            protect_cloud_skipped(&mut plan, &cloud_skipped);
             delete_extraneous(&destination_sink, &plan, &mut report, &mut emit);
         }
 
@@ -514,6 +560,7 @@ where
         byte_copies: report.byte_copies,
         skipped_files: report.skipped_files,
         failed_entries: report.failed_entries,
+        deleted_entries: report.deleted_entries,
         warnings: report.warnings,
         local_workers: report.local_workers,
         streams: report.streams,
@@ -522,6 +569,8 @@ where
         resumed_bytes: report.resumed_bytes,
         retransmitted_bytes: report.retransmitted_bytes,
         checkpoint_bytes: report.checkpoint_bytes,
+        checksum_cache_hits: report.checksum_cache_hits,
+        checksum_cache_misses: report.checksum_cache_misses,
     });
     Ok(report)
 }
@@ -542,13 +591,12 @@ fn apply_directory_clones(
     let mut candidates = plan.directories.new.clone();
     candidates.sort_by_key(|entry| (path_depth(&entry.path), entry.path.clone()));
 
-    let mut selected = Vec::new();
+    let mut selected: Vec<WirePath> = Vec::new();
     for candidate in candidates {
         if candidate.path.is_empty()
-            || selected.iter().any(|parent: &String| {
-                candidate.path.starts_with(parent)
-                    && candidate.path.as_bytes().get(parent.len()) == Some(&b'/')
-            })
+            || selected
+                .iter()
+                .any(|parent| candidate.path.starts_with(parent))
         {
             continue;
         }
@@ -568,7 +616,7 @@ fn apply_directory_clones(
             .find(|entry| entry.path == candidate_path)
             .cloned()
             .ok_or_else(|| LocalSyncError::PathMapping {
-                path: candidate_path.clone(),
+                path: candidate_path.to_string(),
             })?;
         let entries = clone_entries_for_subtree(plan, &candidate_path);
         let file_count = entries
@@ -592,7 +640,7 @@ fn apply_directory_clones(
         report.transferred_files += file_count;
         report.transferred_bytes = report.transferred_bytes.saturating_add(logical_bytes);
         emit(LocalEvent::Transferred {
-            path: candidate_path,
+            path: candidate_path.to_string(),
             bytes: logical_bytes,
             physical_bytes: 0,
             method: TransferMethod::DirectoryClone,
@@ -601,12 +649,11 @@ fn apply_directory_clones(
     Ok(())
 }
 
-fn clone_entries_for_subtree(plan: &Plan, root: &str) -> Vec<FileEntry> {
-    let prefix = format!("{root}/");
+fn clone_entries_for_subtree(plan: &Plan, root: &WirePath) -> Vec<FileEntry> {
     let mut entries = Vec::new();
     for group in [&plan.directories, &plan.files, &plan.symlinks, &plan.other] {
         for entry in &group.new {
-            let Some(relative) = entry.path.strip_prefix(&prefix) else {
+            let Some(relative) = entry.path.strip_prefix(root) else {
                 continue;
             };
             let mut relative_entry = entry.clone();
@@ -617,8 +664,7 @@ fn clone_entries_for_subtree(plan: &Plan, root: &str) -> Vec<FileEntry> {
     entries
 }
 
-fn remove_subtree_entries(plan: &mut Plan, root: &str) {
-    let prefix = format!("{root}/");
+fn remove_subtree_entries(plan: &mut Plan, root: &WirePath) {
     for group in [
         &mut plan.directories,
         &mut plan.files,
@@ -627,7 +673,7 @@ fn remove_subtree_entries(plan: &mut Plan, root: &str) {
     ] {
         group
             .new
-            .retain(|entry| entry.path != root && !entry.path.starts_with(&prefix));
+            .retain(|entry| entry.path != *root && !entry.path.starts_with(root));
     }
 }
 
@@ -665,7 +711,12 @@ fn try_directory_fast_path(
         name: "scan",
         started: true,
     });
-    let entries = collect_scan(source)?;
+    let (entries, queue_high_water) = collect_scan(source, &[])?;
+    emit(LocalEvent::Metrics {
+        queue_high_water,
+        compression_algorithm: None,
+        compression_level: None,
+    });
     emit(LocalEvent::Phase {
         name: "scan",
         started: false,
@@ -756,6 +807,7 @@ fn try_directory_fast_path(
         byte_copies: report.byte_copies,
         skipped_files: report.skipped_files,
         failed_entries: report.failed_entries,
+        deleted_entries: report.deleted_entries,
         warnings: report.warnings,
         local_workers: report.local_workers,
         streams: report.streams,
@@ -764,6 +816,8 @@ fn try_directory_fast_path(
         resumed_bytes: report.resumed_bytes,
         retransmitted_bytes: report.retransmitted_bytes,
         checkpoint_bytes: report.checkpoint_bytes,
+        checksum_cache_hits: report.checksum_cache_hits,
+        checksum_cache_misses: report.checksum_cache_misses,
     });
     Ok(Some(report))
 }
@@ -774,6 +828,9 @@ struct PreparedTransfer {
     source_root_entry: Option<FileEntry>,
     source_by_destination: SourcePathMap,
     plan: Plan,
+    checksum_cache_hits: usize,
+    checksum_cache_misses: usize,
+    cloud_skipped: Vec<FileEntry>,
 }
 
 struct ExcludeMatcher {
@@ -843,21 +900,50 @@ fn prepare_transfer(
         local_workers: options.local_workers,
         streams: options.streams,
     });
-    emit(LocalEvent::CloudPlaceholders {
-        files: 0,
-        bytes: 0,
-        detection_available: cfg!(target_os = "macos"),
-    });
 
     emit(LocalEvent::Phase {
         name: "scan",
         started: true,
     });
-    let source_entries: Vec<_> = collect_scan(source)?
-        .into_iter()
-        .filter(|entry| !excludes.matches(&entry.path))
-        .collect();
     let source_reader_root = source_reader_root(source, source_kind);
+    let (source_entries, source_queue_high_water) =
+        collect_scan(source, &options.exclude_patterns)?;
+    let mut source_entries: Vec<_> = source_entries
+        .into_iter()
+        .filter(|entry| !excludes.matches(&entry.path.to_string()))
+        .collect();
+    let mut cloud_skipped = Vec::new();
+    let mut cloud_files = 0;
+    let mut cloud_bytes: u64 = 0;
+    if cloud::detection_available() {
+        let mut retained = Vec::with_capacity(source_entries.len());
+        for entry in source_entries {
+            let is_placeholder = entry.kind == EntryKind::File
+                && cloud::is_placeholder(&entry.path.to_native_path(&source_reader_root))
+                    .map_err(LocalSyncError::CloudDetection)?;
+            if !is_placeholder {
+                retained.push(entry);
+                continue;
+            }
+            cloud_files += 1;
+            cloud_bytes = cloud_bytes.saturating_add(entry.size);
+            match options.cloud_files {
+                CloudFilesPolicy::Download => retained.push(entry),
+                CloudFilesPolicy::Skip => cloud_skipped.push(entry),
+                CloudFilesPolicy::Error => {
+                    return Err(LocalSyncError::CloudPlaceholderFound {
+                        path: entry.path.to_string(),
+                    });
+                }
+            }
+        }
+        source_entries = retained;
+    }
+    emit(LocalEvent::CloudPlaceholders {
+        files: cloud_files,
+        bytes: cloud_bytes,
+        detection_available: cloud::detection_available(),
+    });
     let source_root_entry = (source_kind == EntryKind::Directory)
         .then(|| root_entry(source, source_kind))
         .transpose()?;
@@ -869,16 +955,29 @@ fn prepare_transfer(
         destination,
     );
     let source_by_destination = layout.map_source_entries(&source_entries);
+    let skipped_destinations = layout
+        .map_source_entries(&cloud_skipped)
+        .destination_for_source
+        .into_values()
+        .collect::<Vec<_>>();
+    for (entry, path) in cloud_skipped.iter_mut().zip(skipped_destinations) {
+        entry.path = path;
+    }
     let destination_sink = Sink::new(&layout.destination_root)?;
-    let destination_entries = collect_scan(destination_sink.root())?
-        .into_iter()
-        .filter(|entry| {
-            layout
-                .direct_destination_name
-                .as_ref()
-                .is_none_or(|name| entry.path == *name)
-                && !excludes.matches(&entry.path)
-        });
+    let (destination_entries, destination_queue_high_water) =
+        collect_scan(destination_sink.root(), &options.exclude_patterns)?;
+    emit(LocalEvent::Metrics {
+        queue_high_water: source_queue_high_water.max(destination_queue_high_water),
+        compression_algorithm: None,
+        compression_level: None,
+    });
+    let destination_entries = destination_entries.into_iter().filter(|entry| {
+        layout
+            .direct_destination_name
+            .as_ref()
+            .is_none_or(|name| entry.path == *name)
+            && !excludes.matches(&entry.path.to_string())
+    });
     let mut destination_index = DestinationIndex::with_config(IndexConfig::default())?;
     for entry in destination_entries {
         destination_index.insert(entry)?;
@@ -900,20 +999,22 @@ fn prepare_transfer(
                 .get(&entry.path)
                 .cloned()
                 .ok_or_else(|| LocalSyncError::PathMapping {
-                    path: entry.path.clone(),
+                    path: entry.path.to_string(),
                 })?;
             Ok::<FileEntry, LocalSyncError>(planned)
         })
         .collect();
     let mut plan = try_plan(planned_source?, destination_index)?;
-    if options.checksum {
+    let (checksum_cache_hits, checksum_cache_misses) = if options.checksum {
         apply_checksum_classification(
             &mut plan,
             &destination_sink,
             &source_reader_root,
             &source_by_destination,
-        );
-    }
+        )
+    } else {
+        (0, 0)
+    };
     let (planned_files, planned_bytes) = transfer_totals(&plan.files);
     emit(LocalEvent::Planned {
         files: planned_files,
@@ -929,6 +1030,9 @@ fn prepare_transfer(
         source_root_entry,
         source_by_destination,
         plan,
+        checksum_cache_hits,
+        checksum_cache_misses,
+        cloud_skipped,
     })
 }
 
@@ -1018,7 +1122,7 @@ impl Layout {
                     .as_deref()
                     .expect("direct destinations have a source name");
                 if entry.path == source_name {
-                    destination_name.clone()
+                    WirePath::from(destination_name.as_str())
                 } else {
                     entry.path.clone()
                 }
@@ -1036,12 +1140,19 @@ impl Layout {
 }
 
 struct SourcePathMap {
-    destination_for_source: BTreeMap<String, String>,
-    source_for_destination: BTreeMap<String, String>,
+    destination_for_source: BTreeMap<WirePath, WirePath>,
+    source_for_destination: BTreeMap<WirePath, WirePath>,
 }
 
-fn collect_scan(root: &Path) -> Result<Vec<FileEntry>, LocalSyncError> {
-    let scan = scan(root)?;
+fn collect_scan(
+    root: &Path,
+    exclude_patterns: &[String],
+) -> Result<(Vec<FileEntry>, usize), LocalSyncError> {
+    let scan = if exclude_patterns.is_empty() {
+        scan(root)?
+    } else {
+        crate::scanner::scan_with_excludes(root, exclude_patterns)?
+    };
     let mut entries = Vec::new();
     let mut first_error = None;
     for result in scan.entries() {
@@ -1051,11 +1162,12 @@ fn collect_scan(root: &Path) -> Result<Vec<FileEntry>, LocalSyncError> {
             Err(_) => {}
         }
     }
+    let queue_high_water = scan.queue_high_water_mark();
     scan.finish()?;
     if let Some(error) = first_error {
         return Err(error.into());
     }
-    Ok(entries)
+    Ok((entries, queue_high_water))
 }
 
 fn root_entry(path: &Path, kind: EntryKind) -> Result<FileEntry, LocalSyncError> {
@@ -1076,7 +1188,7 @@ fn root_entry(path: &Path, kind: EntryKind) -> Result<FileEntry, LocalSyncError>
         }
     })?;
     Ok(FileEntry {
-        path: String::new(),
+        path: WirePath::default(),
         kind,
         size: metadata.len(),
         mtime,
@@ -1132,7 +1244,7 @@ fn apply_checksum_classification(
     sink: &Sink,
     source_root: &Path,
     paths: &SourcePathMap,
-) {
+) -> (usize, usize) {
     let cache = HashCache::open(HashCache::default_path()).ok();
     let mut unchanged = Vec::new();
     let candidates = plan.files.changed.len() + plan.files.unchanged.len();
@@ -1190,6 +1302,7 @@ fn apply_checksum_classification(
     plan.files
         .unchanged
         .sort_by(|left, right| left.path.cmp(&right.path));
+    cache.map_or((0, 0), |cache| cache.stats())
 }
 
 fn cache_hash(
@@ -1210,7 +1323,7 @@ pub(crate) fn emit_plan_actions(plan: &Plan, emit: &mut impl FnMut(LocalEvent)) 
     for entries in [&plan.directories, &plan.symlinks, &plan.files, &plan.other] {
         for entry in entries.new.iter().chain(&entries.changed) {
             emit(LocalEvent::Action {
-                path: entry.path.clone(),
+                path: entry.path.to_string(),
                 action: if entries
                     .changed
                     .iter()
@@ -1224,7 +1337,7 @@ pub(crate) fn emit_plan_actions(plan: &Plan, emit: &mut impl FnMut(LocalEvent)) 
         }
         for entry in &entries.extraneous {
             emit(LocalEvent::Action {
-                path: entry.path.clone(),
+                path: entry.path.to_string(),
                 action: "delete",
             });
         }
@@ -1239,7 +1352,7 @@ fn transfer_directories(
 ) {
     for entry in directories.new.iter().chain(&directories.changed) {
         if let Err(error) = sink.create_directories(std::slice::from_ref(entry)) {
-            record_failure(report, emit, entry.path.clone(), error.to_string());
+            record_failure(report, emit, entry.path.to_string(), error.to_string());
         }
     }
 }
@@ -1257,7 +1370,7 @@ fn transfer_symlinks(
             record_failure(
                 report,
                 emit,
-                entry.path.clone(),
+                entry.path.to_string(),
                 "source path mapping is missing".to_owned(),
             );
             continue;
@@ -1266,7 +1379,7 @@ fn transfer_symlinks(
         let target = match fs::read_link(&source_path) {
             Ok(target) => target,
             Err(error) => {
-                record_failure(report, emit, entry.path.clone(), error.to_string());
+                record_failure(report, emit, entry.path.to_string(), error.to_string());
                 continue;
             }
         };
@@ -1278,7 +1391,7 @@ fn transfer_symlinks(
             }
         });
         if let Err(error) = sink.create_symlink(entry, &target, target_kind) {
-            record_failure(report, emit, entry.path.clone(), error.to_string());
+            record_failure(report, emit, entry.path.to_string(), error.to_string());
         }
     }
 }
@@ -1398,7 +1511,13 @@ fn spawn_file_worker(
             for task in tasks {
                 let path = task.destination.path.clone();
                 let result = transfer_one_file(&sink, &source_reader, task, paranoid);
-                if outcomes.send(FileOutcome { path, result }).is_err() {
+                if outcomes
+                    .send(FileOutcome {
+                        path: path.to_string(),
+                        result,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1475,12 +1594,14 @@ fn join_workers(workers: Vec<JoinHandle<()>>) -> Result<(), LocalSyncError> {
 /// proportional to the work actually performed instead of to the whole tree,
 /// which matters because an unchanged-directory sweep would add a syscall per
 /// directory to every no-op sync.
-fn touched_parent_directories(plan: &Plan, delete: bool) -> HashSet<String> {
+fn touched_parent_directories(plan: &Plan, delete: bool) -> HashSet<WirePath> {
     let mut touched = HashSet::new();
     {
-        let mut note = |path: &str| {
-            if let Some((parent, _)) = path.rsplit_once('/') {
-                touched.insert(parent.to_owned());
+        let mut note = |path: &WirePath| {
+            if let Some(index) = path.as_bytes().iter().rposition(|byte| *byte == b'/') {
+                if let Ok(parent) = WirePath::from_wire(path.as_bytes()[..index].to_vec()) {
+                    touched.insert(parent);
+                }
             }
         };
         for entry in plan.files.new.iter().chain(&plan.files.changed) {
@@ -1533,7 +1654,7 @@ fn finish_directories(
     entries.sort_by_key(|entry| std::cmp::Reverse(path_depth(&entry.path)));
     for entry in entries {
         if let Err(error) = sink.finish_directories(std::slice::from_ref(entry)) {
-            record_failure(report, emit, entry.path.clone(), error.to_string());
+            record_failure(report, emit, entry.path.to_string(), error.to_string());
         }
     }
 }
@@ -1558,16 +1679,28 @@ fn delete_extraneous(
             Ok(()) => {
                 report.deleted_entries += 1;
                 emit(LocalEvent::Deleted {
-                    path: entry.path.clone(),
+                    path: entry.path.to_string(),
                 });
             }
-            Err(error) => record_failure(report, emit, entry.path.clone(), error.to_string()),
+            Err(error) => record_failure(report, emit, entry.path.to_string(), error.to_string()),
         }
     }
 }
 
-fn path_depth(path: &str) -> usize {
-    path.bytes().filter(|&byte| byte == b'/').count()
+fn protect_cloud_skipped(plan: &mut Plan, skipped: &[FileEntry]) {
+    let protected: HashSet<_> = skipped.iter().map(|entry| entry.path.clone()).collect();
+    for entries in [
+        &mut plan.files.extraneous,
+        &mut plan.directories.extraneous,
+        &mut plan.symlinks.extraneous,
+        &mut plan.other.extraneous,
+    ] {
+        entries.retain(|entry| !protected.contains(&entry.path));
+    }
+}
+
+fn path_depth(path: &WirePath) -> usize {
+    path.depth()
 }
 
 fn record_failure(

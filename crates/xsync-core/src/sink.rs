@@ -8,11 +8,12 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use filetime::FileTime;
 
+use crate::path::WirePath;
 use crate::scanner::{EntryKind, FileEntry};
 
 /// Number of receive attempts allowed after one verification failure.
@@ -99,7 +100,7 @@ pub enum SinkError {
 #[derive(Debug, Clone)]
 pub struct Sink {
     root: PathBuf,
-    temporary_hashes: Arc<Mutex<HashMap<String, String>>>,
+    temporary_hashes: Arc<Mutex<HashMap<WirePath, String>>>,
 }
 
 impl Sink {
@@ -128,8 +129,8 @@ impl Sink {
     ///
     /// # Errors
     /// Returns [`SinkError::InvalidPath`] for an unsafe relative path.
-    pub fn path_for(&self, relative_path: &str) -> Result<PathBuf, SinkError> {
-        self.destination_path(relative_path)
+    pub fn path_for(&self, relative_path: impl Into<WirePath>) -> Result<PathBuf, SinkError> {
+        self.destination_path(&relative_path.into())
     }
 
     /// Apply metadata to this sink's root directory after all child writes.
@@ -161,19 +162,20 @@ impl Sink {
     /// # Errors
     ///
     /// Returns [`SinkError::InvalidPath`] for an unsafe protocol path.
-    pub fn temporary_path(&self, relative_path: &str) -> Result<PathBuf, SinkError> {
-        let final_path = self.destination_path(relative_path)?;
+    pub fn temporary_path(&self, relative_path: impl Into<WirePath>) -> Result<PathBuf, SinkError> {
+        let relative_path = relative_path.into();
+        let final_path = self.destination_path(&relative_path)?;
         let mut temporary_hashes = match self.temporary_hashes.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         let hash = temporary_hashes
-            .entry(relative_path.to_owned())
+            .entry(relative_path.clone())
             .or_insert_with(|| blake3::hash(relative_path.as_bytes()).to_hex().to_string())
             .clone();
         let parent = final_path
             .parent()
-            .ok_or_else(|| invalid_path(relative_path))?;
+            .ok_or_else(|| invalid_path(&relative_path.to_string()))?;
         Ok(parent.join(format!(".xsync.tmp.{hash}")))
     }
 
@@ -203,7 +205,7 @@ impl Sink {
 
         for attempt in 1..=MAX_VERIFICATION_ATTEMPTS {
             let data = receive(attempt).map_err(|source| SinkError::Receive {
-                path: entry.path.clone(),
+                path: entry.path.to_string(),
                 attempt,
                 source,
             })?;
@@ -216,7 +218,7 @@ impl Sink {
         }
 
         Err(SinkError::VerificationFailed {
-            path: entry.path.clone(),
+            path: entry.path.to_string(),
             attempts: MAX_VERIFICATION_ATTEMPTS,
         })
     }
@@ -277,7 +279,7 @@ impl Sink {
             .is_none_or(|end| end > entry.size)
         {
             return Err(SinkError::InvalidChunkRange {
-                path: entry.path.clone(),
+                path: entry.path.to_string(),
                 offset,
                 length,
                 size: entry.size,
@@ -287,7 +289,7 @@ impl Sink {
 
         for attempt in 1..=MAX_VERIFICATION_ATTEMPTS {
             let data = receive(attempt).map_err(|source| SinkError::Receive {
-                path: entry.path.clone(),
+                path: entry.path.to_string(),
                 attempt,
                 source,
             })?;
@@ -298,7 +300,7 @@ impl Sink {
         }
 
         Err(SinkError::VerificationFailed {
-            path: entry.path.clone(),
+            path: entry.path.to_string(),
             attempts: MAX_VERIFICATION_ATTEMPTS,
         })
     }
@@ -321,7 +323,7 @@ impl Sink {
             .len();
         if actual_size != entry.size {
             return Err(SinkError::InvalidChunkRange {
-                path: entry.path.clone(),
+                path: entry.path.to_string(),
                 offset: 0,
                 length: actual_size,
                 size: entry.size,
@@ -397,23 +399,13 @@ impl Sink {
         commit_temp(&temp_path, &final_path)
     }
 
-    fn destination_path(&self, relative_path: &str) -> Result<PathBuf, SinkError> {
+    fn destination_path(&self, relative_path: &WirePath) -> Result<PathBuf, SinkError> {
+        let relative_path = WirePath::from_wire(relative_path.as_bytes().to_vec())
+            .map_err(|_| invalid_path(&relative_path.to_string()))?;
         if relative_path.is_empty() {
-            return Err(invalid_path(relative_path));
+            return Err(invalid_path(&relative_path.to_string()));
         }
-
-        let mut destination = self.root.clone();
-        for part in relative_path.split('/') {
-            let mut components = Path::new(part).components();
-            if part.is_empty()
-                || !matches!(components.next(), Some(Component::Normal(_)))
-                || components.next().is_some()
-            {
-                return Err(invalid_path(relative_path));
-            }
-            destination.push(part);
-        }
-        Ok(destination)
+        Ok(relative_path.to_native_path(&self.root))
     }
 }
 
@@ -426,7 +418,7 @@ fn require_kind(
         Ok(())
     } else {
         Err(SinkError::WrongKind {
-            path: entry.path.clone(),
+            path: entry.path.to_string(),
             expected,
             actual: entry.kind,
         })
@@ -543,8 +535,8 @@ fn remove_non_directory(path: &Path) -> Result<(), SinkError> {
         .map_err(|source| io_error("remove existing path", path, source))
 }
 
-fn path_depth(path: &str) -> usize {
-    path.bytes().filter(|&byte| byte == b'/').count()
+fn path_depth(path: &WirePath) -> usize {
+    path.depth()
 }
 
 #[cfg(unix)]
@@ -583,7 +575,7 @@ mod tests {
 
     fn entry(path: &str, kind: EntryKind, size: u64, mode: u32, seconds: u64) -> FileEntry {
         FileEntry {
-            path: path.to_owned(),
+            path: WirePath::from(path),
             kind,
             size,
             mtime: UNIX_EPOCH + Duration::from_secs(seconds),
@@ -597,7 +589,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn scanned(root: &Path) -> HashMap<String, FileEntry> {
+    fn scanned(root: &Path) -> HashMap<WirePath, FileEntry> {
         let scan = scanner::scan(root).unwrap();
         let entries = scan
             .entries()
@@ -639,6 +631,31 @@ mod tests {
         assert_eq!(calls, 2);
         assert_eq!(fs::read(temp.path().join("nested/file")).unwrap(), good);
         assert!(!sink.temporary_path("nested/file").unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_invalid_utf8_filename_without_lossy_conversion() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp = tempdir().unwrap();
+        let raw_name = OsString::from_vec(b"raw-\xff-name".to_vec());
+        let probe = temp.path().join(&raw_name);
+        if fs::write(&probe, []).is_err() {
+            // Some macOS filesystems reject non-UTF-8 names.
+            return;
+        }
+        fs::remove_file(&probe).unwrap();
+
+        let sink = Sink::new(temp.path()).unwrap();
+        let mut file = entry("placeholder", EntryKind::File, 3, 0o644, 1);
+        file.path = WirePath::from_wire(b"raw-\xff-name".to_vec()).unwrap();
+        let payload = b"raw";
+        sink.write_file_with_retry(&file, &blake3::hash(payload), |_| Ok(payload.to_vec()))
+            .unwrap();
+
+        assert_eq!(fs::read(temp.path().join(raw_name)).unwrap(), payload);
     }
 
     #[test]
@@ -794,13 +811,13 @@ mod tests {
         for entry in source_entries.values() {
             match entry.kind {
                 EntryKind::File => {
-                    let data = fs::read(source.path().join(&entry.path)).unwrap();
+                    let data = fs::read(entry.path.to_native_path(source.path())).unwrap();
                     let hash = blake3::hash(&data);
                     sink.write_file_with_retry(entry, &hash, |_| Ok(data.clone()))
                         .unwrap();
                 }
                 EntryKind::Symlink => {
-                    let target = fs::read_link(source.path().join(&entry.path)).unwrap();
+                    let target = fs::read_link(entry.path.to_native_path(source.path())).unwrap();
                     sink.create_symlink(entry, &target, SymlinkTargetKind::File)
                         .unwrap();
                 }

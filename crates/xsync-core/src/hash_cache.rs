@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,6 +44,8 @@ pub struct HashCache {
     path: PathBuf,
     database: Database,
     pending: Mutex<HashMap<Vec<u8>, [u8; blake3::OUT_LEN]>>,
+    hits: AtomicUsize,
+    misses: AtomicUsize,
 }
 
 impl HashCache {
@@ -67,6 +70,8 @@ impl HashCache {
             path,
             database,
             pending: Mutex::new(HashMap::new()),
+            hits: AtomicUsize::new(0),
+            misses: AtomicUsize::new(0),
         };
         cache.ensure_schema()?;
         Ok(cache)
@@ -84,6 +89,7 @@ impl HashCache {
         // in-memory buffer has to be consulted before the database.
         if let Ok(pending) = self.pending.lock() {
             if let Some(digest) = pending.get(&key) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(blake3::Hash::from(*digest));
             }
         }
@@ -92,6 +98,7 @@ impl HashCache {
                 if let Ok(Some(value)) = table.get(key.as_slice()) {
                     let bytes = value.value();
                     if bytes.len() == blake3::OUT_LEN {
+                        self.hits.fetch_add(1, Ordering::Relaxed);
                         let mut digest = [0; blake3::OUT_LEN];
                         digest.copy_from_slice(bytes);
                         return Ok(blake3::Hash::from(digest));
@@ -101,6 +108,7 @@ impl HashCache {
         }
 
         let mut file = File::open(path)?;
+        self.misses.fetch_add(1, Ordering::Relaxed);
         let mut hasher = blake3::Hasher::new();
         // Sized from the fingerprint the caller already holds, so no extra
         // stat is issued. A fixed 1 MiB buffer costs an allocation and a
@@ -131,6 +139,15 @@ impl HashCache {
             let _ = self.flush();
         }
         Ok(digest)
+    }
+
+    /// Return cache hits and misses observed by this handle.
+    #[must_use]
+    pub fn stats(&self) -> (usize, usize) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
     }
 
     /// Commit every buffered digest in a single transaction.
@@ -268,10 +285,12 @@ mod tests {
 
         let expected: Vec<blake3::Hash> = {
             let cache = HashCache::open(&database).unwrap();
-            fingerprints
+            let expected = fingerprints
                 .iter()
                 .map(|(path, fingerprint)| cache.hash_file(path, *fingerprint).unwrap())
-                .collect()
+                .collect();
+            assert_eq!(cache.stats(), (0, fingerprints.len()));
+            expected
             // cache drops here, which must flush
         };
 
@@ -290,6 +309,7 @@ mod tests {
                 path.display()
             );
         }
+        assert_eq!(reopened.stats(), (fingerprints.len(), 0));
     }
 
     #[test]

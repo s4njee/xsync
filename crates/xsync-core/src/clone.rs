@@ -240,7 +240,7 @@ pub fn try_clone_directory(
 
 fn entries_match(source: &Path, entries: &[FileEntry]) -> Result<bool, CloneError> {
     for entry in entries {
-        let path = source.join(Path::new(&entry.path));
+        let path = entry.path.to_native_path(source);
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -511,7 +511,7 @@ mod tests {
         let metadata = fs::symlink_metadata(path).unwrap();
         let mtime = metadata.modified().unwrap();
         FileEntry {
-            path: String::new(),
+            path: crate::path::WirePath::default(),
             kind: EntryKind::Directory,
             size: metadata.len(),
             mtime,

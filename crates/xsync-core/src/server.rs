@@ -23,14 +23,16 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use filetime::{set_file_mtime, FileTime};
 use thiserror::Error;
 
+use crate::hash_cache::{HashCache, HashFingerprint};
 use crate::local::{LocalEvent, LocalSyncOptions, LocalSyncReport, TransferMethod};
+use crate::path::WirePath;
 use crate::planner::{
     try_plan, try_plan_with_fingerprint, DestinationIndex, IndexConfig, PlannerError,
 };
@@ -171,31 +173,83 @@ pub fn entry_record_from_file_entry(entry: &FileEntry) -> EntryRecord {
     }
 }
 
-fn content_identity(path: &Path) -> io::Result<FileIdentity> {
-    let hash = blake3::hash(&fs::read(path)?);
-    Ok(FileIdentity {
-        device: u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap_or([0; 8])),
-        file: u64::from_le_bytes(hash.as_bytes()[8..16].try_into().unwrap_or([0; 8])),
-    })
+fn native_symlink_target(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        return PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec()));
+    }
+    #[cfg(windows)]
+    {
+        return PathBuf::from(String::from_utf8_lossy(bytes).into_owned());
+    }
+    #[allow(unreachable_code)]
+    PathBuf::new()
 }
 
-fn content_entry_record(root: &Path, entry: &FileEntry) -> Result<EntryRecord, ServerError> {
+fn hash_file_streaming(path: &Path) -> io::Result<blake3::Hash> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hasher.finalize());
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn content_entry_record(
+    root: &Path,
+    entry: &FileEntry,
+    cache: Option<&HashCache>,
+) -> Result<EntryRecord, ServerError> {
     let mut record = entry_record_from_file_entry(entry);
     if entry.kind == ScanEntryKind::File {
-        let identity = content_identity(&root.join(&entry.path)).map_err(ServerError::Io)?;
+        let path = entry.path.to_native_path(root);
+        let identity = cached_content_identity(&path, entry, cache)?;
         record.fingerprint[..8].copy_from_slice(&identity.device.to_le_bytes());
         record.fingerprint[8..16].copy_from_slice(&identity.file.to_le_bytes());
     }
     Ok(record)
 }
 
+fn cached_content_identity(
+    path: &Path,
+    entry: &FileEntry,
+    cache: Option<&HashCache>,
+) -> Result<FileIdentity, ServerError> {
+    let digest = match cache.and_then(|cache| {
+        cache
+            .hash_file(
+                path,
+                HashFingerprint {
+                    device: entry.fingerprint.identity.device,
+                    file: entry.fingerprint.identity.file,
+                    size: entry.fingerprint.size,
+                    mtime: entry.fingerprint.mtime,
+                    ctime: entry.fingerprint.ctime,
+                },
+            )
+            .ok()
+    }) {
+        Some(digest) => digest,
+        None => blake3::hash(&fs::read(path).map_err(ServerError::Io)?),
+    };
+    Ok(FileIdentity {
+        device: u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or([0; 8])),
+        file: u64::from_le_bytes(digest.as_bytes()[8..16].try_into().unwrap_or([0; 8])),
+    })
+}
+
 /// Convert an [`EntryRecord`] received from the wire into a [`FileEntry`].
 ///
 /// # Errors
-/// Returns [`ServerError::InvalidPath`] if the path bytes are not valid UTF-8.
+/// Returns [`ServerError::InvalidPath`] if the path bytes are unsafe.
 pub fn file_entry_from_entry_record(record: &EntryRecord) -> Result<FileEntry, ServerError> {
-    let path = String::from_utf8(record.path.clone())
-        .map_err(|_| ServerError::InvalidPath(format!("{:?}", record.path)))?;
+    let path = WirePath::from_wire(record.path.clone())
+        .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
     let mtime = nanos_to_system_time(record.mtime_ns);
     let device = u64::from_le_bytes(record.fingerprint[0..8].try_into().unwrap_or([0; 8]));
     let file = u64::from_le_bytes(record.fingerprint[8..16].try_into().unwrap_or([0; 8]));
@@ -220,24 +274,31 @@ pub fn file_entry_from_entry_record(record: &EntryRecord) -> Result<FileEntry, S
 ///
 /// # Errors
 /// Returns [`ServerError::InvalidPath`] or [`ServerError::SymlinkEscape`].
-pub fn validate_destination_path(root: &Path, relative_path: &str) -> Result<PathBuf, ServerError> {
+pub fn validate_destination_path(
+    root: &Path,
+    relative_path: impl Into<WirePath>,
+) -> Result<PathBuf, ServerError> {
+    let relative_path = relative_path.into();
+    let relative_path = WirePath::from_wire(relative_path.as_bytes().to_vec())
+        .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
     if relative_path.is_empty() {
         return Err(ServerError::InvalidPath("empty path".to_owned()));
     }
-    let mut current = root.to_path_buf();
-    for part in relative_path.split('/') {
-        if part.is_empty() || part == "." || part == ".." {
-            return Err(ServerError::InvalidPath(relative_path.to_owned()));
+    let current = relative_path.to_native_path(root);
+    let mut ancestor = root.to_path_buf();
+    for component in relative_path.as_bytes().split(|byte| *byte == b'/') {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            ancestor.push(OsString::from_vec(component.to_vec()));
         }
-        let mut components = Path::new(part).components();
-        if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-            return Err(ServerError::InvalidPath(relative_path.to_owned()));
-        }
-        current.push(part);
+        #[cfg(not(unix))]
+        ancestor.push(String::from_utf8_lossy(component).as_ref());
         // Check if an intermediate ancestor is a symlink.
-        if let Ok(metadata) = fs::symlink_metadata(&current) {
-            if metadata.file_type().is_symlink() && current.is_dir() {
-                return Err(ServerError::SymlinkEscape(relative_path.to_owned()));
+        if let Ok(metadata) = fs::symlink_metadata(&ancestor) {
+            if metadata.file_type().is_symlink() && ancestor.is_dir() {
+                return Err(ServerError::SymlinkEscape(relative_path.to_string()));
             }
         }
     }
@@ -250,7 +311,7 @@ pub struct Server {
     root: PathBuf,
     next_message_id: u64,
     decoder: FrameDecoder,
-    seen_destinations: HashSet<String>,
+    seen_destinations: HashSet<WirePath>,
     journal: Option<crate::journal::ResumeJournal>,
     compression: CompressionMode,
     compression_level: i32,
@@ -468,7 +529,7 @@ impl Server {
                         let file_entry = file_entry_from_entry_record(&record)?;
                         validate_destination_path(&self.root, &file_entry.path)?;
                         if !self.seen_destinations.insert(file_entry.path.clone()) {
-                            return Err(ServerError::DuplicatePath(file_entry.path.clone()));
+                            return Err(ServerError::DuplicatePath(file_entry.path.to_string()));
                         }
                         let hash = blake3::hash(&data);
                         sink.write_file_with_retry(
@@ -517,11 +578,11 @@ impl Server {
                     mode,
                     fingerprint,
                 } => {
-                    let rel_path = String::from_utf8(path)
-                        .map_err(|_| ServerError::InvalidPath("invalid UTF-8 path".to_owned()))?;
+                    let rel_path = WirePath::from_wire(path)
+                        .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
                     validate_destination_path(&self.root, &rel_path)?;
                     if !self.seen_destinations.insert(rel_path.clone()) {
-                        return Err(ServerError::DuplicatePath(rel_path));
+                        return Err(ServerError::DuplicatePath(rel_path.to_string()));
                     }
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
                     let file = u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
@@ -588,6 +649,9 @@ impl Server {
         dry_run: bool,
         exclude_patterns: &[Vec<u8>],
     ) -> Result<(), ServerError> {
+        let hash_cache = checksum
+            .then(|| HashCache::open(HashCache::default_path()).ok())
+            .flatten();
         // Destination scan phase: if destination exists, scan and send Scan frames.
         let mut entries = Vec::new();
         if self.root.exists() {
@@ -596,7 +660,7 @@ impl Server {
                     if let Ok(entry) = item {
                         if !excluded_path(exclude_patterns, &entry.path) {
                             entries.push(if checksum {
-                                content_entry_record(&self.root, &entry)?
+                                content_entry_record(&self.root, &entry, hash_cache.as_ref())?
                             } else {
                                 entry_record_from_file_entry(&entry)
                             });
@@ -699,12 +763,12 @@ impl Server {
                     mode,
                     mtime_ns,
                 } => {
-                    let rel_path = String::from_utf8(path)
-                        .map_err(|_| ServerError::InvalidPath("invalid UTF-8 path".to_owned()))?;
+                    let rel_path = WirePath::from_wire(path)
+                        .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
                     if !rel_path.is_empty() && !self.seen_destinations.insert(rel_path.clone()) {
                         // Check if duplicate for same operation; allow set directory after creation
                         if operation != MetadataOperation::SetDirectory {
-                            return Err(ServerError::DuplicatePath(rel_path));
+                            return Err(ServerError::DuplicatePath(rel_path.to_string()));
                         }
                     }
 
@@ -727,9 +791,6 @@ impl Server {
                         }
                         MetadataOperation::CreateSymlink => {
                             validate_destination_path(&self.root, &rel_path)?;
-                            let target_str = String::from_utf8(target).map_err(|_| {
-                                ServerError::InvalidPath("invalid symlink target".to_owned())
-                            })?;
                             let entry = FileEntry {
                                 path: rel_path.clone(),
                                 kind: ScanEntryKind::Symlink,
@@ -744,7 +805,7 @@ impl Server {
                             };
                             sink.create_symlink(
                                 &entry,
-                                Path::new(&target_str),
+                                &native_symlink_target(&target),
                                 SymlinkTargetKind::File,
                             )?;
                         }
@@ -757,7 +818,7 @@ impl Server {
                         MetadataOperation::SetDirectory => {
                             if rel_path.is_empty() {
                                 let entry = FileEntry {
-                                    path: ".".to_owned(),
+                                    path: WirePath::default(),
                                     kind: ScanEntryKind::Directory,
                                     size: 0,
                                     mtime: nanos_to_system_time(mtime_ns),
@@ -801,7 +862,17 @@ impl Server {
                                         UNIX_EPOCH,
                                     ),
                                 };
-                                sink.delete_entry(&entry)?;
+                                if let Err(error) = sink.delete_entry(&entry) {
+                                    let error = Message::Error {
+                                        code: 1001,
+                                        related_id: frame.message_id,
+                                        message: format!("delete '{rel_path}' failed: {error}"),
+                                    };
+                                    let msg_id = self.next_id();
+                                    writer.write_all(&encode_frame(msg_id, &error)?)?;
+                                    writer.flush()?;
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -843,7 +914,7 @@ impl Server {
                         let file_entry = file_entry_from_entry_record(&record)?;
                         validate_destination_path(&self.root, &file_entry.path)?;
                         if !self.seen_destinations.insert(file_entry.path.clone()) {
-                            return Err(ServerError::DuplicatePath(file_entry.path.clone()));
+                            return Err(ServerError::DuplicatePath(file_entry.path.to_string()));
                         }
                         let hash = blake3::hash(&data);
                         sink.write_file_with_retry(
@@ -857,7 +928,7 @@ impl Server {
                             let readback = fs::read(&committed_path)?;
                             if blake3::hash(&readback) != hash {
                                 return Err(ServerError::Sink(SinkError::VerificationFailed {
-                                    path: file_entry.path,
+                                    path: file_entry.path.to_string(),
                                     attempts: 2,
                                 }));
                             }
@@ -926,11 +997,11 @@ impl Server {
                     mode,
                     fingerprint,
                 } => {
-                    let rel_path = String::from_utf8(path)
-                        .map_err(|_| ServerError::InvalidPath("invalid UTF-8 path".to_owned()))?;
+                    let rel_path = WirePath::from_wire(path)
+                        .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
                     validate_destination_path(&self.root, &rel_path)?;
                     if !self.seen_destinations.insert(rel_path.clone()) {
-                        return Err(ServerError::DuplicatePath(rel_path));
+                        return Err(ServerError::DuplicatePath(rel_path.to_string()));
                     }
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
                     let file = u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
@@ -1044,7 +1115,7 @@ impl Server {
                             .as_ref()
                             .expect("journal is initialized during handshake");
                         let identity = crate::journal::ResumeIdentity {
-                            path: entry.path.clone().into_bytes(),
+                            path: entry.path.as_bytes().to_vec(),
                             fingerprint: entry.fingerprint,
                         };
                         journal.clear(&identity)?;
@@ -1054,7 +1125,7 @@ impl Server {
                             let readback = fs::read(&committed_path)?;
                             if *blake3::hash(&readback).as_bytes() != digest {
                                 return Err(ServerError::Sink(SinkError::VerificationFailed {
-                                    path: entry.path,
+                                    path: entry.path.to_string(),
                                     attempts: 2,
                                 }));
                             }
@@ -1242,8 +1313,8 @@ impl Server {
                     mode,
                     fingerprint,
                 } => {
-                    let rel_path = String::from_utf8(path)
-                        .map_err(|_| ServerError::InvalidPath("invalid UTF-8 path".to_owned()))?;
+                    let rel_path = WirePath::from_wire(path)
+                        .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
                     let file = u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
                     let entry = FileEntry {
@@ -1332,9 +1403,8 @@ impl Server {
                 } => {
                     // Client requesting symlink metadata in Pull mode.
                     if operation == MetadataOperation::CreateSymlink {
-                        let rel_path = String::from_utf8(path).map_err(|_| {
-                            ServerError::InvalidPath("invalid UTF-8 path".to_owned())
-                        })?;
+                        let rel_path = WirePath::from_wire(path)
+                            .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
                         let symlink_path = self.root.join(&rel_path);
                         let target_path = fs::read_link(&symlink_path)?;
                         let target_bytes = target_path.into_os_string().into_encoded_bytes();
@@ -1659,12 +1729,20 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf()
     };
+    let hash_cache = options
+        .checksum
+        .then(|| HashCache::open(HashCache::default_path()).ok())
+        .flatten();
     let source_scan = scan(source_path)?;
     let mut source_entries = Vec::new();
     for item in source_scan.entries() {
         let mut entry = item?;
         if options.checksum && entry.kind == ScanEntryKind::File {
-            entry.fingerprint.identity = content_identity(&source_reader_root.join(&entry.path))?;
+            entry.fingerprint.identity = cached_content_identity(
+                &entry.path.to_native_path(&source_reader_root),
+                &entry,
+                hash_cache.as_ref(),
+            )?;
         }
         if !excluded_path(
             &encode_exclude_patterns(&options.exclude_patterns),
@@ -1700,7 +1778,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     let mut mapped_source = Vec::new();
     for mut entry in source_entries {
         if !prefix.is_empty() {
-            entry.path = format!("{prefix}/{}", entry.path);
+            entry.path = entry.path.with_prefix(&WirePath::from(prefix.as_str()));
         }
         mapped_source.push(entry);
     }
@@ -1719,6 +1797,8 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     let mut report = LocalSyncReport {
         local_workers: options.local_workers,
         streams: options.streams,
+        checksum_cache_hits: hash_cache.as_ref().map_or(0, |cache| cache.stats().0),
+        checksum_cache_misses: hash_cache.as_ref().map_or(0, |cache| cache.stats().1),
         ..LocalSyncReport::default()
     };
     report.skipped_files = plan.files.unchanged.len();
@@ -1743,7 +1823,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
 
     for entry in &plan.files.unchanged {
         emit(LocalEvent::Skipped {
-            path: entry.path.clone(),
+            path: entry.path.to_string(),
             bytes: entry.size,
         });
     }
@@ -1793,12 +1873,12 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         let mut pending = 0usize;
         for sym in plan.symlinks.new.iter().chain(&plan.symlinks.changed) {
             let local_sym_path = if prefix.is_empty() {
-                source_reader_root.join(&sym.path)
+                sym.path.to_native_path(&source_reader_root)
             } else {
                 let stripped = sym
                     .path
-                    .strip_prefix(&format!("{prefix}/"))
-                    .unwrap_or(&sym.path);
+                    .strip_prefix(format!("{prefix}/"))
+                    .unwrap_or_else(|| sym.path.clone());
                 source_reader_root.join(stripped)
             };
             let target = fs::read_link(&local_sym_path)?;
@@ -1857,9 +1937,9 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 if !prefix.is_empty() {
                     file_to_read.path = file
                         .path
-                        .strip_prefix(&format!("{prefix}/"))
-                        .unwrap_or(&file.path)
-                        .to_owned();
+                        .strip_prefix(format!("{prefix}/"))
+                        .unwrap_or_else(|| file.path.clone())
+                        .clone();
                 }
                 // Read before the file is announced, so a read failure never
                 // leaves the receiver waiting for a segment that never arrives.
@@ -1870,7 +1950,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     }
                     Err(err) => {
                         emit(LocalEvent::Failed {
-                            path: file.path.clone(),
+                            path: file.path.to_string(),
                             message: err.to_string(),
                         });
                         report.failed_entries = report.failed_entries.saturating_add(1);
@@ -1883,7 +1963,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
 
             let transferred: Vec<(String, u64)> = loaded
                 .iter()
-                .map(|(file, _)| (file.path.clone(), file.size))
+                .map(|(file, _)| (file.path.to_string(), file.size))
                 .collect();
             let entries = loaded
                 .iter()
@@ -1960,16 +2040,16 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             if !prefix.is_empty() {
                 file_to_read.path = file
                     .path
-                    .strip_prefix(&format!("{prefix}/"))
-                    .unwrap_or(&file.path)
-                    .to_owned();
+                    .strip_prefix(format!("{prefix}/"))
+                    .unwrap_or_else(|| file.path.clone())
+                    .clone();
             }
 
             let stable = match source_reader.read(&file_to_read) {
                 Ok(s) => s,
                 Err(err) => {
                     emit(LocalEvent::Failed {
-                        path: file.path.clone(),
+                        path: file.path.to_string(),
                         message: err.to_string(),
                     });
                     report.failed_entries = report.failed_entries.saturating_add(1);
@@ -2032,7 +2112,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 report.byte_copies = report.byte_copies.saturating_add(1);
 
                 emit(LocalEvent::Transferred {
-                    path: file.path.clone(),
+                    path: file.path.to_string(),
                     bytes: file.size,
                     physical_bytes: file.size,
                     method: TransferMethod::ByteCopy,
@@ -2145,7 +2225,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                         ));
                     }
                     emit(LocalEvent::Progress {
-                        path: file.path.clone(),
+                        path: file.path.to_string(),
                         stream: 0,
                         completed: resumed_bytes.saturating_add(sent_bytes),
                         total: file.size,
@@ -2180,7 +2260,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 report.byte_copies = report.byte_copies.saturating_add(1);
 
                 emit(LocalEvent::Transferred {
-                    path: file.path.clone(),
+                    path: file.path.to_string(),
                     bytes: file.size,
                     physical_bytes: sent_bytes,
                     method: TransferMethod::ByteCopy,
@@ -2199,7 +2279,6 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             ext_dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
             to_delete.extend(ext_dirs);
 
-            let mut pending = 0usize;
             for entry in to_delete {
                 let meta_msg = Message::Metadata {
                     operation: MetadataOperation::Delete,
@@ -2211,20 +2290,22 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 let msg_id = alloc_id();
                 let b = encode_frame(msg_id, &meta_msg)?;
                 writer.write_all(&b)?;
-                pending += 1;
-                if pending >= MAX_PIPELINED_FRAMES {
-                    writer.flush()?;
-                    drain_acks(
-                        &mut decoder,
-                        &mut reader,
-                        &mut pending,
-                        MAX_PIPELINED_FRAMES / 2,
-                    )?;
+                writer.flush()?;
+                match expect_ack_or_delete_warning(&mut decoder, &mut reader)? {
+                    Some(message) => record_delete_failure(
+                        &mut report,
+                        &mut emit,
+                        &entry,
+                        ServerError::RemoteError {
+                            code: 1001,
+                            message,
+                        },
+                    ),
+                    None => emit(LocalEvent::Deleted {
+                        path: entry.path.to_string(),
+                    }),
                 }
-                emit(LocalEvent::Deleted { path: entry.path });
             }
-            writer.flush()?;
-            drain_acks(&mut decoder, &mut reader, &mut pending, 0)?;
         }
 
         // Finish directories metadata deepest first.
@@ -2341,6 +2422,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
         failed_entries: report.failed_entries,
+        deleted_entries: report.deleted_entries,
         warnings: report.warnings,
         local_workers: report.local_workers,
         streams: report.streams,
@@ -2352,6 +2434,8 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         resumed_bytes: report.resumed_bytes,
         retransmitted_bytes: report.retransmitted_bytes,
         checkpoint_bytes: report.checkpoint_bytes,
+        checksum_cache_hits: report.checksum_cache_hits,
+        checksum_cache_misses: report.checksum_cache_misses,
     });
 
     Ok(report)
@@ -2501,7 +2585,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     if rec.path.is_empty() {
                         let mtime = nanos_to_system_time(rec.mtime_ns);
                         source_root_entry = Some(FileEntry {
-                            path: ".".to_owned(),
+                            path: WirePath::default(),
                             kind: ScanEntryKind::Directory,
                             size: 0,
                             mtime,
@@ -2584,7 +2668,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     let mut mapped_source = Vec::new();
     for mut entry in source_entries {
         if !prefix.is_empty() {
-            entry.path = format!("{prefix}/{}", entry.path);
+            entry.path = entry.path.with_prefix(&WirePath::from(prefix.as_str()));
         }
         mapped_source.push(entry);
     }
@@ -2627,7 +2711,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
 
     for entry in &plan.files.unchanged {
         emit(LocalEvent::Skipped {
-            path: entry.path.clone(),
+            path: entry.path.to_string(),
             bytes: entry.size,
         });
     }
@@ -2653,9 +2737,9 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 sym.path.clone()
             } else {
                 sym.path
-                    .strip_prefix(&format!("{prefix}/"))
-                    .unwrap_or(&sym.path)
-                    .to_owned()
+                    .strip_prefix(format!("{prefix}/"))
+                    .unwrap_or_else(|| sym.path.clone())
+                    .clone()
             };
 
             let req = Message::Metadata {
@@ -2674,9 +2758,11 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 .read(&mut reader)
                 .map_err(|e| map_transport_error(e, 0))?;
             if let Message::Metadata { target, .. } = reply.message {
-                let target_str = String::from_utf8(target)
-                    .map_err(|_| ServerError::InvalidPath("invalid symlink target".to_owned()))?;
-                sink.create_symlink(sym, Path::new(&target_str), SymlinkTargetKind::File)?;
+                sink.create_symlink(
+                    sym,
+                    &native_symlink_target(&target),
+                    SymlinkTargetKind::File,
+                )?;
             }
         }
 
@@ -2685,12 +2771,12 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         // of costing a request round trip each.
         let remote_path = |file: &FileEntry| -> String {
             if prefix.is_empty() {
-                file.path.clone()
+                file.path.to_string()
             } else {
                 file.path
-                    .strip_prefix(&format!("{prefix}/"))
-                    .unwrap_or(&file.path)
-                    .to_owned()
+                    .strip_prefix(format!("{prefix}/"))
+                    .unwrap_or_else(|| file.path.clone())
+                    .to_string()
             }
         };
         let small_files: Vec<&FileEntry> = plan
@@ -2755,7 +2841,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     let readback = fs::read(&committed_path)?;
                     if blake3::hash(&readback) != hash {
                         return Err(ServerError::Sink(SinkError::VerificationFailed {
-                            path: file.path.clone(),
+                            path: file.path.to_string(),
                             attempts: 2,
                         }));
                     }
@@ -2774,7 +2860,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 report.physical_bytes = report.physical_bytes.saturating_add(file.size);
                 report.byte_copies = report.byte_copies.saturating_add(1);
                 emit(LocalEvent::Transferred {
-                    path: file.path.clone(),
+                    path: file.path.to_string(),
                     bytes: file.size,
                     physical_bytes: file.size,
                     method: TransferMethod::ByteCopy,
@@ -2837,7 +2923,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     let readback = fs::read(&committed_path)?;
                     if blake3::hash(&readback) != hash {
                         return Err(ServerError::Sink(SinkError::VerificationFailed {
-                            path: file.path.clone(),
+                            path: file.path.to_string(),
                             attempts: 2,
                         }));
                     }
@@ -2870,7 +2956,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 report.byte_copies = report.byte_copies.saturating_add(1);
 
                 emit(LocalEvent::Transferred {
-                    path: file.path.clone(),
+                    path: file.path.to_string(),
                     bytes: file.size,
                     physical_bytes: file.size,
                     method: TransferMethod::ByteCopy,
@@ -2990,7 +3076,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                         )));
                     }
                     emit(LocalEvent::Progress {
-                        path: file.path.clone(),
+                        path: file.path.to_string(),
                         stream: 0,
                         completed: verified_ranges
                             .iter()
@@ -3038,7 +3124,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 report.byte_copies = report.byte_copies.saturating_add(1);
 
                 emit(LocalEvent::Transferred {
-                    path: file.path.clone(),
+                    path: file.path.to_string(),
                     bytes: file.size,
                     physical_bytes: sent_bytes,
                     method: TransferMethod::ByteCopy,
@@ -3064,24 +3150,30 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         // Delete extraneous entries if enabled.
         if options.delete && !report.partial_failure() {
             for entry in &plan.files.extraneous {
-                sink.delete_entry(entry)?;
-                emit(LocalEvent::Deleted {
-                    path: entry.path.clone(),
-                });
+                match sink.delete_entry(entry) {
+                    Ok(()) => emit(LocalEvent::Deleted {
+                        path: entry.path.to_string(),
+                    }),
+                    Err(error) => record_delete_failure(&mut report, &mut emit, entry, error),
+                }
             }
             for entry in &plan.symlinks.extraneous {
-                sink.delete_entry(entry)?;
-                emit(LocalEvent::Deleted {
-                    path: entry.path.clone(),
-                });
+                match sink.delete_entry(entry) {
+                    Ok(()) => emit(LocalEvent::Deleted {
+                        path: entry.path.to_string(),
+                    }),
+                    Err(error) => record_delete_failure(&mut report, &mut emit, entry, error),
+                }
             }
             let mut ext_dirs = plan.directories.extraneous.clone();
             ext_dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
             for entry in &ext_dirs {
-                sink.delete_entry(entry)?;
-                emit(LocalEvent::Deleted {
-                    path: entry.path.clone(),
-                });
+                match sink.delete_entry(entry) {
+                    Ok(()) => emit(LocalEvent::Deleted {
+                        path: entry.path.to_string(),
+                    }),
+                    Err(error) => record_delete_failure(&mut report, &mut emit, entry, error),
+                }
             }
         }
     }
@@ -3138,6 +3230,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
         failed_entries: report.failed_entries,
+        deleted_entries: report.deleted_entries,
         warnings: report.warnings,
         local_workers: report.local_workers,
         streams: report.streams,
@@ -3149,6 +3242,8 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         resumed_bytes: report.resumed_bytes,
         retransmitted_bytes: report.retransmitted_bytes,
         checkpoint_bytes: report.checkpoint_bytes,
+        checksum_cache_hits: report.checksum_cache_hits,
+        checksum_cache_misses: report.checksum_cache_misses,
     });
 
     Ok(report)
@@ -3172,8 +3267,9 @@ fn encode_exclude_patterns(patterns: &[String]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn excluded_path(patterns: &[Vec<u8>], path: &str) -> bool {
-    let mut candidate = Some(path);
+fn excluded_path(patterns: &[Vec<u8>], path: &WirePath) -> bool {
+    let display = path.to_string();
+    let mut candidate = Some(display.as_str());
     while let Some(value) = candidate {
         if patterns.iter().any(|pattern| {
             std::str::from_utf8(pattern)
@@ -3286,6 +3382,43 @@ fn expect_ack<R: Read>(decoder: &mut FrameDecoder, reader: &mut R) -> Result<(),
         )));
     }
     Ok(())
+}
+
+fn expect_ack_or_delete_warning<R: Read>(
+    decoder: &mut FrameDecoder,
+    reader: &mut R,
+) -> Result<Option<String>, ServerError> {
+    let frame = decoder
+        .read(reader)
+        .map_err(|e| map_transport_error(e, 0))?;
+    match frame.message {
+        Message::Ack { .. } => Ok(None),
+        Message::Error {
+            code: 1001,
+            message,
+            ..
+        } => Ok(Some(message)),
+        other => Err(ServerError::UnexpectedMessage(format!(
+            "expected Ack or delete warning, got {other:?}"
+        ))),
+    }
+}
+
+fn record_delete_failure<F: FnMut(LocalEvent)>(
+    report: &mut LocalSyncReport,
+    emit: &mut F,
+    entry: &FileEntry,
+    error: impl std::fmt::Display,
+) {
+    let path = entry.path.to_string();
+    let message = format!("delete '{path}' failed: {error}");
+    report.failed_entries = report.failed_entries.saturating_add(1);
+    report.warnings = report.warnings.saturating_add(1);
+    emit(LocalEvent::Warning {
+        path: path.clone(),
+        message: message.clone(),
+    });
+    emit(LocalEvent::Failed { path, message });
 }
 
 /// Multi-stream PUSH (Story 4.2): one control session owns planning, metadata,
@@ -3466,7 +3599,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     let mut mapped = Vec::new();
     for mut entry in source_entries {
         if !prefix.is_empty() {
-            entry.path = format!("{prefix}/{}", entry.path);
+            entry.path = entry.path.with_prefix(&WirePath::from(prefix.as_str()));
         }
         mapped.push(entry);
     }
@@ -3492,7 +3625,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     });
     for entry in &plan.files.unchanged {
         emit(LocalEvent::Skipped {
-            path: entry.path.clone(),
+            path: entry.path.to_string(),
             bytes: entry.size,
         });
     }
@@ -3517,12 +3650,12 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         }
         for sym in plan.symlinks.new.iter().chain(&plan.symlinks.changed) {
             let local = if prefix.is_empty() {
-                source_path.join(&sym.path)
+                sym.path.to_native_path(source_path)
             } else {
                 source_path.join(
                     sym.path
-                        .strip_prefix(&format!("{prefix}/"))
-                        .unwrap_or(&sym.path),
+                        .strip_prefix(format!("{prefix}/"))
+                        .unwrap_or_else(|| sym.path.clone()),
                 )
             };
             let target = fs::read_link(&local)?;
@@ -3557,7 +3690,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     }
 
     // Control: prepare each large file and read its resume pages (verified ranges).
-    let mut verified_by_path: HashMap<String, Vec<ByteRange>> = HashMap::new();
+    let mut verified_by_path: HashMap<WirePath, Vec<ByteRange>> = HashMap::new();
     let mut control_large_ids: Vec<(u64, FileEntry)> = Vec::new();
     for file in &large_files {
         let file_id = calloc();
@@ -3609,16 +3742,16 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             let mut f = file.clone();
             f.path = file
                 .path
-                .strip_prefix(&format!("{prefix}/"))
-                .unwrap_or(&file.path)
-                .to_owned();
+                .strip_prefix(format!("{prefix}/"))
+                .unwrap_or_else(|| file.path.clone())
+                .clone();
             f
         };
         let stable = match source_reader.read(&file_to_read) {
             Ok(s) => s,
             Err(err) => {
                 emit(LocalEvent::Failed {
-                    path: file.path.clone(),
+                    path: file.path.to_string(),
                     message: err.to_string(),
                 });
                 report.failed_entries = report.failed_entries.saturating_add(1);
@@ -3654,7 +3787,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         report.physical_bytes = report.physical_bytes.saturating_add(file.size);
         report.byte_copies = report.byte_copies.saturating_add(1);
         emit(LocalEvent::Transferred {
-            path: file.path.clone(),
+            path: file.path.to_string(),
             bytes: file.size,
             physical_bytes: file.size,
             method: TransferMethod::ByteCopy,
@@ -3665,9 +3798,9 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     let chunk = 8 * 1024 * 1024u64;
     // Per data-session work grouped by file path, so each session prepares each
     // file exactly once and then writes that file's disjoint ranges.
-    let mut grouped: Vec<HashMap<String, (FileEntry, Vec<ByteRange>)>> =
+    let mut grouped: Vec<HashMap<WirePath, (FileEntry, Vec<ByteRange>)>> =
         (0..streams).map(|_| HashMap::new()).collect();
-    let mut assigned_by_path: HashMap<String, Vec<ByteRange>> = HashMap::new();
+    let mut assigned_by_path: HashMap<WirePath, Vec<ByteRange>> = HashMap::new();
     let mut round = 0usize;
     for file in &large_files {
         let verified = verified_by_path
@@ -3727,7 +3860,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         handles
     };
 
-    let written: Vec<Result<(Vec<(String, Vec<ByteRange>)>, u64), ServerError>> = data_threads
+    let written: Vec<Result<(Vec<(WirePath, Vec<ByteRange>)>, u64), ServerError>> = data_threads
         .into_iter()
         .map(|h| {
             h.join().unwrap_or_else(|_| {
@@ -3737,14 +3870,14 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             })
         })
         .collect();
-    let mut written_by_path: HashMap<String, Vec<ByteRange>> = HashMap::new();
+    let mut written_by_path: HashMap<WirePath, Vec<ByteRange>> = HashMap::new();
     for result in written {
         let (ranges, wire_bytes) = result?;
         report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes);
         for (path, mut rs) in ranges {
             if let Some(file) = large_files.iter().find(|file| file.path == path) {
                 emit(LocalEvent::Progress {
-                    path: path.clone(),
+                    path: path.to_string(),
                     stream: 0,
                     completed: rs.iter().map(|range| range.length).sum(),
                     total: file.size,
@@ -3786,7 +3919,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         report.physical_bytes = report.physical_bytes.saturating_add(physical);
         report.byte_copies = report.byte_copies.saturating_add(1);
         emit(LocalEvent::Transferred {
-            path: file.path.clone(),
+            path: file.path.to_string(),
             bytes: file.size,
             physical_bytes: physical,
             method: TransferMethod::ByteCopy,
@@ -3795,16 +3928,28 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
 
     if !options.dry_run {
         // Barrier reached: all ranges are durably written. Finish large files.
-        // The finish digest is zeroed: the striped path owns durability through
-        // the per-range journal checkpoints, not an end-of-transfer whole-file
-        // readback (which would buffer the entire file).
-        for (file_id, _file) in &control_large_ids {
+        // Paranoid mode supplies a complete source digest so the receiver can
+        // validate the published striped file after the final rename.
+        for (file_id, file) in &control_large_ids {
+            let digest = if options.paranoid {
+                let source_relative = if prefix.is_empty() {
+                    file.path.clone()
+                } else {
+                    file.path
+                        .strip_prefix(format!("{prefix}/"))
+                        .unwrap_or_else(|| file.path.clone())
+                        .clone()
+                };
+                *hash_file_streaming(&source_relative.to_native_path(source_path))?.as_bytes()
+            } else {
+                [0u8; 32]
+            };
             write_frame(
                 &mut cwriter,
                 calloc(),
                 &Message::LargeFileFinish {
                     file_id: *file_id,
-                    digest: [0u8; 32],
+                    digest,
                 },
             )?;
             expect_ack(&mut cdec, &mut creader)?;
@@ -3868,8 +4013,20 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                         mtime_ns: 0,
                     },
                 )?;
-                expect_ack(&mut cdec, &mut creader)?;
-                emit(LocalEvent::Deleted { path: entry.path });
+                match expect_ack_or_delete_warning(&mut cdec, &mut creader)? {
+                    Some(message) => record_delete_failure(
+                        &mut report,
+                        &mut emit,
+                        &entry,
+                        ServerError::RemoteError {
+                            code: 1001,
+                            message,
+                        },
+                    ),
+                    None => emit(LocalEvent::Deleted {
+                        path: entry.path.to_string(),
+                    }),
+                }
             }
         }
 
@@ -3918,6 +4075,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
         failed_entries: report.failed_entries,
+        deleted_entries: report.deleted_entries,
         warnings: report.warnings,
         local_workers: options.local_workers,
         streams,
@@ -3929,6 +4087,8 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         resumed_bytes: report.resumed_bytes,
         retransmitted_bytes: report.retransmitted_bytes,
         checkpoint_bytes: report.checkpoint_bytes,
+        checksum_cache_hits: report.checksum_cache_hits,
+        checksum_cache_misses: report.checksum_cache_misses,
     });
 
     Ok(report)
@@ -3936,7 +4096,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
 
 /// Drive one data-only `--server` session (Story 4.2), handshaking with the
 /// `CAP_DATA_ONLY` capability bit and writing the assigned large-file ranges.
-type DataThreadResult = (Vec<(String, Vec<ByteRange>)>, u64);
+type DataThreadResult = (Vec<(WirePath, Vec<ByteRange>)>, u64);
 ///
 /// # Errors
 /// Returns [`ServerError`] on protocol or transport failure.
@@ -4053,7 +4213,7 @@ fn run_data_inner(
     expect_ack(&mut decoder, &mut reader)?;
 
     let source_reader = SourceReader::new(source_path);
-    let mut written: Vec<(String, Vec<ByteRange>)> = Vec::new();
+    let mut written: Vec<(WirePath, Vec<ByteRange>)> = Vec::new();
     let mut wire_bytes = 0_u64;
     for (file, ranges) in work {
         // Read the file once as the source for this session's slices.
@@ -4061,9 +4221,9 @@ fn run_data_inner(
             file.path.clone()
         } else {
             file.path
-                .strip_prefix(&format!("{prefix}/"))
-                .unwrap_or(&file.path)
-                .to_owned()
+                .strip_prefix(format!("{prefix}/"))
+                .unwrap_or_else(|| file.path.clone())
+                .clone()
         };
         let mut file_to_read = file.clone();
         file_to_read.path = rel;
@@ -4330,6 +4490,50 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use tempfile::tempdir;
+
+    #[test]
+    fn entry_record_round_trips_invalid_utf8_path_bytes() {
+        let record = EntryRecord {
+            path: b"bad-\xff-name".to_vec(),
+            kind: crate::protocol::EntryKind::File,
+            size: 3,
+            mtime_ns: 0,
+            mode: 0o644,
+            fingerprint: [0; 32],
+        };
+        let entry = file_entry_from_entry_record(&record).unwrap();
+        assert_eq!(entry.path.as_bytes(), b"bad-\xff-name");
+        assert_eq!(entry_record_from_file_entry(&entry).path, record.path);
+    }
+
+    #[test]
+    fn delete_failure_is_reported_as_a_warning_and_partial_failure() {
+        let entry = FileEntry {
+            path: WirePath::from("stale.txt"),
+            kind: ScanEntryKind::File,
+            size: 0,
+            mtime: UNIX_EPOCH,
+            mode: 0o644,
+            fingerprint: SourceFingerprint::synthetic(ScanEntryKind::File, 0, UNIX_EPOCH),
+        };
+        let mut report = LocalSyncReport::default();
+        let mut events = Vec::new();
+        record_delete_failure(
+            &mut report,
+            &mut |event| events.push(event),
+            &entry,
+            ServerError::RemoteError {
+                code: 1001,
+                message: "permission denied".to_owned(),
+            },
+        );
+
+        assert_eq!(report.failed_entries, 1);
+        assert_eq!(report.warnings, 1);
+        assert!(report.partial_failure());
+        assert!(matches!(events.first(), Some(LocalEvent::Warning { .. })));
+        assert!(matches!(events.get(1), Some(LocalEvent::Failed { .. })));
+    }
 
     #[test]
     fn unrouted_segment_is_a_loud_error_not_a_silent_drop() {

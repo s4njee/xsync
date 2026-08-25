@@ -229,7 +229,7 @@ fn small_corpus(shape: &str) -> Vec<FileEntry> {
 
 fn file(path: impl Into<String>, size: u64) -> FileEntry {
     FileEntry {
-        path: path.into(),
+        path: xsync_core::path::WirePath::from(path.into().as_str()),
         kind: EntryKind::File,
         size,
         mtime: UNIX_EPOCH,

@@ -15,6 +15,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
+use globset::{Glob, GlobSetBuilder};
 use md5::{Digest as _, Md5};
 
 use crate::local::{LocalEvent, LocalSyncOptions, LocalSyncReport, TransferMethod};
@@ -312,12 +313,6 @@ pub fn validate_options(options: &LocalSyncOptions) -> Result<(), RsyncError> {
     if options.delete {
         return Err(RsyncError::UnsupportedOption("--delete"));
     }
-    if !options.exclude_patterns.is_empty() {
-        return Err(RsyncError::UnsupportedOption("--exclude"));
-    }
-    if options.dry_run {
-        return Err(RsyncError::UnsupportedOption("--dry-run"));
-    }
     if options.paranoid {
         return Err(RsyncError::UnsupportedOption("--paranoid"));
     }
@@ -371,7 +366,10 @@ pub fn sync_push<F: FnMut(LocalEvent)>(
 ) -> Result<LocalSyncReport, RsyncError> {
     validate_options(options)?;
     validate_peer(peer)?;
-    let entries = scan_source(source, source_trailing_slash)?;
+    let entries = apply_excludes(
+        scan_source(source, source_trailing_slash)?,
+        &options.exclude_patterns,
+    )?;
     let planned_files = entries.iter().filter(|e| e.kind == WireKind::File).count();
     let planned_bytes = entries
         .iter()
@@ -387,19 +385,37 @@ pub fn sync_push<F: FnMut(LocalEvent)>(
         files: planned_files,
         bytes: planned_bytes,
     });
+    if options.dry_run {
+        for entry in &entries {
+            emit(LocalEvent::Action {
+                path: display_wire_path(&entry.path),
+                action: "create",
+            });
+        }
+    }
 
-    let command_args: [&[u8]; 9] = [
-        b"rsync",
-        b"--server",
-        b"-lptrW",
-        b"-e.Cv",
-        b"--dirs",
-        b"--force",
-        b"--no-inc-recursive",
-        b".",
-        destination.as_bytes(),
+    let mut command_args = vec![
+        b"rsync".to_vec(),
+        b"--server".to_vec(),
+        b"-lptrW".to_vec(),
+        b"-e.Cv".to_vec(),
+        b"--dirs".to_vec(),
+        b"--force".to_vec(),
+        b"--no-inc-recursive".to_vec(),
     ];
-    let mut child = remote_command(rsh, host, &command_args)?
+    command_args.extend(
+        options
+            .exclude_patterns
+            .iter()
+            .map(|pattern| format!("--exclude={pattern}").into_bytes()),
+    );
+    if options.dry_run {
+        command_args.push(b"--dry-run".to_vec());
+    }
+    command_args.push(b".".to_vec());
+    command_args.push(destination.as_bytes().to_vec());
+    let command_refs: Vec<&[u8]> = command_args.iter().map(Vec::as_slice).collect();
+    let mut child = remote_command(rsh, host, &command_refs)?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -418,7 +434,13 @@ pub fn sync_push<F: FnMut(LocalEvent)>(
 
     let mut reader = BufReader::new(stdout);
     let mut writer = CountingWriter::new(BufWriter::new(stdin));
-    let mut result = run_session(&mut reader, &mut writer, &entries, &mut emit);
+    let mut result = run_session(
+        &mut reader,
+        &mut writer,
+        &entries,
+        &mut emit,
+        options.dry_run,
+    );
     let wire_bytes = writer.bytes;
     drop(reader);
     drop(writer);
@@ -480,6 +502,7 @@ fn run_session<R: Read, W: Write, F: FnMut(LocalEvent)>(
     writer: &mut W,
     entries: &[WireEntry],
     emit: &mut F,
+    dry_run: bool,
 ) -> Result<LocalSyncReport, RsyncError> {
     write_i32(writer, RSYNC_WIRE_VERSION)?;
     writer.flush()?;
@@ -570,8 +593,10 @@ fn run_session<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     ));
                 }
                 send_file_data(&mut output, entry, sums)?;
-                report.physical_bytes = report.physical_bytes.saturating_add(entry.size);
-                if !requested[index] {
+                if !dry_run {
+                    report.physical_bytes = report.physical_bytes.saturating_add(entry.size);
+                }
+                if !requested[index] && !dry_run {
                     requested[index] = true;
                     report.transferred_files = report.transferred_files.saturating_add(1);
                     report.transferred_bytes = report.transferred_bytes.saturating_add(entry.size);
@@ -596,7 +621,7 @@ fn run_session<R: Read, W: Write, F: FnMut(LocalEvent)>(
     expect_done(&mut incoming_indexes, &mut input, "final goodbye")?;
 
     for (index, entry) in entries.iter().enumerate() {
-        if entry.kind == WireKind::File && !requested[index] {
+        if entry.kind == WireKind::File && !requested[index] && !dry_run {
             report.skipped_files = report.skipped_files.saturating_add(1);
             emit(LocalEvent::Skipped {
                 path: display_wire_path(&entry.path),
@@ -638,6 +663,7 @@ fn emit_finished<F: FnMut(LocalEvent)>(report: &LocalSyncReport, emit: &mut F) {
         wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
         failed_entries: 0,
+        deleted_entries: 0,
         warnings: 0,
         local_workers: 1,
         streams: 1,
@@ -649,6 +675,8 @@ fn emit_finished<F: FnMut(LocalEvent)>(report: &LocalSyncReport, emit: &mut F) {
         resumed_bytes: 0,
         retransmitted_bytes: report.physical_bytes,
         checkpoint_bytes: 0,
+        checksum_cache_hits: 0,
+        checksum_cache_misses: 0,
     });
 }
 
@@ -747,6 +775,42 @@ fn send_file_data<W: Write>(
         });
     }
     Ok(())
+}
+
+fn apply_excludes(
+    entries: Vec<WireEntry>,
+    patterns: &[String],
+) -> Result<Vec<WireEntry>, RsyncError> {
+    if patterns.is_empty() {
+        return Ok(entries);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).map_err(|error| {
+            RsyncError::InvalidPath(format!("invalid exclude pattern: {error}"))
+        })?;
+        builder.add(glob);
+    }
+    let matcher = builder
+        .build()
+        .map_err(|error| RsyncError::InvalidPath(format!("invalid exclude patterns: {error}")))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            let display = String::from_utf8_lossy(&entry.path);
+            if matcher.is_match(display.as_ref()) {
+                return false;
+            }
+            let mut prefix = display.as_ref();
+            while let Some((ancestor, _)) = prefix.rsplit_once('/') {
+                if matcher.is_match(ancestor) {
+                    return false;
+                }
+                prefix = ancestor;
+            }
+            true
+        })
+        .collect())
 }
 
 fn scan_source(source: &Path, trailing_slash: bool) -> Result<Vec<WireEntry>, RsyncError> {
@@ -1488,6 +1552,48 @@ mod tests {
                 .as_bytes(),
             b"'rsync' '--server' \"$HOME\"/'nested'"
         );
+    }
+
+    #[test]
+    fn excludes_filter_files_and_descendants_for_rsync_fallback() {
+        let entry = |path: &[u8], kind: WireKind| WireEntry {
+            source: PathBuf::from("source"),
+            path: path.to_vec(),
+            kind,
+            size: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            mode: 0o644,
+            link_target: Vec::new(),
+            top_level: false,
+        };
+        let entries = apply_excludes(
+            vec![
+                entry(b"keep.txt", WireKind::File),
+                entry(b"skip", WireKind::Directory),
+                entry(b"skip/child.txt", WireKind::File),
+                entry(b"nested/debug.log", WireKind::File),
+            ],
+            &["skip".to_owned(), "*.log".to_owned()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.path.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"keep.txt".as_slice()]
+        );
+    }
+
+    #[test]
+    fn rsync_fallback_accepts_dry_run() {
+        let options = LocalSyncOptions {
+            dry_run: true,
+            ..LocalSyncOptions::default()
+        };
+        assert!(validate_options(&options).is_ok());
     }
 
     #[test]
