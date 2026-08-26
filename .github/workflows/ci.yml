@@ -87,3 +87,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: cargo check --workspace --locked
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      # Advisories and policy are checked against the committed lockfile, which
+      # is the same resolution every other job builds with --locked.
+      - uses: taiki-e/install-action@cargo-deny
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Licences, bans, and sources
+        run: cargo deny --all-features check
+      - name: Security advisories
+        run: cargo audit --deny warnings

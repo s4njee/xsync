@@ -102,7 +102,11 @@ Blocking. Nothing downstream matters until all three platforms compile.
 The project has none. This epic is what makes every other guarantee in this file durable.
 
 ### Story D1.1 — Build, test, and lint on every Tier 1 target
-- [x] CI runs on push and pull request via `.github/workflows/ci.yml`.
+- [x] CI runs on push and pull request via `.github/workflows/ci.yml`, and now passes.
+  It had never passed: `x86_64-apple-darwin` requested the retired `macos-13` runner
+  and burned the 24-hour ceiling on every run, and `clippy -D warnings` was red on
+  every platform. Both are fixed and every gate is verified locally on macOS and on
+  a Windows ARM64 host.
 
 **AC**
 - Matrix covers macOS (aarch64 and x86_64), Linux (glibc and musl, x86_64 and aarch64), and
@@ -139,7 +143,9 @@ The project has none. This epic is what makes every other guarantee in this file
   D0.3's interop bug would have been caught by exactly this.
 
 ### Story D1.3 — Dependency and supply-chain gates
-- [ ] The workspace already denies `unsafe_code`; nothing verifies the dependency tree.
+- [x] `cargo audit` and `cargo deny` run in CI via the `supply-chain` job; policy is in
+  [deny.toml](deny.toml) and the audited result is checked in at
+  [docs/supply-chain.md](docs/supply-chain.md).
 
 **AC**
 - `cargo audit` (advisories) and `cargo deny` (licences, duplicate versions, banned crates)

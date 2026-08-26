@@ -1,0 +1,52 @@
+# Supply-chain policy for xsync (DEPLOYMENT.md story D1.3).
+#
+# Enforced in CI by `cargo deny check`. The intent is that CI fails on *new*
+# findings: anything accepted here is recorded with the reason it was accepted,
+# so an addition is a deliberate edit to this file rather than a silent pass.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Reviewed and accepted. Each entry needs a reason; unmaintained is tolerated
+# only where the crate is transitive, small, and not security-sensitive.
+ignore = [
+  { id = "RUSTSEC-2025-0119", reason = "number_prefix is unmaintained. It is a transitive dependency of indicatif used only to format human-readable byte counts in progress output. It parses no untrusted input and has no unsafe code. Revisit when indicatif drops it." },
+]
+
+[licenses]
+version = 2
+# Every licence observed in the tree as of 2026-08-26. All are permissive and
+# compatible with the crate's declared "MIT OR Apache-2.0".
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "Unlicense",
+  "CC0-1.0",
+  "Unicode-3.0",
+]
+# A dual/multi licence is satisfied if any option is allowed above, so a crate
+# offering "MIT OR Apache-2.0 OR LGPL-2.1-or-later" passes on its MIT option
+# without pulling an LGPL obligation into the build.
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions are a size and audit-surface problem, not a correctness
+# one, and the three below are forced by upstream rather than by our own
+# manifests. Warn so new ones are visible without blocking the build on a
+# transitive dependency we do not control.
+multiple-versions = "warn"
+# A wildcard version requirement from crates.io is a real hazard; a `path`
+# dependency inside this workspace is not, and every one of ours is a path
+# dependency, so allow those specifically rather than disabling the check.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Everything must come from crates.io. An unknown registry or a git dependency
+# is how a supply-chain substitution arrives, and neither is expected here.
+unknown-registry = "deny"
+unknown-git = "deny"

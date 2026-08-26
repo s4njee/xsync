@@ -28,7 +28,10 @@ clap = { version = "4.5", features = ["derive"] }
 indicatif = "0.17"
 serde_json = "1"
 thiserror = "2"
-xsync-core = { path = "../xsync-core" }
+# A path dependency alone cannot be published: crates.io needs a version
+# requirement to resolve against. Keep this in step with workspace.package
+# version on release (D2.3).
+xsync-core = { path = "../xsync-core", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3"

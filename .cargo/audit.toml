@@ -1,0 +1,9 @@
+# cargo-audit reads this file, not deny.toml, so an advisory accepted for the
+# build has to be recorded in both places. The reasoning lives in
+# docs/supply-chain.md; keep the two lists in step.
+[advisories]
+ignore = [
+    # number_prefix is unmaintained, not vulnerable. Transitive via indicatif,
+    # used only to format human-readable byte counts in progress output.
+    "RUSTSEC-2025-0119",
+]
