@@ -354,15 +354,17 @@ fn test_rsync_remote_destination_is_shell_quoted() {
     let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), true) else {
         return;
     };
-    let marker = std::env::current_dir()
-        .unwrap()
-        .join("XSYNC_RSYNC_INJECTION_MARKER");
-    let _ = fs::remove_file(&marker);
+    // The injected `touch` uses a relative path, so it lands in the child's
+    // working directory. Give the child a tempdir of its own so a regression
+    // drops the canary in scratch space rather than in the crate directory.
+    let cwd = tempdir().unwrap();
+    let marker = cwd.path().join("XSYNC_RSYNC_INJECTION_MARKER");
     let hostile = base
         .path()
         .join("dst'; touch XSYNC_RSYNC_INJECTION_MARKER; echo '");
 
     let output = Command::new(xsync_bin())
+        .current_dir(cwd.path())
         .arg("-e")
         .arg(&fake_rsh)
         .arg(format!("{}/", src.path().display()))

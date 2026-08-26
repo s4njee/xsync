@@ -6,3 +6,19 @@ target/
 __pycache__/
 *.pyc
 /corpora/
+
+# Accidental sync destinations: running `xs <src> xs` (or similar) from a crate
+# directory writes generated test corpora into a literal `xs/` directory.
+# Nothing in this repo is legitimately named `xs/`; the binary is target/*/xs.
+xs/
+
+# Raw benchmark run artifacts. benches/results/tuning holds ~22.6k per-run
+# JSON files (~268 KB each, ~715 MB) that are regenerable bench output and
+# dominated the tracked-file count. Keep the human-readable summaries
+# (DECISION.md / README.md / matrix.md / report-*.md), drop the raw data.
+benches/results/tuning/**
+!benches/results/tuning/**/
+!benches/results/tuning/**/*.md
+
+# macOS finder droppings (4 were previously tracked under benches/results)
+.DS_Store
