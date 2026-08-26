@@ -206,7 +206,20 @@ Unsigned binaries are actively hostile to install on macOS and Windows. This epi
 separates "a binary exists" from "a stranger can run it."
 
 ### Story D3.1 — macOS signing and notarization
-- [ ] An unsigned, un-notarized binary is blocked by Gatekeeper on download.
+- [~] Deferred deliberately, with expectations documented rather than discovered.
+
+  Gatekeeper blocks only files carrying `com.apple.quarantine`, which is applied by the
+  *downloading application* — browsers, Mail, AirDrop — and **not** by `curl`, `wget`,
+  Homebrew, or `cargo`. Verified: a `curl`-fetched release tarball carries
+  `com.apple.provenance` and no quarantine attribute. For a CLI installed the way CLIs are
+  installed, unsigned binaries run without a prompt; the browser-download path is the only
+  one that is hostile. Binaries are already ad-hoc linker-signed, which is what lets them
+  execute on Apple Silicon at all.
+
+  Completing this needs a Developer ID Application certificate (Apple Developer Program,
+  paid). The release workflow has a fail-closed hook so adding one is a secrets change
+  rather than a pipeline rewrite. Note this is unrelated to the App Store, which uses a
+  different certificate and a review process.
 
 **AC**
 - Binaries are signed with a Developer ID Application certificate and hardened runtime, then
@@ -218,7 +231,14 @@ separates "a binary exists" from "a stranger can run it."
   closed if they are absent.
 
 ### Story D3.2 — Windows Authenticode signing
-- [ ] SmartScreen penalises unsigned executables heavily.
+- [~] Deferred deliberately; the AC's documentation requirement is met.
+
+  SmartScreen is a browser-download concern: `curl`, `winget`, and `scoop` do not go
+  through it. An ordinary OV certificate does **not** clear the warning immediately —
+  reputation accrues per-certificate over time and download volume, and only an EV
+  certificate carries immediate reputation. Documented in
+  [docs/verifying-downloads.md](docs/verifying-downloads.md) so that is known before a
+  certificate is purchased rather than after. Fail-closed hook present as for D3.1.
 
 **AC**
 - The `.exe` is Authenticode-signed with a timestamp so signatures survive certificate
@@ -228,7 +248,13 @@ separates "a binary exists" from "a stranger can run it."
 - The installer from D4.4, if any, is signed as well as the binary.
 
 ### Story D3.3 — Linux integrity
-- [ ] Linux has no equivalent signing requirement, but distribution does.
+- [x] Every release publishes `SHA256SUMS` and a Sigstore-backed provenance attestation,
+  and the pipeline verifies the checksums describe the published artifacts before
+  publishing. Verification is documented in
+  [docs/verifying-downloads.md](docs/verifying-downloads.md), including what a checksum
+  alone does *not* prove. No GPG key is published: a key the user must obtain through
+  another trusted channel moves the problem rather than solving it, and the attestation
+  binds artifacts to the workflow run and commit with no key to distribute or lose.
 
 **AC**
 - Package repositories, if published, are signed with a documented key and rotation policy.

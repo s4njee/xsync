@@ -112,9 +112,47 @@ jobs:
           cd dist
           sha256sum ./* > SHA256SUMS
           cat SHA256SUMS
+      # Sigstore-backed, keyless: binds each artifact to this workflow run and
+      # commit, with no private key for the project to hold, rotate, or lose.
+      # This is the primary integrity story -- see docs/verifying-downloads.md.
       - uses: actions/attest-build-provenance@v1
         with:
           subject-path: dist/*
+
+      # Prove the published checksums actually describe the published files.
+      # A SHA256SUMS generated in the same step that moves the artifacts could
+      # be wrong in ways nobody notices until a user reports a bad download.
+      - name: Verify checksums against the artifacts
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check --strict SHA256SUMS
+          count=$(find . -type f ! -name SHA256SUMS | wc -l)
+          echo "verified $count artifacts"
+          if [ "$count" -lt 5 ]; then
+            echo "::error::expected one artifact per Tier 1 target, found $count"
+            exit 1
+          fi
+
+      # Signing is opt-in on secrets being present. It fails closed: a secret
+      # that is configured but unusable stops the release rather than silently
+      # publishing unsigned artifacts, which is the failure mode that matters.
+      # See docs/verifying-downloads.md for what is and is not signed today.
+      - name: macOS Developer ID signing
+        if: env.MACOS_CERT_P12 != ''
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+        run: |
+          echo "::error::macOS signing secret is set but the signing step is not implemented (D3.1)"
+          exit 1
+
+      - name: Windows Authenticode signing
+        if: env.WINDOWS_CERT_PFX != ''
+        env:
+          WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+        run: |
+          echo "::error::Windows signing secret is set but the signing step is not implemented (D3.2)"
+          exit 1
       - name: Publish release
         # Never on workflow_dispatch: that path exists precisely so the pipeline
         # can be exercised without producing a public release.
