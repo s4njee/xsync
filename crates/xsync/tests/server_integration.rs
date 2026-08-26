@@ -1206,3 +1206,90 @@ fn test_server_stdout_is_protocol_only() {
     }
     assert!(decoded_count >= 1);
 }
+
+#[test]
+fn test_failure_log_captures_a_fatal_client_error_as_json() {
+    // The error that ends a run was previously only ever plain text on stderr,
+    // so the single most important event was absent from machine-readable
+    // output entirely.
+    let log = tempdir().unwrap();
+    let log_path = log.path().join("failures.jsonl");
+    let dst = tempdir().unwrap();
+
+    let output = Command::new(xsync_bin())
+        .arg("--log-json")
+        .arg(&log_path)
+        .arg("definitely-not-a-real-source/")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+
+    let text = fs::read_to_string(&log_path).expect("failure log must exist");
+    let record: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(record["type"], "fatal");
+    assert_eq!(record["origin"], "client");
+    assert_eq!(record["schema_version"], 1);
+    assert!(record["message"]
+        .as_str()
+        .unwrap()
+        .contains("definitely-not-a-real-source"));
+}
+
+#[test]
+fn test_failure_log_appends_rather_than_truncating() {
+    // A post-mortem must survive the next run; truncating would destroy the
+    // record of the failure someone is trying to investigate.
+    let log = tempdir().unwrap();
+    let log_path = log.path().join("failures.jsonl");
+    let dst = tempdir().unwrap();
+
+    for _ in 0..2 {
+        Command::new(xsync_bin())
+            .arg("--log-json")
+            .arg(&log_path)
+            .arg("definitely-not-a-real-source/")
+            .arg(dst.path())
+            .output()
+            .unwrap();
+    }
+    let text = fs::read_to_string(&log_path).unwrap();
+    assert_eq!(text.lines().count(), 2, "second run must append: {text}");
+}
+
+#[test]
+fn test_failure_log_is_independent_of_progress_json() {
+    // The two are separate switches: a human-readable run still leaves a
+    // machine-readable failure record.
+    let log = tempdir().unwrap();
+    let log_path = log.path().join("failures.jsonl");
+    let dst = tempdir().unwrap();
+
+    let output = Command::new(xsync_bin())
+        .arg("--log-json")
+        .arg(&log_path)
+        .arg("definitely-not-a-real-source/")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    // Human output is retained alongside the structured record.
+    assert!(String::from_utf8_lossy(&output.stderr).contains("xs:"));
+    assert!(log_path.is_file());
+}
+
+#[test]
+fn test_unwritable_failure_log_is_reported_not_ignored() {
+    // Asking for failure records and silently not getting them is worse than
+    // being told immediately.
+    let dst = tempdir().unwrap();
+    let output = Command::new(xsync_bin())
+        .arg("--log-json")
+        .arg("/definitely/not/a/directory/failures.jsonl")
+        .arg("src/")
+        .arg(dst.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failure log"), "{stderr}");
+}

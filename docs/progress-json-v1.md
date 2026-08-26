@@ -37,3 +37,14 @@ Phase timing is represented by paired `phase` events. Consumers record the times
 `started: true` event and subtract it from the matching `started: false` event. Absent compression
 values are JSON `null`. New fields may be ignored; changes to existing field meanings require a
 new schema version.
+
+## Failure records
+
+A run that ends in an error now emits a `fatal` record before exiting; before,
+the error that ended the run was printed only as plain text and was the one
+event missing from this stream. Records relayed from the remote server appear
+here too, tagged `"origin":"server"`.
+
+These records follow [failure-log-v1.md](failure-log-v1.md), which is also what
+`--log-json` writes. They carry `origin`, `kind`, and `pid` in addition to the
+common fields above.

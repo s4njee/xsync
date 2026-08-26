@@ -15,6 +15,7 @@ pub mod bootstrap;
 pub mod clone;
 pub mod cloud;
 pub mod compression;
+pub mod faillog;
 pub mod hash_cache;
 pub mod journal;
 pub mod local;

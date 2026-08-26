@@ -56,8 +56,63 @@ use crate::strategy::{BATCH_TARGET_SIZE, MAX_BATCH_FILES, SMALL_FILE_LIMIT};
 
 /// Emit server lifecycle diagnostics without contaminating the binary
 /// protocol on stdout. Stderr is intentionally safe for SSH diagnostics.
+///
+/// With a failure log configured, the whole stream becomes JSON records rather
+/// than a mix of JSON and bare text, so the client can parse every line it
+/// relays instead of guessing which ones are structured.
 fn server_log(message: impl std::fmt::Display) {
+    if crate::faillog::is_enabled() {
+        let text = message.to_string();
+        crate::faillog::write(&crate::faillog::Record {
+            severity: crate::faillog::Severity::Info,
+            origin: crate::faillog::Origin::Server,
+            kind: "lifecycle",
+            path: None,
+            host: None,
+            message: &text,
+        });
+        return;
+    }
     eprintln!("[xsync server] {message}");
+}
+
+/// Report a server-side failure in human-readable form.
+///
+/// Structured records are written by exactly one place -- the binary's
+/// top-level error handler, which sees every failure including those raised
+/// before a session starts. Emitting here as well produced two records for one
+/// failure, so this reports only when nothing structured is being written.
+fn server_fail(error: &ServerError) {
+    if !crate::faillog::is_enabled() {
+        eprintln!("[xsync server] session failed: {error}");
+    }
+}
+
+impl ServerError {
+    /// Stable machine-readable family for this error.
+    ///
+    /// Kept deliberately coarse and separate from the `Display` text: the
+    /// message is for a human and may be reworded, while a consumer routing on
+    /// failures needs something it can match on that will not change with
+    /// wording. Grouping is by what an operator would *do* about it -- a path
+    /// problem is fixed differently from a transport one.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Protocol(_) | Self::UnexpectedMessage(_) | Self::Browse(_) => "protocol",
+            Self::Io(_) | Self::Sink(_) | Self::SourceRead(_) | Self::Journal(_) => "io",
+            Self::Scan(_) => "scan",
+            Self::Planner(_) => "plan",
+            Self::InvalidPath(_) | Self::SymlinkEscape(_) | Self::DuplicatePath(_) => "path",
+            Self::RemoteError { .. } => "remote",
+            Self::MissingRemoteXsync => "missing-remote-binary",
+            Self::RemoteFlagRejected => "remote-flag-rejected",
+            Self::Bootstrap(_) => "bootstrap",
+            Self::RemoteShellMismatch => "remote-shell",
+            Self::Transport { .. } => "transport",
+            Self::PeerDisconnected => "peer-disconnected",
+        }
+    }
 }
 
 /// Errors produced by server operations and remote protocol sessions.
@@ -110,6 +165,12 @@ pub enum ServerError {
     /// The remote shell positively reported that xsync is unavailable.
     #[error("xs not found on remote host — install it or check PATH")]
     MissingRemoteXsync,
+    /// The remote's argument parser refused a flag this build sent.
+    ///
+    /// Internal: the caller drops the flag for that host and retries, so a
+    /// logging preference never costs a transfer.
+    #[error("remote rejected a command-line flag")]
+    RemoteFlagRejected,
     /// Provisioning a binary onto a remote that lacked one failed.
     #[error("remote bootstrap failed: {0}")]
     Bootstrap(String),
@@ -3115,7 +3176,7 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
     let result = server.run(reader, &mut writer);
     match &result {
         Ok(()) => server_log("session finished successfully"),
-        Err(error) => server_log(format_args!("session failed: {error}")),
+        Err(error) => server_fail(error),
     }
     result
 }
@@ -6097,19 +6158,19 @@ where
 {
     let Some(host_name) = host else {
         let child = spawn_server_child_with_shell(remote_path, rsh, host, RemoteShell::Posix)?;
-        return run_server_child_session(child, RemoteShell::Posix, &mut f);
+        return run_server_child_session(child, RemoteShell::Posix, false, &mut f);
     };
 
     let mut shell = remote_shell_for(rsh, host_name);
     let child = spawn_server_child_with_shell(remote_path, rsh, host, shell)?;
-    let mut result = run_server_child_session(child, shell, &mut f);
+    let mut result = run_server_child_session(child, shell, rsh.is_none(), &mut f);
 
     // The POSIX form silently succeeded without running anything, which only
     // stock Windows cmd.exe does. Try the cmd form.
     if matches!(result, Err(ServerError::RemoteShellMismatch)) && shell == RemoteShell::Posix {
         shell = RemoteShell::Windows;
         let child = spawn_server_child_with_shell(remote_path, rsh, host, shell)?;
-        result = run_server_child_session(child, shell, &mut f);
+        result = run_server_child_session(child, shell, rsh.is_none(), &mut f);
         // Remember the family whenever the cmd form got further than the POSIX
         // one did, not only on a completed transfer: "the binary is missing"
         // is itself proof that cmd parsed the command, and bootstrap needs the
@@ -6117,6 +6178,15 @@ where
         if !matches!(result, Err(ServerError::RemoteShellMismatch)) {
             remember_remote_shell(rsh, host_name, shell);
         }
+    }
+
+    // An older remote refused `--log-json`. Drop it for this host and retry:
+    // structured remote records are a convenience, and a transfer must not fail
+    // because the far end is a version that cannot provide them.
+    if matches!(result, Err(ServerError::RemoteFlagRejected)) {
+        remember_log_json_rejected(rsh, host_name);
+        let child = spawn_server_child_with_shell(remote_path, rsh, host, shell)?;
+        result = run_server_child_session(child, shell, rsh.is_none(), &mut f);
     }
 
     // The remote answered but has no xsync. With bootstrap enabled, provision a
@@ -6145,10 +6215,15 @@ where
         eprintln!("bootstrap: checksum verified on {host_name}, running {uploaded}");
         remember_remote_program(rsh, host_name, uploaded);
         let child = spawn_server_child_with_shell(remote_path, rsh, host, shell)?;
-        result = run_server_child_session(child, shell, &mut f);
+        result = run_server_child_session(child, shell, rsh.is_none(), &mut f);
     }
 
     match result {
+        // Still refused after the flag was dropped: not a logging problem.
+        Err(ServerError::RemoteFlagRejected) => Err(ServerError::Transport {
+            stream: 0,
+            message: "remote rejected the server command line".to_owned(),
+        }),
         // Still silent after the cmd form was tried: not a shell problem.
         Err(ServerError::RemoteShellMismatch) => Err(ServerError::Transport {
             stream: 0,
@@ -6236,13 +6311,18 @@ fn xsync_remote_command(
     remote_path: &str,
     shell: RemoteShell,
     program: Option<&str>,
+    log_json: bool,
 ) -> Result<String, ServerError> {
     // A bootstrap-provisioned binary is addressed by absolute path; otherwise
     // the bare name is resolved from the remote's PATH.
     let program = program.unwrap_or("xs");
+    // `-` sends the remote's records to its stderr, which the client already
+    // captures and relays. The remote's stdout is the binary protocol and can
+    // never carry diagnostics.
+    let logging = if log_json { " '--log-json' '-'" } else { "" };
     match shell {
         RemoteShell::Posix => Ok(format!(
-            "PATH=\"$HOME/.local/bin:$PATH\" {} {} {}",
+            "PATH=\"$HOME/.local/bin:$PATH\" {}{logging} {} {}",
             quote_remote_arg_or_path(program),
             quote_remote_arg("--server"),
             quote_remote_path(remote_path)
@@ -6251,8 +6331,9 @@ fn xsync_remote_command(
         // `&&` so a `set` that reports failure still runs the server, matching
         // the POSIX form where the assignment prefix cannot fail independently.
         RemoteShell::Windows => Ok(format!(
-            "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & {} --server {}",
+            "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & {}{} --server {}",
             quote_windows_arg(program)?,
+            if log_json { " --log-json -" } else { "" },
             quote_windows_path(remote_path)?
         )),
     }
@@ -6283,6 +6364,61 @@ fn remote_shell_for(rsh: Option<&str>, host: &str) -> RemoteShell {
         .ok()
         .and_then(|map| map.get(&remote_shell_key(rsh, host)).copied())
         .unwrap_or_default()
+}
+
+/// Whether the remote server should be asked to emit structured records, and
+/// whether relayed records should also be echoed to this process's stdout.
+///
+/// Process-global rather than threaded through every entry point because it is
+/// a whole-run output preference, not a property of one transfer.
+static REMOTE_JSON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+const REMOTE_JSON_REQUESTED: u8 = 1;
+const REMOTE_JSON_ECHO_STDOUT: u8 = 2;
+
+/// Ask the remote server for structured records, and say whether relayed
+/// records should also go to this process's stdout event stream.
+pub fn configure_remote_logging(requested: bool, echo_stdout: bool) {
+    let mut bits = 0;
+    if requested {
+        bits |= REMOTE_JSON_REQUESTED;
+    }
+    if echo_stdout {
+        bits |= REMOTE_JSON_ECHO_STDOUT;
+    }
+    REMOTE_JSON.store(bits, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn remote_json_requested() -> bool {
+    REMOTE_JSON.load(std::sync::atomic::Ordering::Relaxed) & REMOTE_JSON_REQUESTED != 0
+}
+
+fn remote_json_echo_stdout() -> bool {
+    REMOTE_JSON.load(std::sync::atomic::Ordering::Relaxed) & REMOTE_JSON_ECHO_STDOUT != 0
+}
+
+/// Per-host opt-out, set when a remote rejected `--log-json`.
+///
+/// An older remote's argument parser refuses an unknown flag outright, so the
+/// request is dropped for that host and the session retried rather than failing
+/// a transfer over a logging preference.
+fn remote_json_unsupported() -> &'static std::sync::Mutex<HashSet<String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+fn remote_accepts_log_json(rsh: Option<&str>, host: &str) -> bool {
+    remote_json_requested()
+        && remote_json_unsupported()
+            .lock()
+            .is_ok_and(|set| !set.contains(&remote_shell_key(rsh, host)))
+}
+
+fn remember_log_json_rejected(rsh: Option<&str>, host: &str) {
+    if let Ok(mut set) = remote_json_unsupported().lock() {
+        set.insert(remote_shell_key(rsh, host));
+    }
 }
 
 /// Remote program to invoke, when bootstrap has uploaded one for this host.
@@ -6355,6 +6491,16 @@ pub(crate) fn base_remote_invocation(
 /// Default remote shell; replaced only by an explicit `-e/--rsh`.
 const DEFAULT_RSH: &str = "ssh";
 
+/// Whether a relayed line is one of the remote's structured records.
+///
+/// Deliberately shallow: a full parse would reject a record from a newer remote
+/// carrying a field this build does not know, and relaying it verbatim is
+/// exactly the right behaviour there.
+fn is_json_object(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with('{') && line.ends_with('}')
+}
+
 fn is_missing_xsync_stderr(stderr: &str, exit_code: Option<i32>) -> bool {
     let lower = stderr.to_lowercase();
     // 9009 is cmd.exe's "not recognized as an internal or external command".
@@ -6398,11 +6544,12 @@ pub fn remote_server_command_with_shell(
 ) -> Result<(String, Vec<String>), ServerError> {
     let program = host.and_then(|h| remote_program_for(rsh, h));
     let program = program.as_deref();
+    let log_json = host.is_some_and(|h| remote_accepts_log_json(rsh, h));
     match host {
         Some(h) => Ok(base_remote_invocation(
             rsh,
             h,
-            &xsync_remote_command(remote_path, shell, program)?,
+            &xsync_remote_command(remote_path, shell, program, log_json)?,
         )),
         // No host: the server runs locally as a child process with no shell in
         // between, so the arguments are passed through verbatim and none of the
@@ -6518,6 +6665,7 @@ impl<R: Read> Read for CountingReader<R> {
 fn run_server_child_session<F>(
     child: Child,
     shell: RemoteShell,
+    default_ssh: bool,
     f: F,
 ) -> Result<LocalSyncReport, ServerError>
 where
@@ -6568,9 +6716,26 @@ where
     // Relay the remote/ssh stderr so authentication, host-key, and other
     // diagnostics remain visible to the user (required for SSH UX). It is
     // empty for a clean in-process/fake-rsh session, so this adds no noise.
-    let trimmed = stderr_text.trim_end().to_owned();
-    if !trimmed.is_empty() {
-        eprintln!("{trimmed}");
+    //
+    // A remote asked for structured records emits one JSON object per line.
+    // Those are routed to the failure log and, when the client is emitting a
+    // JSON event stream, echoed to stdout. Anything else -- ssh's own messages,
+    // and everything an older remote produces -- is relayed as text exactly as
+    // before, so this degrades cleanly rather than swallowing diagnostics it
+    // does not recognise.
+    for line in stderr_text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        if is_json_object(line) {
+            crate::faillog::write_raw(line);
+            if remote_json_echo_stdout() {
+                println!("{line}");
+            }
+        } else {
+            eprintln!("{line}");
+        }
     }
 
     let exit_code = status.and_then(|s| s.code());
@@ -6581,25 +6746,34 @@ where
 
     let silent = bytes_from_remote.load(std::sync::atomic::Ordering::Relaxed) == 0;
 
-    // Nothing on the far end ever spoke the protocol. What that means depends
-    // on how the remote exited, and both cases were measured rather than
-    // assumed:
-    //
-    //   * Exit 0 with no output is the POSIX command string reaching stock
-    //     Windows `cmd.exe`, where `PATH` is a builtin: the whole command is
-    //     read as a `PATH` invocation that sets the search path to that literal
-    //     text and succeeds. Nothing runs and nothing is reported.
-    //   * A non-zero exit under the cmd form means cmd did run the command and
-    //     it failed. With no protocol bytes, the binary was not there --
-    //     cmd reports "is not recognized" and exits 1, not the 9009 its docs
-    //     suggest, so the code is not matched on and the localised message is
-    //     not parsed.
-    //
-    // ssh reserves 255 for its own failures (authentication, host key,
-    // connection), so those are excluded from both and a rejected credential
-    // still costs exactly one connection attempt.
+    // Nothing on the far end spoke the protocol, and ssh did not report one of
+    // its own failures (255: authentication, host key, connection). ssh's code
+    // is excluded so a rejected credential still costs exactly one connection.
     if result.is_err() && silent && exit_code != Some(255) {
-        if exit_code == Some(0) {
+        // clap exits 2 on an unrecognised argument: an older remote that does
+        // not know a flag this build sends.
+        if exit_code == Some(2) {
+            return Err(ServerError::RemoteFlagRejected);
+        }
+        // Exit 0 with no output is the POSIX command reaching stock Windows
+        // cmd.exe, where `PATH` is a builtin: the whole line is read as a `PATH`
+        // invocation that sets the search path to that literal text and
+        // succeeds, running nothing.
+        //
+        // A *non-zero* exit under the POSIX form means cmd tried to parse the
+        // line and refused it. That happens whenever the destination path
+        // contains a cmd metacharacter -- `C:/a<>b` makes cmd read `>` as
+        // redirection and fail with "was unexpected at this time" long before
+        // the PATH builtin swallows anything. Treating only the silent-success
+        // case as a shell mismatch made detection depend on the destination
+        // path happening to be benign under a shell we had not identified yet.
+        //
+        // Restricted to the default ssh transport: an explicit `-e` is a
+        // transport the caller chose, not a stock Windows sshd, and a server
+        // killed mid-transfer through such a helper also exits non-zero with no
+        // bytes read. Retrying there would re-run a session whose partial work
+        // and resume journal must be preserved.
+        if exit_code == Some(0) || (default_ssh && shell == RemoteShell::Posix) {
             return Err(ServerError::RemoteShellMismatch);
         }
         if shell == RemoteShell::Windows {

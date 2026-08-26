@@ -52,11 +52,18 @@ fn words(command: &str) -> Vec<String> {
     out
 }
 
-/// The server root is the word after `--server`.
+/// The server root is the last word of the remote command.
+///
+/// Taken positionally rather than as "the word after `--server`" so that adding
+/// another flag to the invocation cannot silently make the harness pass a flag
+/// name as the destination path.
 fn server_root(command: &str) -> Option<String> {
     let words = words(command);
-    let index = words.iter().position(|word| word == "--server")?;
-    words.get(index + 1).cloned()
+    words
+        .iter()
+        .position(|word| word == "--server")
+        .and_then(|_| words.last().cloned())
+        .filter(|last| !last.starts_with('-'))
 }
 
 /// Locate the `xs` binary built alongside this helper.

@@ -116,6 +116,16 @@ struct Cli {
     #[arg(long)]
     progress_json: bool,
 
+    /// Append structured failure records to FILE, or to stderr when FILE is `-`.
+    ///
+    /// Independent of `--progress-json`: failures are captured during ordinary
+    /// human-readable runs too, and the file survives a terminal nobody was
+    /// watching. Records append rather than truncate, so a post-mortem is not
+    /// destroyed by the next run. When a remote is involved, the far end's
+    /// records are relayed into the same log, tagged `"origin":"server"`.
+    #[arg(long, value_name = "FILE")]
+    log_json: Option<String>,
+
     /// Disable data compression (zstd).
     #[arg(long)]
     no_compress: bool,
@@ -143,14 +153,89 @@ struct Cli {
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+
+    // Configure the failure log before any work, so a failure during setup is
+    // captured too. A log that cannot be opened is reported and fatal: a caller
+    // who asked for failure records and silently did not get them is worse off
+    // than one told immediately.
+    if let Some(spec) = cli.log_json.as_deref() {
+        if let Err(error) = xsync_core::faillog::enable(spec) {
+            eprintln!("xs: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    // Ask the remote for structured records whenever this side is producing
+    // them, and echo relayed records into the stdout stream only when that
+    // stream exists.
+    xsync_core::server::configure_remote_logging(
+        cli.log_json.is_some() || cli.progress_json,
+        cli.progress_json,
+    );
+
     match run(&cli) {
         Ok(RunOutcome::Complete) => ExitCode::SUCCESS,
         Ok(RunOutcome::Partial) => ExitCode::from(xsync_core::local::PARTIAL_FAILURE_EXIT_CODE),
-        Err(e) => {
-            eprintln!("xs: {e}");
+        Err(error) => {
+            report_fatal(&cli, &error);
             ExitCode::FAILURE
         }
     }
+}
+
+/// Report the error that ended the run.
+///
+/// Previously this was only ever `eprintln!("xs: {e}")`, so the single most
+/// important event -- the thing that killed the run -- was the one event absent
+/// from the `--progress-json` stream. It now reaches every configured sink.
+fn report_fatal(cli: &Cli, error: &CliError) {
+    let message = error.to_string();
+    let authority = remote_authority(cli);
+    // `xs --server` runs through this same main, so the origin has to come from
+    // the role this process is playing. Hard-coding Client made the remote's own
+    // fatal arrive at the client's log labelled as client-origin, which is the
+    // one thing the field exists to distinguish.
+    let origin = if cli.server {
+        xsync_core::faillog::Origin::Server
+    } else {
+        xsync_core::faillog::Origin::Client
+    };
+    let record = xsync_core::faillog::Record {
+        severity: xsync_core::faillog::Severity::Fatal,
+        origin,
+        kind: error.kind(),
+        path: None,
+        host: authority.as_deref(),
+        message: &message,
+    };
+    xsync_core::faillog::write(&record);
+    if cli.progress_json {
+        println!("{}", xsync_core::faillog::render(&record));
+    }
+    // Keep the human line: stderr is where an operator looks, and a structured
+    // sink is an addition to that rather than a replacement. The exception is a
+    // server already writing records to its stderr -- there the plain line is
+    // relayed alongside the record that already carries it, so it is pure
+    // duplication in the client's output.
+    let structured_to_stderr = cli.server && cli.log_json.as_deref() == Some("-");
+    if !structured_to_stderr {
+        eprintln!("xs: {message}");
+    }
+}
+
+/// The remote authority this run concerns, when either side is remote.
+fn remote_authority(cli: &Cli) -> Option<String> {
+    for spec in [cli.src.as_deref(), cli.dest.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(parsed) = xsync_core::path::parse(spec) {
+            if let Some(authority) = parsed.authority() {
+                return Some(authority);
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +256,23 @@ enum CliError {
     Rsync(#[from] xsync_core::rsync::RsyncError),
     #[error("{0}")]
     Transport(String),
+}
+
+impl CliError {
+    /// Stable machine-readable family, for consumers routing on failures.
+    ///
+    /// Server errors delegate so the client and the remote report the same
+    /// vocabulary for the same condition: a consumer should not have to learn
+    /// two names for one transport failure depending on which end noticed it.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Path(_) => "path",
+            Self::Local(_) => "local",
+            Self::Server(error) => error.kind(),
+            Self::Rsync(_) => "rsync",
+            Self::Transport(_) => "transport",
+        }
+    }
 }
 
 /// Run the CLI command.
@@ -830,6 +932,34 @@ fn render_event(
     );
     if quiet && !is_error {
         return;
+    }
+    // Per-entry failures reach the failure log regardless of the display mode,
+    // so a plain human-readable run still leaves a machine-readable record of
+    // what went wrong.
+    if xsync_core::faillog::is_enabled() {
+        match &event {
+            xsync_core::local::LocalEvent::Failed { path, message } => {
+                xsync_core::faillog::write(&xsync_core::faillog::Record {
+                    severity: xsync_core::faillog::Severity::Failed,
+                    origin: xsync_core::faillog::Origin::Client,
+                    kind: "entry",
+                    path: Some(path),
+                    host: None,
+                    message,
+                });
+            }
+            xsync_core::local::LocalEvent::Warning { path, message } => {
+                xsync_core::faillog::write(&xsync_core::faillog::Record {
+                    severity: xsync_core::faillog::Severity::Info,
+                    origin: xsync_core::faillog::Origin::Client,
+                    kind: "warning",
+                    path: Some(path),
+                    host: None,
+                    message,
+                });
+            }
+            _ => {}
+        }
     }
     if progress_json {
         let mut value = json_event(&event);
