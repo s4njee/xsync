@@ -45,3 +45,18 @@ On 2026-08-25 from macOS, against `192.168.1.119` (`mars`, x86_64/ext4):
 
 The remaining ZFS, ext2/3, and aarch64 ext4 hosts require their own staging
 checks before the story is complete.
+
+## Matrix verification
+
+Run `scripts/verify-linux-staging.sh` to build both targets and probe all three
+host classes without stopping at the first unavailable host. Set
+`XSYNC_ZFS_HOST`, `XSYNC_EXT23_HOST`, and `XSYNC_ARM64_HOST` to local SSH
+aliases when the defaults are not available. Add `--stage` only after the
+probes pass; it stages to `/tmp/xsync-stage/xs` by default and can be changed
+with `XSYNC_REMOTE_PATH`.
+
+On 2026-08-26 this machine could reach `freya.local` (x86_64/ZFS), but the
+configured aarch64 host rejected the available SSH key and the prior
+`192.168.1.119` ext2/3 host timed out. The verifier records each as a blocker
+and still checks the other host, so a later run can complete the story without
+repeating the build manually.

@@ -399,6 +399,41 @@ them separately. Smaller files now use smaller read buffers, small files skip an
 attempt, and repeated temporary-name lookups reuse their path hash. The last change did not make
 the transfer faster in this five-run test, but every destination still matched the source.
 
+### Story T1.2b — Gate cloud-placeholder detection on the policy that uses it
+- [x] A fourth per-file waste item, not in the original T1.2 list because it did not exist
+  when T1.2 was written: `cloud::is_placeholder` spawns `/usr/bin/xattr` per regular file,
+  and ran under every policy including the default `Download`, whose behaviour does not
+  depend on the answer.
+
+**AC**
+- Detection runs only for `Skip` and `Error`.
+- The `CloudPlaceholders` event distinguishes "inspected and found none" from "did not
+  inspect", so the JSONL schema stays honest.
+- Measured independently on `congress-10k`, five repetitions, oracle passing on every run.
+
+**Progress:** Implemented and measured; evidence in
+[`benches/results/tuning/T1/cloud-detection-gate/`](../benches/results/tuning/T1/cloud-detection-gate/README.md).
+Back-to-back on the same host, xsync median CPU fell 29.388 s -> 7.013 s (4.2x) and median
+wall 39.609 s -> 8.217 s (4.8x), paired ratio 0.128 -> 0.867, all 20 oracles passing.
+
+**Caveat, and it is load-bearing:** the host was at load average 265 for both runs. The
+before run is `noisy` (26.8% baseline MAD) and is therefore **not gate-able evidence**; the
+after run is internally comparable at 4.7%. The result is reported because the same-run
+`rsync -a` baseline moved *against* the change (5.294 s -> 7.336 s), so contention cannot
+explain the direction — but **a rerun on an idle host is required before this is quoted as
+a T1 number.**
+
+**Note for every other T1 story:** `cloud.rs` was added in `8ca26cce`, four commits after
+the `f5e10179` revision stamped on all existing T1 reports. No checked-in baseline contains
+this cost, T1.3's recorded 0.515 ratio included, and TUNING.md §3's 1.9 ms/file predates it
+and is a separate finding.
+
+**Plain-English results:** xsync was starting a small helper program once for every single
+file just to ask a question whose answer it then ignored. It no longer asks unless the
+answer can change what it does. On an eleven-thousand-file corpus this cut processor time by
+about four times, and every copy still verified byte-for-byte. The machine was busy during
+the test, so the exact numbers need re-measuring on a quiet machine.
+
 ### Story T1.3 — Hit the syscall budget target
 - [~] Reduce total system time on `congress-10k` to within 1.5x of `rsync -a`.
 

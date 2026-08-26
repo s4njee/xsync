@@ -339,7 +339,12 @@ pub fn parse(spec: &str) -> Result<PathSpec, PathError> {
         return Err(PathError::Empty);
     }
 
-    let trailing_slash = spec.ends_with('/');
+    // A local path on Windows may end with either separator. A remote path is
+    // interpreted by the remote shell, where '\\' is a legal filename byte, so
+    // only '/' terminates a remote spec regardless of the local platform.
+    let is_remote_spec = find_remote_colon(spec).is_some();
+    let trailing_slash = spec.ends_with('/')
+        || (cfg!(windows) && !is_remote_spec && spec.ends_with('\\'));
     let spec = if trailing_slash {
         &spec[..spec.len() - 1]
     } else {
@@ -408,6 +413,37 @@ mod tests {
         assert_eq!(p.location, Location::Local);
         assert_eq!(p.path, "dir");
         assert!(!p.trailing_slash);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_local_trailing_backslash_is_a_trailing_separator() {
+        // rsync semantics: a trailing separator means "copy the contents of the
+        // directory", not the directory itself. On Windows '\\' is the native
+        // separator and must behave exactly like '/'.
+        let back = parse(r"C:\data\").unwrap();
+        assert!(!back.is_remote());
+        assert!(back.trailing_slash);
+        assert_eq!(back.path, r"C:\data");
+
+        let forward = parse("C:/data/").unwrap();
+        assert!(forward.trailing_slash);
+        assert_eq!(forward.path, "C:/data");
+
+        // No trailing separator keeps directory-itself semantics.
+        let bare = parse(r"C:\data").unwrap();
+        assert!(!bare.trailing_slash);
+        assert_eq!(bare.path, r"C:\data");
+    }
+
+    #[test]
+    fn remote_trailing_backslash_is_not_a_separator() {
+        // The remote shell interprets this path; '\\' is a legal filename byte
+        // there, so it must survive as part of the path on every platform.
+        let remote = parse(r"host:/data\").unwrap();
+        assert!(remote.is_remote());
+        assert!(!remote.trailing_slash);
+        assert_eq!(remote.path, r"/data\");
     }
 
     #[test]

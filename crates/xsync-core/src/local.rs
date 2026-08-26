@@ -119,6 +119,13 @@ pub enum LocalEvent {
         bytes: u64,
         /// Whether platform detection is available.
         detection_available: bool,
+        /// Whether this run actually inspected entries for placeholders.
+        ///
+        /// Detection costs a process spawn per file, so it runs only for the
+        /// policies whose outcome depends on the answer. When this is false
+        /// the counts are zero because nothing was inspected, not because no
+        /// placeholder exists — consumers must not read them as an inventory.
+        detection_performed: bool,
     },
     /// A regular file was published successfully.
     Transferred {
@@ -634,7 +641,7 @@ fn apply_directory_clones(
         let Some(source_relative) = paths.source_for_destination.get(&candidate_path) else {
             continue;
         };
-        let source_path = source_root.join(source_relative);
+        let source_path = source_relative.to_native_path(source_root);
         let target_path = sink.path_for(&candidate_path)?;
         let root = plan
             .directories
@@ -788,10 +795,13 @@ fn try_directory_fast_path(
         local_workers: options.local_workers,
         streams: options.streams,
     });
+    // The fast path is only reachable under `CloudFilesPolicy::Download`, and a
+    // whole-tree clone cannot filter individual entries, so nothing is inspected.
     emit(LocalEvent::CloudPlaceholders {
         files: 0,
         bytes: 0,
         detection_available: cfg!(target_os = "macos"),
+        detection_performed: false,
     });
     emit(LocalEvent::Planned {
         files: file_count,
@@ -942,7 +952,13 @@ fn prepare_transfer(
     let mut cloud_skipped = Vec::new();
     let mut cloud_files = 0;
     let mut cloud_bytes: u64 = 0;
-    if cloud::detection_available() {
+    // `cloud::is_placeholder` costs a process spawn per file, so only the
+    // policies whose outcome depends on the answer pay for it. Under
+    // `Download` every entry is retained either way, and the directory fast
+    // path already reports zero for exactly the same reason.
+    let detect_placeholders =
+        cloud::detection_available() && options.cloud_files != CloudFilesPolicy::Download;
+    if detect_placeholders {
         let mut retained = Vec::with_capacity(source_entries.len());
         for entry in source_entries {
             let is_placeholder = entry.kind == EntryKind::File
@@ -970,6 +986,7 @@ fn prepare_transfer(
         files: cloud_files,
         bytes: cloud_bytes,
         detection_available: cloud::detection_available(),
+        detection_performed: detect_placeholders,
     });
     let source_root_entry = (source_kind == EntryKind::Directory)
         .then(|| root_entry(source, source_kind))
@@ -1335,7 +1352,7 @@ fn apply_checksum_classification(
             changed.push(entry);
             continue;
         };
-        let source_path = source_root.join(source_relative);
+        let source_path = source_relative.to_native_path(source_root);
         let Ok(destination_path) = sink.path_for(&entry.path) else {
             changed.push(entry);
             continue;
@@ -1454,7 +1471,7 @@ fn transfer_symlinks(
             );
             continue;
         };
-        let source_path = source_reader_root.join(Path::new(source_relative));
+        let source_path = source_relative.to_native_path(source_reader_root);
         let target = match fs::read_link(&source_path) {
             Ok(target) => target,
             Err(error) => {
@@ -1512,7 +1529,7 @@ fn transfer_files(
             Some(FileTask {
                 source,
                 destination: destination.clone(),
-                source_path: source_reader_root.join(Path::new(source_relative)),
+                source_path: source_relative.to_native_path(source_reader_root),
             })
         })
         .collect();
@@ -1820,6 +1837,72 @@ mod tests {
             compress: true,
             compress_level: 3,
         }
+    }
+
+    fn cloud_placeholder_event(options: &LocalSyncOptions) -> (usize, u64, bool) {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        fs::create_dir_all(source.join("group")).unwrap();
+        for index in 0..4 {
+            fs::write(source.join(format!("group/file{index}")), b"payload").unwrap();
+        }
+        // An existing destination root defeats the whole-tree clone fast path,
+        // so the per-entry planning loop is the code under test. That is also
+        // the incremental case where per-file detection costs the most.
+        fs::create_dir_all(&destination).unwrap();
+
+        let mut observed = None;
+        sync(&source, true, &destination, false, options, |event| {
+            if let LocalEvent::CloudPlaceholders {
+                files,
+                bytes,
+                detection_performed,
+                ..
+            } = event
+            {
+                observed = Some((files, bytes, detection_performed));
+            }
+        })
+        .unwrap();
+        observed.expect("sync must emit exactly one CloudPlaceholders event")
+    }
+
+    #[test]
+    fn download_policy_does_not_inspect_entries_for_placeholders() {
+        // `cloud::is_placeholder` spawns a process per file. Under `Download`
+        // every entry is retained whatever the answer is, so the inspection is
+        // pure cost and must not run. The event reports that it did not look,
+        // rather than reporting zero placeholders as if it had.
+        let mut options = options();
+        options.cloud_files = CloudFilesPolicy::Download;
+
+        let (files, bytes, detection_performed) = cloud_placeholder_event(&options);
+        assert!(
+            !detection_performed,
+            "download policy must not inspect entries for placeholders"
+        );
+        assert_eq!(files, 0);
+        assert_eq!(bytes, 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn skip_policy_still_inspects_entries_for_placeholders() {
+        // The gate must not disable detection for the policies whose outcome
+        // genuinely depends on it.
+        let mut options = options();
+        options.cloud_files = CloudFilesPolicy::Skip;
+
+        let (files, bytes, detection_performed) = cloud_placeholder_event(&options);
+        assert!(
+            detection_performed,
+            "skip policy must inspect entries for placeholders"
+        );
+        // Ordinary temp files are not placeholders, so the inventory is empty
+        // — but it is an inventory, which is the distinction being asserted.
+        assert_eq!(files, 0);
+        assert_eq!(bytes, 0);
     }
 
     #[test]

@@ -4,6 +4,11 @@ This document is the compatibility contract for the v1 remote protocol. The
 Rust types in `xsync-core::protocol` implement this layout; Rust enum layout or
 the choice of serialization library is not observable on the wire.
 
+The canonical ownership and review process for both xsync and f2 is in
+[`docs/protocol-ownership.md`](docs/protocol-ownership.md). Changes to this
+document are not complete until the process there and the compatibility matrix
+have been followed.
+
 ## Envelope
 
 Every frame begins with this fixed 32-byte little-endian header, followed by

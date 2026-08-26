@@ -1575,13 +1575,13 @@ mod tests {
         assert_eq!(
             shell_command(&[b"rsync", b"--server", b"~"])
                 .unwrap()
-                .as_bytes(),
+                .as_encoded_bytes(),
             b"'rsync' '--server' \"$HOME\""
         );
         assert_eq!(
             shell_command(&[b"rsync", b"--server", b"~/nested"])
                 .unwrap()
-                .as_bytes(),
+                .as_encoded_bytes(),
             b"'rsync' '--server' \"$HOME\"/'nested'"
         );
     }

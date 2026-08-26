@@ -110,6 +110,12 @@ pub enum ServerError {
     /// The remote shell positively reported that xsync is unavailable.
     #[error("xs not found on remote host — install it or check PATH")]
     MissingRemoteXsync,
+    /// The remote was reached but its shell could not parse the server command.
+    ///
+    /// Raised for stock Windows OpenSSH, which hands the command to `cmd.exe`.
+    /// Internal: callers retry once with the Windows command form.
+    #[error("remote shell could not run the xsync server command")]
+    RemoteShellMismatch,
     /// A transport error occurred on the named stream.
     #[error("transport error on stream {stream}: {message}")]
     Transport {
@@ -2961,7 +2967,7 @@ impl Server {
                     if operation == MetadataOperation::CreateSymlink {
                         let rel_path = WirePath::from_wire(path)
                             .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
-                        let symlink_path = self.root.join(&rel_path);
+                        let symlink_path = rel_path.to_native_path(&self.root);
                         let target_path = fs::read_link(&symlink_path)?;
                         let target_bytes = target_path.into_os_string().into_encoded_bytes();
                         let metadata = fs::symlink_metadata(&symlink_path)?;
@@ -3118,10 +3124,14 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         local_workers: options.local_workers,
         streams: options.streams,
     });
+    // The remote routes do not implement placeholder detection at all: the
+    // counts are structurally zero, not an inventory. See the note on
+    // `LocalEvent::CloudPlaceholders::detection_performed`.
     emit(LocalEvent::CloudPlaceholders {
         files: 0,
         bytes: 0,
         detection_available: cfg!(target_os = "macos"),
+        detection_performed: false,
     });
 
     // 1. Send Handshake (Client is Source).
@@ -3441,7 +3451,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     .path
                     .strip_prefix(format!("{prefix}/"))
                     .unwrap_or_else(|| sym.path.clone());
-                source_reader_root.join(stripped)
+                stripped.to_native_path(&source_reader_root)
             };
             let target = fs::read_link(&local_sym_path)?;
             let target_bytes = target.into_os_string().into_encoded_bytes();
@@ -4038,10 +4048,14 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         local_workers: options.local_workers,
         streams: options.streams,
     });
+    // The remote routes do not implement placeholder detection at all: the
+    // counts are structurally zero, not an inventory. See the note on
+    // `LocalEvent::CloudPlaceholders::detection_performed`.
     emit(LocalEvent::CloudPlaceholders {
         files: 0,
         bytes: 0,
         detection_available: cfg!(target_os = "macos"),
+        detection_performed: false,
     });
 
     // 1. Send Handshake (Client is Sink).
@@ -4919,8 +4933,8 @@ pub fn sync_push_server<F: FnMut(LocalEvent)>(
             emit,
         );
     }
-    let child = spawn_server_child(dest_path, rsh, host)?;
-    run_server_child_session(child, |reader, writer| {
+    let mut emit = emit;
+    spawn_and_run_session(dest_path, rsh, host, |reader, writer| {
         run_client_push(
             source_path,
             source_trailing_slash,
@@ -4929,7 +4943,7 @@ pub fn sync_push_server<F: FnMut(LocalEvent)>(
             options,
             reader,
             writer,
-            emit,
+            &mut emit,
         )
     })
 }
@@ -5329,11 +5343,10 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             let local = if prefix.is_empty() {
                 sym.path.to_native_path(source_path)
             } else {
-                source_path.join(
-                    sym.path
-                        .strip_prefix(format!("{prefix}/"))
-                        .unwrap_or_else(|| sym.path.clone()),
-                )
+                sym.path
+                    .strip_prefix(format!("{prefix}/"))
+                    .unwrap_or_else(|| sym.path.clone())
+                    .to_native_path(source_path)
             };
             let target = fs::read_link(&local)?;
             write_frame(
@@ -5984,8 +5997,8 @@ pub fn sync_pull_server<F: FnMut(LocalEvent)>(
     host: Option<&str>,
     emit: F,
 ) -> Result<LocalSyncReport, ServerError> {
-    let child = spawn_server_child(src_path, rsh, host)?;
-    run_server_child_session(child, |reader, writer| {
+    let mut emit = emit;
+    spawn_and_run_session(src_path, rsh, host, |reader, writer| {
         run_client_pull(
             src_path,
             src_trailing_slash,
@@ -5994,9 +6007,66 @@ pub fn sync_pull_server<F: FnMut(LocalEvent)>(
             options,
             reader,
             writer,
-            emit,
+            &mut emit,
         )
     })
+}
+
+/// Spawn the remote server and run one client session against it, learning the
+/// remote shell family from the attempt rather than probing for it first.
+///
+/// A stock Windows OpenSSH host hands the command to `cmd.exe`, which cannot
+/// parse the POSIX form. That is only discoverable by trying, so the first
+/// session against an unknown host may cost one extra connection -- but only
+/// when the remote actually ran and rejected the command. An authentication or
+/// host-key failure returns ssh's 255 and is never retried, so a bad credential
+/// still produces exactly one connection attempt.
+///
+/// The learned family is cached per host, so later streams in the same job and
+/// later jobs in the same process go straight to the right form.
+fn spawn_and_run_session<F>(
+    remote_path: &str,
+    rsh: Option<&str>,
+    host: Option<&str>,
+    mut f: F,
+) -> Result<LocalSyncReport, ServerError>
+where
+    F: FnMut(
+        &mut BufReader<CountingReader<std::process::ChildStdout>>,
+        &mut BufWriter<std::process::ChildStdin>,
+    ) -> Result<LocalSyncReport, ServerError>,
+{
+    let Some(host_name) = host else {
+        let child = spawn_server_child_with_shell(remote_path, rsh, host, RemoteShell::Posix)?;
+        return run_server_child_session(child, &mut f);
+    };
+
+    let first = remote_shell_for(rsh, host_name);
+    let child = spawn_server_child_with_shell(remote_path, rsh, host, first)?;
+    let result = run_server_child_session(child, &mut f);
+
+    match result {
+        Err(ServerError::RemoteShellMismatch) if first == RemoteShell::Posix => {
+            let child = spawn_server_child_with_shell(
+                remote_path,
+                rsh,
+                host,
+                RemoteShell::Windows,
+            )?;
+            let retried = run_server_child_session(child, &mut f);
+            if retried.is_ok() {
+                remember_remote_shell(rsh, host_name, RemoteShell::Windows);
+            }
+            retried
+        }
+        // A mismatch when the Windows form was already in use is not a shell
+        // problem; report it as the transport failure it actually is.
+        Err(ServerError::RemoteShellMismatch) => Err(ServerError::Transport {
+            stream: 0,
+            message: "remote xsync server exited without completing the session".to_owned(),
+        }),
+        other => other,
+    }
 }
 
 fn parse_rsh_command(rsh: &str) -> Vec<String> {
@@ -6017,13 +6087,129 @@ fn quote_remote_path(path: &str) -> String {
     }
 }
 
-fn xsync_remote_command(remote_path: &str) -> String {
-    format!(
-        "PATH=\"$HOME/.local/bin:$PATH\" {} {} {}",
-        quote_remote_arg("xs"),
-        quote_remote_arg("--server"),
-        quote_remote_path(remote_path)
-    )
+/// Which shell the remote `sshd` will hand the command string to.
+///
+/// The command is a single string interpreted by the remote login shell, so its
+/// syntax is not portable: `PATH="$HOME/..." 'xs' '--server' '/p'` is correct
+/// POSIX and complete nonsense to `cmd.exe`, which is what stock Windows
+/// OpenSSH uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemoteShell {
+    /// A POSIX shell: `sh`, `bash`, `zsh`. The default everywhere but Windows.
+    #[default]
+    Posix,
+    /// Windows `cmd.exe`, the stock OpenSSH-for-Windows default shell.
+    Windows,
+}
+
+/// Quote one argument for `cmd.exe`.
+///
+/// Inside double quotes `cmd` treats `&`, `|`, `<`, `>` and `^` literally, so
+/// the only genuine hazards are an embedded quote (which ends the run) and `%`
+/// (which still expands `%VAR%` inside quotes and would leak or corrupt the
+/// path). Neither can be escaped reliably across `cmd` versions, so they are
+/// refused rather than mangled.
+fn quote_windows_arg(argument: &str) -> Result<String, ServerError> {
+    if argument.contains('"') || argument.contains('%') {
+        return Err(ServerError::InvalidPath(format!(
+            "remote Windows path may not contain '\"' or '%': {argument}"
+        )));
+    }
+    Ok(format!("\"{argument}\""))
+}
+
+fn quote_windows_path(path: &str) -> Result<String, ServerError> {
+    if path == "~" {
+        return Ok("\"%USERPROFILE%\"".to_owned());
+    }
+    if let Some(relative) = path.strip_prefix("~/") {
+        return Ok(format!("\"%USERPROFILE%\\{}\"", {
+            let quoted = quote_windows_arg(relative)?;
+            quoted.trim_matches('"').to_owned()
+        }));
+    }
+    quote_windows_arg(path)
+}
+
+fn xsync_remote_command(
+    remote_path: &str,
+    shell: RemoteShell,
+) -> Result<String, ServerError> {
+    match shell {
+        RemoteShell::Posix => Ok(format!(
+            "PATH=\"$HOME/.local/bin:$PATH\" {} {} {}",
+            quote_remote_arg("xs"),
+            quote_remote_arg("--server"),
+            quote_remote_path(remote_path)
+        )),
+        // `set "PATH=..." & xs --server "<path>"`. A single `&` rather than
+        // `&&` so a `set` that reports failure still runs the server, matching
+        // the POSIX form where the assignment prefix cannot fail independently.
+        RemoteShell::Windows => Ok(format!(
+            "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & xs --server {}",
+            quote_windows_path(remote_path)?
+        )),
+    }
+}
+
+/// Remote shell family remembered per `(rsh, host)` pair for this process.
+///
+/// Deliberately *not* a probe. An upfront probe would add a second SSH
+/// connection to every job, and on a host that rejects authentication that
+/// second connection means a second password prompt or another failed-login
+/// attempt against a lockout policy. `xs` must contact a failing remote exactly
+/// once, so the family is instead learned from the first attempt and reused.
+fn remote_shell_cache() -> &'static std::sync::Mutex<HashMap<String, RemoteShell>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, RemoteShell>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn remote_shell_key(rsh: Option<&str>, host: &str) -> String {
+    format!("{}\u{1f}{host}", rsh.unwrap_or_default())
+}
+
+/// The shell family to try first: whatever a previous session established for
+/// this host, otherwise POSIX, which is correct everywhere but Windows.
+fn remote_shell_for(rsh: Option<&str>, host: &str) -> RemoteShell {
+    remote_shell_cache()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&remote_shell_key(rsh, host)).copied())
+        .unwrap_or_default()
+}
+
+fn remember_remote_shell(rsh: Option<&str>, host: &str, shell: RemoteShell) {
+    if let Ok(mut map) = remote_shell_cache().lock() {
+        map.insert(remote_shell_key(rsh, host), shell);
+    }
+}
+
+/// `(program, args)` that runs one command string on `host`, without deciding
+/// what that string should be. Shared by the shell probe and the server launch
+/// so they can never disagree about how the remote shell is reached.
+fn base_remote_invocation(
+    rsh: Option<&str>,
+    host: &str,
+    command: &str,
+) -> (String, Vec<String>) {
+    if let Some(rsh_cmd) = rsh {
+        let parts = parse_rsh_command(rsh_cmd);
+        let program = parts.first().cloned().unwrap_or_else(|| rsh_cmd.to_owned());
+        let mut args = if parts.is_empty() {
+            Vec::new()
+        } else {
+            parts[1..].to_vec()
+        };
+        args.push(host.to_owned());
+        args.push(command.to_owned());
+        (program, args)
+    } else {
+        (
+            DEFAULT_RSH.to_owned(),
+            vec![host.to_owned(), command.to_owned()],
+        )
+    }
 }
 
 /// Default remote shell; replaced only by an explicit `-e/--rsh`.
@@ -6042,47 +6228,88 @@ fn is_missing_xsync_stderr(stderr: &str, exit_code: Option<i32>) -> bool {
 ///   injection-safe quoted remote command are appended.
 /// - No `-e` but a host: the default `ssh {host} '<quoted command>'`.
 /// - No host and no `-e`: an in-process/local child server via `current_exe`.
-#[must_use]
+///
+/// `shell` selects the syntax of the remote command string. Callers that have
+/// not probed the remote should use [`remote_server_command`], which detects it.
+///
+/// # Errors
+///
+/// Returns [`ServerError::InvalidPath`] when a Windows remote path contains a
+/// character that `cmd.exe` quoting cannot express safely.
+pub fn remote_server_command_with_shell(
+    remote_path: &str,
+    rsh: Option<&str>,
+    host: Option<&str>,
+    shell: RemoteShell,
+) -> Result<(String, Vec<String>), ServerError> {
+    match host {
+        Some(h) => Ok(base_remote_invocation(
+            rsh,
+            h,
+            &xsync_remote_command(remote_path, shell)?,
+        )),
+        // No host: the server runs locally as a child process with no shell in
+        // between, so the arguments are passed through verbatim and none of the
+        // quoting above applies.
+        None => {
+            if let Some(rsh_cmd) = rsh {
+                let parts = parse_rsh_command(rsh_cmd);
+                let program = parts.first().cloned().unwrap_or_else(|| rsh_cmd.to_owned());
+                let mut args = if parts.is_empty() {
+                    Vec::new()
+                } else {
+                    parts[1..].to_vec()
+                };
+                args.push("xs".to_owned());
+                args.push("--server".to_owned());
+                args.push(remote_path.to_owned());
+                Ok((program, args))
+            } else {
+                let exe = std::env::current_exe()
+                    .unwrap_or_else(|_| PathBuf::from("xsync"))
+                    .to_string_lossy()
+                    .into_owned();
+                Ok((exe, vec!["--server".to_owned(), remote_path.to_owned()]))
+            }
+        }
+    }
+}
+
+/// Compute `(program, args)` for the remote server, detecting the remote shell.
+///
+/// Probes the remote shell family once per `(rsh, host)` pair per process; see
+/// [`remote_server_command_with_shell`] for the syntax rules.
+///
+/// # Errors
+///
+/// Returns [`ServerError::InvalidPath`] when a Windows remote path contains a
+/// character that `cmd.exe` quoting cannot express safely.
 pub fn remote_server_command(
     remote_path: &str,
     rsh: Option<&str>,
     host: Option<&str>,
-) -> (String, Vec<String>) {
-    if let Some(rsh_cmd) = rsh {
-        let parts = parse_rsh_command(rsh_cmd);
-        let program = parts.first().cloned().unwrap_or_else(|| rsh_cmd.to_owned());
-        let mut args = if parts.is_empty() {
-            Vec::new()
-        } else {
-            parts[1..].to_vec()
-        };
-        if let Some(h) = host {
-            args.push(h.to_owned());
-            args.push(xsync_remote_command(remote_path));
-        } else {
-            args.push("xs".to_owned());
-            args.push("--server".to_owned());
-            args.push(remote_path.to_owned());
-        }
-        (program, args)
-    } else if let Some(h) = host {
-        (
-            DEFAULT_RSH.to_owned(),
-            vec![h.to_owned(), xsync_remote_command(remote_path)],
-        )
-    } else {
-        let exe = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("xsync"))
-            .to_string_lossy()
-            .into_owned();
-        (exe, vec!["--server".to_owned(), remote_path.to_owned()])
-    }
+) -> Result<(String, Vec<String>), ServerError> {
+    let shell = match host {
+        Some(h) => remote_shell_for(rsh, h),
+        None => RemoteShell::Posix,
+    };
+    remote_server_command_with_shell(remote_path, rsh, host, shell)
 }
 
 fn spawn_server_child(
     remote_path: &str,
     rsh: Option<&str>,
     host: Option<&str>,
+) -> Result<Child, ServerError> {
+    let shell = host.map_or(RemoteShell::Posix, |h| remote_shell_for(rsh, h));
+    spawn_server_child_with_shell(remote_path, rsh, host, shell)
+}
+
+fn spawn_server_child_with_shell(
+    remote_path: &str,
+    rsh: Option<&str>,
+    host: Option<&str>,
+    shell: RemoteShell,
 ) -> Result<Child, ServerError> {
     if host.is_some_and(|value| value.starts_with('-')) {
         return Err(ServerError::Transport {
@@ -6091,7 +6318,7 @@ fn spawn_server_child(
                 .to_owned(),
         });
     }
-    let (program, args) = remote_server_command(remote_path, rsh, host);
+    let (program, args) = remote_server_command_with_shell(remote_path, rsh, host, shell)?;
     let mut cmd = Command::new(program);
     cmd.args(args);
 
@@ -6108,10 +6335,34 @@ fn spawn_server_child(
 /// Run a client protocol session against a spawned remote child, draining the
 /// child's stderr so a missing remote binary is reported as a typed selection
 /// result rather than as a raw broken-pipe error.
+/// Read adapter recording whether the remote ever produced a single byte.
+///
+/// This is the only dependable way to tell "the remote shell never ran our
+/// server" from "the server ran and then failed". Exit codes cannot do it: on
+/// stock Windows `cmd.exe`, `PATH` is a *builtin*, so the POSIX command string
+/// `PATH="$HOME/.local/bin:$PATH" \'xs\' ...` is parsed as a `PATH` command that
+/// sets the search path to that literal text and **exits 0**. The remote
+/// reports success, emits nothing, and no status code distinguishes it.
+struct CountingReader<R> {
+    inner: R,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.bytes.fetch_add(
+            u64::try_from(read).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(read)
+    }
+}
+
 fn run_server_child_session<F>(child: Child, f: F) -> Result<LocalSyncReport, ServerError>
 where
-    F: FnOnce(
-        &mut BufReader<std::process::ChildStdout>,
+    F: FnMut(
+        &mut BufReader<CountingReader<std::process::ChildStdout>>,
         &mut BufWriter<std::process::ChildStdin>,
     ) -> Result<LocalSyncReport, ServerError>,
 {
@@ -6136,8 +6387,13 @@ where
         })
     });
 
-    let mut reader = BufReader::new(stdout);
+    let bytes_from_remote = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut reader = BufReader::new(CountingReader {
+        inner: stdout,
+        bytes: std::sync::Arc::clone(&bytes_from_remote),
+    });
     let mut writer = BufWriter::new(stdin);
+    let mut f = f;
     let result = f(&mut reader, &mut writer);
 
     // Close both streams to signal EOF to the child before reaping it.
@@ -6161,6 +6417,31 @@ where
 
     if is_missing_xsync_stderr(&stderr_text, exit_code) {
         return Err(ServerError::MissingRemoteXsync);
+    }
+
+    // The remote shell reported success and yet never spoke a single byte of the
+    // protocol. That pair is the exact, measured signature of the POSIX command
+    // string reaching stock Windows `cmd.exe`: `PATH` is a cmd builtin, so
+    // `PATH="$HOME/.local/bin:$PATH" \'xs\' ...` is read as a `PATH` command that
+    // sets the search path to that literal text and exits 0. Nothing runs, and
+    // no error is reported anywhere.
+    //
+    // Both halves are load-bearing:
+    //
+    //   * Requiring exit 0 excludes a server that started and then died. A
+    //     transfer killed mid-flight exits non-zero, and its staged data and
+    //     resume journal must survive -- retrying there would resume from the
+    //     checkpoint and publish a file the caller was never told about.
+    //   * Requiring zero bytes excludes a remote that spoke and then failed,
+    //     including a peer that answers with a malformed protocol.
+    //
+    // ssh's own 255 (authentication, host key, connection) fails both tests, so
+    // a rejected credential still costs exactly one connection attempt.
+    if result.is_err()
+        && exit_code == Some(0)
+        && bytes_from_remote.load(std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        return Err(ServerError::RemoteShellMismatch);
     }
 
     if status.is_some_and(|status| !status.success()) && result.is_ok() {
@@ -7169,7 +7450,9 @@ mod tests {
 
     #[test]
     fn default_remote_shell_is_ssh_over_host() {
-        let (program, args) = remote_server_command("/dest", None, Some("user@mars"));
+        let (program, args) =
+            remote_server_command_with_shell("/dest", None, Some("user@mars"), RemoteShell::Posix)
+                .unwrap();
         assert_eq!(program, "ssh");
         assert_eq!(
             args,
@@ -7182,7 +7465,13 @@ mod tests {
 
     #[test]
     fn explicit_rsh_replaces_the_shell_but_preserves_host_and_args() {
-        let (program, args) = remote_server_command("/dest", Some("myrsh -oK=1"), Some("host"));
+        let (program, args) = remote_server_command_with_shell(
+            "/dest",
+            Some("myrsh -oK=1"),
+            Some("host"),
+            RemoteShell::Posix,
+        )
+        .unwrap();
         assert_eq!(program, "myrsh");
         assert_eq!(
             args,
@@ -7197,7 +7486,13 @@ mod tests {
     #[test]
     fn remote_path_is_shell_quoted_as_one_command() {
         let (_, args) =
-            remote_server_command("/dst'; touch XSYNC_INJECTION; echo '", None, Some("host"));
+            remote_server_command_with_shell(
+                "/dst'; touch XSYNC_INJECTION; echo '",
+                None,
+                Some("host"),
+                RemoteShell::Posix,
+            )
+            .unwrap();
         assert_eq!(
             args,
             [
@@ -7209,7 +7504,8 @@ mod tests {
 
     #[test]
     fn remote_home_path_is_expanded_by_the_remote_shell() {
-        let (_, args) = remote_server_command("~", None, Some("host"));
+        let (_, args) =
+            remote_server_command_with_shell("~", None, Some("host"), RemoteShell::Posix).unwrap();
         assert_eq!(
             args,
             [
@@ -7218,7 +7514,9 @@ mod tests {
             ]
         );
 
-        let (_, args) = remote_server_command("~/nested", None, Some("host"));
+        let (_, args) =
+            remote_server_command_with_shell("~/nested", None, Some("host"), RemoteShell::Posix)
+                .unwrap();
         assert_eq!(
             args,
             [
@@ -7229,8 +7527,106 @@ mod tests {
     }
 
     #[test]
+    fn remote_shell_is_remembered_per_host_and_rsh() {
+        // The learned family must not leak between hosts: one Windows box in a
+        // script must not push every later POSIX host down the cmd.exe path.
+        remember_remote_shell(None, "winbox.example", RemoteShell::Windows);
+        assert_eq!(
+            remote_shell_for(None, "winbox.example"),
+            RemoteShell::Windows
+        );
+        assert_eq!(
+            remote_shell_for(None, "linuxbox.example"),
+            RemoteShell::Posix,
+            "an unrelated host must still start from the POSIX default"
+        );
+        // A different -e command against the same host is a different route and
+        // does not inherit the answer.
+        assert_eq!(
+            remote_shell_for(Some("ssh -p 2222"), "winbox.example"),
+            RemoteShell::Posix
+        );
+    }
+
+    #[test]
+    fn windows_remote_uses_cmd_syntax_not_posix() {
+        // Stock Windows OpenSSH hands the command to cmd.exe, which cannot parse
+        // a POSIX assignment prefix or single-quoted words.
+        let (program, args) = remote_server_command_with_shell(
+            "C:/backup",
+            None,
+            Some("winbox"),
+            RemoteShell::Windows,
+        )
+        .unwrap();
+        assert_eq!(program, "ssh");
+        assert_eq!(
+            args,
+            [
+                "winbox",
+                "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & xs --server \"C:/backup\""
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_remote_expands_home_with_userprofile() {
+        let (_, args) =
+            remote_server_command_with_shell("~", None, Some("winbox"), RemoteShell::Windows)
+                .unwrap();
+        assert!(args[1].ends_with("xs --server \"%USERPROFILE%\""), "{}", args[1]);
+
+        let (_, args) = remote_server_command_with_shell(
+            "~/backup",
+            None,
+            Some("winbox"),
+            RemoteShell::Windows,
+        )
+        .unwrap();
+        assert!(
+            args[1].ends_with("xs --server \"%USERPROFILE%\\backup\""),
+            "{}",
+            args[1]
+        );
+    }
+
+    #[test]
+    fn windows_remote_refuses_paths_cmd_quoting_cannot_express() {
+        // `%` still expands inside cmd double quotes, and a quote ends the run.
+        // Both are refused rather than silently mangled into a different path.
+        for hostile in [
+            r"C:/%USERPROFILE%/evil",
+            r#"C:/dest" & del /q C:\important & echo "#,
+        ] {
+            let result = remote_server_command_with_shell(
+                hostile,
+                None,
+                Some("winbox"),
+                RemoteShell::Windows,
+            );
+            assert!(
+                matches!(result, Err(ServerError::InvalidPath(_))),
+                "expected refusal for {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_and_posix_forms_differ_for_the_same_path() {
+        let posix =
+            remote_server_command_with_shell("/data", None, Some("h"), RemoteShell::Posix).unwrap();
+        let windows =
+            remote_server_command_with_shell("/data", None, Some("h"), RemoteShell::Windows)
+                .unwrap();
+        assert_ne!(posix.1, windows.1);
+        assert!(posix.1[1].starts_with("PATH="));
+        assert!(windows.1[1].starts_with("set \"PATH="));
+    }
+
+    #[test]
     fn no_host_runs_an_in_process_local_server() {
-        let (program, args) = remote_server_command("/dest", None, None);
+        let (program, args) =
+            remote_server_command_with_shell("/dest", None, None, RemoteShell::Posix).unwrap();
         assert_ne!(program, "ssh");
         assert_eq!(args, ["--server", "/dest"]);
     }

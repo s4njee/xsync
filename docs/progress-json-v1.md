@@ -11,7 +11,7 @@ Common fields:
 - `phase`: `name` (`scan`, `plan`, `transfer`, or `metadata`) and `started` (`true` or `false`)
 - `metrics`: `queue_high_water`, `compression_algorithm`, and `compression_level`
 - `planned`: `files`, `bytes`
-- `cloud_placeholders`: `files`, `bytes`, `detection_available`
+- `cloud_placeholders`: `files`, `bytes`, `detection_available`, `detection_performed`
 - `action`: `path`, `action` (`create`, `update`, or `delete`)
 - `transferred`: `path`, `bytes`, `physical_bytes`, `method`
 - `skipped`/`deleted`: `path`
@@ -21,6 +21,17 @@ The `done` event contains the complete transfer summary: logical, physical, and 
 transferred/skipped/deleted/failed counts; local workers and streams; clone/copy counts; resume and
 retransmission counters; transport identity; negotiated wire version; mapped options; unavailable
 guarantees; checksum/compression algorithms; and the selection reason.
+
+`cloud_placeholders` reports an inventory only when `detection_performed` is `true`.
+Detection costs a process spawn per file, so it runs only under the `skip` and `error`
+policies, whose outcome depends on the answer. Under the default `download` policy, on the
+whole-tree clone fast path, and on every remote route, `detection_performed` is `false` and
+`files`/`bytes` are zero because nothing was inspected — not because no placeholder exists.
+Consumers must check `detection_performed` before treating the counts as an inventory.
+`detection_available` remains a platform capability flag and is independent of it.
+
+`detection_performed` was added additively; a consumer that does not read it sees the same
+`files`/`bytes` semantics it saw before for the `skip` and `error` policies.
 
 Phase timing is represented by paired `phase` events. Consumers record the timestamp on the
 `started: true` event and subtract it from the matching `started: false` event. Absent compression

@@ -848,9 +848,18 @@ fn render_event(
             files,
             bytes,
             detection_available,
-        } => println!(
-            "cloud placeholders: {files} file(s), {bytes} bytes (detection available: {detection_available})"
-        ),
+            detection_performed,
+        } => {
+            if detection_performed {
+                println!(
+                    "cloud placeholders: {files} file(s), {bytes} bytes (detection available: {detection_available})"
+                );
+            } else {
+                println!(
+                    "cloud placeholders: not inspected (detection available: {detection_available})"
+                );
+            }
+        }
         xsync_core::local::LocalEvent::Action { path, action } => {
             println!("{action} {path}");
         }
@@ -972,11 +981,13 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             files,
             bytes,
             detection_available,
+            detection_performed,
         } => serde_json::json!({
             "event": "cloud_placeholders",
             "files": files,
             "bytes": bytes,
             "detection_available": detection_available,
+            "detection_performed": detection_performed,
         }),
         LocalEvent::Transferred {
             path,

@@ -660,17 +660,56 @@ fn push_classification(plan: &mut Plan, entry: FileEntry, classification: Classi
     }
 }
 
+/// Whether two modification times refer to the same instant, allowing for the
+/// fact that filesystems disagree about how finely they store one.
+///
+/// APFS and ext4 keep nanoseconds, NTFS keeps 100-nanosecond ticks, HFS+ and
+/// ext3 keep whole seconds. A timestamp therefore does not survive a round trip
+/// between two different filesystems: writing an APFS mtime of `...126080149`
+/// to NTFS reads back as `...126080100`. Comparing at full precision reported
+/// every such file as modified on every run, so an incremental sync between
+/// unlike filesystems degenerated into a full re-transfer.
+///
+/// Whole seconds is the granularity rsync compares at, and it is coarse enough
+/// to absorb every quantisation in the table above except FAT's two-second
+/// resolution, which needs an explicit `--modify-window`.
+fn mtimes_match(source: SystemTime, destination: SystemTime) -> bool {
+    whole_seconds(source) == whole_seconds(destination)
+}
+
+/// Seconds since the Unix epoch, rounding toward negative infinity so that
+/// times on either side of the epoch compare consistently.
+fn whole_seconds(time: SystemTime) -> i128 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i128::from(duration.as_secs()),
+        Err(error) => {
+            let duration = error.duration();
+            let seconds = i128::from(duration.as_secs());
+            if duration.subsec_nanos() == 0 {
+                -seconds
+            } else {
+                -(seconds + 1)
+            }
+        }
+    }
+}
+
 fn metadata_matches(
     source: &FileEntry,
     destination: &FileEntry,
     compare_fingerprint: bool,
 ) -> bool {
-    source.kind == destination.kind
-        && source.size == destination.size
-        && source.mtime == destination.mtime
-        && (!compare_fingerprint
-            || source.kind != EntryKind::File
-            || source.fingerprint.identity == destination.fingerprint.identity)
+    if source.kind != destination.kind || source.size != destination.size {
+        return false;
+    }
+    // `--checksum` classifies by content hash *instead of* size+mtime, so the
+    // timestamp heuristic is skipped entirely rather than added to. Retaining it
+    // would make the flag useless exactly where it is needed most: a source and
+    // destination whose filesystems store timestamps at different granularity.
+    if compare_fingerprint && source.kind == EntryKind::File {
+        return source.fingerprint.identity == destination.fingerprint.identity;
+    }
+    mtimes_match(source.mtime, destination.mtime)
 }
 
 /// Entries of one filesystem kind grouped by their required action.
@@ -1411,6 +1450,72 @@ mod tests {
         .unwrap();
         let plan = try_plan([source.clone()], destination).unwrap();
         assert_eq!(plan.files.new[0].path.as_bytes(), b"bad-\xff-name");
+    }
+
+    #[test]
+    fn mtimes_matching_within_the_same_second_are_equal() {
+        // NTFS truncates to 100 ns ticks, so an APFS source mtime cannot be
+        // reproduced exactly on a Windows destination. Both must still compare
+        // as unchanged or every sync becomes a full re-transfer.
+        let apfs = UNIX_EPOCH + Duration::new(1_787_728_803, 126_080_149);
+        let ntfs = UNIX_EPOCH + Duration::new(1_787_728_803, 126_080_100);
+        assert!(mtimes_match(apfs, ntfs));
+
+        // HFS+ and ext3 drop the sub-second part entirely.
+        let seconds_only = UNIX_EPOCH + Duration::new(1_787_728_803, 0);
+        assert!(mtimes_match(apfs, seconds_only));
+    }
+
+    #[test]
+    fn mtimes_in_different_seconds_still_differ() {
+        let earlier = UNIX_EPOCH + Duration::new(1_787_728_803, 999_999_999);
+        let later = UNIX_EPOCH + Duration::new(1_787_728_804, 0);
+        assert!(!mtimes_match(earlier, later));
+    }
+
+    #[test]
+    fn mtimes_before_the_epoch_compare_consistently() {
+        let before = UNIX_EPOCH - Duration::new(10, 0);
+        let same = UNIX_EPOCH - Duration::new(10, 0);
+        assert!(mtimes_match(before, same));
+
+        // Rounding toward negative infinity puts -9.5 s and -10.0 s in the same
+        // one-second bucket, exactly as 9.5 s and 9.0 s share a bucket after the
+        // epoch. Without floor semantics the two sides of the epoch would round
+        // in opposite directions.
+        let within_same_bucket = UNIX_EPOCH - Duration::new(9, 500_000_000);
+        assert!(mtimes_match(before, within_same_bucket));
+
+        // A genuinely different second is still detected.
+        let earlier = UNIX_EPOCH - Duration::new(11, 0);
+        assert!(!mtimes_match(before, earlier));
+    }
+
+    #[test]
+    fn checksum_classification_ignores_mtime_entirely() {
+        // `--checksum` is documented as classifying by content hash *instead of*
+        // size+mtime. A file with identical content but an mtime the destination
+        // filesystem could not reproduce must compare as unchanged.
+        let mut source = entry("f", EntryKind::File, 10, 1_000);
+        let mut destination = entry("f", EntryKind::File, 10, 1_000);
+        source.mtime = UNIX_EPOCH + Duration::new(1_787_728_803, 126_080_149);
+        destination.mtime = UNIX_EPOCH + Duration::new(9_999, 0);
+        source.fingerprint.identity = FileIdentity {
+            device: 7,
+            file: 42,
+        };
+        destination.fingerprint.identity = FileIdentity {
+            device: 7,
+            file: 42,
+        };
+        assert!(metadata_matches(&source, &destination, true));
+
+        // Differing content still registers as changed.
+        destination.fingerprint.identity = FileIdentity {
+            device: 7,
+            file: 43,
+        };
+        assert!(!metadata_matches(&source, &destination, true));
     }
 
     #[test]

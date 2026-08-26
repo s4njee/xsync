@@ -445,6 +445,13 @@ should use, not a second magic number.
   this story can be marked complete. The supplied host covers the build and remote atomic-install
   path, but is not those three filesystem cases.
 
+**Blocker:**
+- The current macOS checkout can build both GNU targets and can reach `freya.local` (x86_64/ZFS),
+  but the configured `192.168.1.119` host timed out and `gentoo-rpi5.local` rejected the available
+  SSH key. The three-host staging proof cannot be completed until credentials/network access to the
+  ext2/3 and aarch64/ext4 hosts are restored. `scripts/verify-linux-staging.sh` records all host
+  results and continues instead of stopping at the first blocker.
+
 ### Story 13.3 — Connection model for a browsing client
 - [x] Revisit Story 4.3's connection-model decision for a client that holds a session open for hours
   rather than running one sync.
@@ -474,7 +481,7 @@ should use, not a second magic number.
 incompatible "v2"s a month apart — is not caught by any test either project would think to write.*
 
 ### Story 14.1 — Spec ownership and change process
-- [ ] Write down who may change `protocol.md`, what a change requires, and how the other project
+- [x] Write down who may change `protocol.md`, what a change requires, and how the other project
   learns about it.
 
 **AC**
@@ -486,8 +493,13 @@ incompatible "v2"s a month apart — is not caught by any test either project wo
 - Says how a change is landed when both projects need it simultaneously, since neither can merge a
   half-implemented wire format.
 
+**Results:**
+- Added [`docs/protocol-ownership.md`](docs/protocol-ownership.md), naming xsync as the canonical
+  owner, f2 as the consuming reviewer, the never-reuse type-byte rule, version-bump boundary, and
+  the coordinated landing/release sequence. `protocol.md` now links to that contract.
+
 ### Story 14.2 — Compatibility matrix and release coordination
-- [ ] A published statement of which client versions work with which server versions, and what
+- [x] A published statement of which client versions work with which server versions, and what
   happens at each intersection.
 
 **AC**
@@ -498,8 +510,15 @@ incompatible "v2"s a month apart — is not caught by any test either project wo
 - Covers the asymmetric field case both projects will actually hit: a long-lived agent staged months
   before the client that connects to it.
 
+**Results:**
+- Added [`scripts/generate-compatibility-matrix.py`](scripts/generate-compatibility-matrix.py) and
+  generated [`docs/compatibility-matrix.md`](docs/compatibility-matrix.md). The generator hashes and
+  counts the canonical Story 9.3 vectors, emits every client/server intersection, and names the
+  reduced-capability result for a long-lived v1 agent or f2 client that does not yet implement the
+  later mutation/transfer assignments. `--check` fails when the checked-in matrix is stale.
+
 ### Story 14.3 — A joint smoke test
-- [ ] One test exercising a real f2 client against a real xsync server, run before either project
+- [~] One test exercising a real f2 client against a real xsync server, run before either project
   tags a release.
 
 **AC**
@@ -507,3 +526,16 @@ incompatible "v2"s a month apart — is not caught by any test either project wo
 - Covers the browse surface end to end — connect, list, stat, fetch, publish, mutate, disconnect —
   because unit tests on either side cannot catch a disagreement about meaning, only about bytes.
 - Failure output identifies which side is wrong, which is the whole reason it exists.
+
+**Results so far:**
+- Added [`scripts/joint-smoke.sh`](scripts/joint-smoke.sh), the single entry point. It runs the
+  xsync v2 server/codec tests and the real f2 Swift protocol suite first, then checks that f2 exposes
+  the message cases needed for rename, mkdir, delete, fetch, and publish. Failures are labelled
+  `[xsync]` or `[f2]`; an incomplete consumer is reported as a blocker rather than a false pass.
+
+**Blocker:**
+- The checked-out f2 client currently implements only v2 message types 14–21 (list/stat/cancel/
+  keepalive). It has no client cases for types 22–35, so a real f2 client cannot yet execute the
+  required mutate/fetch/publish steps against xsync. The command still runs both conformance suites
+  and exits with a named f2 blocker; continue with other stories and rerun after f2 lands those
+  operations.
