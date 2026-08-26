@@ -186,7 +186,8 @@ fn measure_setup(root: &Path, streams: usize) -> Result<f64, BenchError> {
     let wall = Instant::now();
     let mut children: Vec<Child> = Vec::new();
     for _ in 0..streams {
-        let (program, args) = remote_server_command(&root.to_string_lossy(), None, None);
+        let (program, args) = remote_server_command(&root.to_string_lossy(), None, None)
+            .map_err(|e| BenchError::Handshake(std::io::Error::other(e)))?;
         let child = Command::new(program)
             .args(args)
             .stdin(Stdio::piped())

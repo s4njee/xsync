@@ -181,6 +181,12 @@ pub struct ProbedConnection<R, W> {
 
 impl<R: Read, W: Write> ProbedConnection<R, W> {
     /// Continue directly into a browse session without another connection or handshake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::UnexpectedMessage`] when the probe did not settle
+    /// on [`ProbeStatus::Ready`], since a session may not begin on a connection
+    /// whose capability negotiation did not complete.
     pub fn into_browse_session(self) -> Result<BrowseSession<R, W>, ServerError> {
         if !matches!(self.probe.status, ProbeStatus::Ready) {
             return Err(ServerError::UnexpectedMessage(format!(
@@ -199,6 +205,12 @@ impl<R: Read, W: Write> ProbedConnection<R, W> {
 }
 
 /// Perform the v1-compatible opening handshake without starting a session operation.
+///
+/// # Errors
+///
+/// Returns [`ServerError::UnexpectedMessage`] if the peer's reply is not a
+/// handshake acknowledgement, and propagates transport and codec failures from
+/// the underlying stream.
 pub fn probe_session<R: Read, W: Write>(
     mut reader: R,
     mut writer: W,
@@ -419,6 +431,12 @@ impl<R: Read, W: Write> BrowseSession<R, W> {
     ///
     /// Cancelling an already completed or unknown request is a no-op
     /// acknowledgement, not a session error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::UnexpectedMessage`] if the peer answers with a
+    /// frame other than a cancel acknowledgement. Transport failures are
+    /// propagated.
     pub fn cancel(&mut self, related_id: u64) -> Result<(), ServerError> {
         let response = self.request(&V2Message::CancelRequest { related_id })?;
         match response.message {
@@ -451,6 +469,13 @@ impl<R: Read, W: Write> BrowseSession<R, W> {
     }
 
     /// Rename a remote path without replacing an existing destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::RemoteError`] carrying the peer's status code and
+    /// message when the remote refuses the operation, and
+    /// [`ServerError::UnexpectedMessage`] if the peer answers with a frame other
+    /// than the matching response. Transport failures are propagated.
     pub fn rename(&mut self, source: Vec<u8>, destination: Vec<u8>) -> Result<(), ServerError> {
         let response = self.request(&V2Message::RenameRequest {
             source,
@@ -472,6 +497,13 @@ impl<R: Read, W: Write> BrowseSession<R, W> {
     }
 
     /// Create one remote directory, without creating missing parents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::RemoteError`] carrying the peer's status code and
+    /// message when the remote refuses the operation, and
+    /// [`ServerError::UnexpectedMessage`] if the peer answers with a frame other
+    /// than the matching response. Transport failures are propagated.
     pub fn create_directory(&mut self, path: Vec<u8>) -> Result<(), ServerError> {
         let response = self.request(&V2Message::CreateDirectoryRequest { path })?;
         match response.message {
@@ -492,6 +524,13 @@ impl<R: Read, W: Write> BrowseSession<R, W> {
     }
 
     /// Delete a remote tree, calling `progress` once for every attempted item.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::RemoteError`] carrying the peer's status code and
+    /// message when the remote refuses the operation, and
+    /// [`ServerError::UnexpectedMessage`] if the peer answers with a frame other
+    /// than the matching response. Transport failures are propagated.
     pub fn delete_with_progress<F>(
         &mut self,
         path: Vec<u8>,
@@ -521,17 +560,24 @@ impl<R: Read, W: Write> BrowseSession<R, W> {
     }
 
     /// Fetch one remote regular file to a local path, publishing atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::RemoteError`] when the remote refuses the read,
+    /// [`ServerError::UnexpectedMessage`] on an out-of-protocol reply, and an
+    /// I/O error if the local temporary file cannot be written or published. A
+    /// digest mismatch fails the fetch and leaves the destination untouched.
     pub fn fetch(
         &mut self,
         remote_path: Vec<u8>,
         local_path: impl AsRef<Path>,
     ) -> Result<FetchedFile, ServerError> {
         let related_id = self.send(&V2Message::FetchRequest { path: remote_path })?;
-        let start = loop {
+        let start = {
             let response = self.receive()?;
             match response.message {
                 V2Message::FetchStart { related_id: id, .. } if id == related_id => {
-                    break response.message
+                    response.message
                 }
                 V2Message::BrowseError { code, message, .. } => {
                     return Err(ServerError::RemoteError {
@@ -607,6 +653,13 @@ impl<R: Read, W: Write> BrowseSession<R, W> {
     }
 
     /// Publish a locally edited file only when the fetched remote identity is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::RemoteError`] when the remote rejects the write —
+    /// including the identity check failing, which means the file changed since
+    /// it was fetched and the edit would silently overwrite newer content — and
+    /// [`ServerError::UnexpectedMessage`] on an out-of-protocol reply.
     pub fn publish(
         &mut self,
         remote_path: Vec<u8>,
@@ -858,10 +911,16 @@ pub fn validate_destination_path(
 ///
 /// `WirePath` is the protocol's normalized representation, so equivalent
 /// destinations are compared as paths rather than as presentation strings.
-pub fn validate_unique_destination_path(
+///
+/// # Errors
+///
+/// Returns [`ServerError::DuplicatePath`] when `path` was already seen in this
+/// transfer, and propagates [`ServerError::InvalidPath`] for a path that
+/// escapes `root` or is otherwise unrepresentable.
+pub fn validate_unique_destination_path<S: std::hash::BuildHasher>(
     root: &Path,
-    path: WirePath,
-    seen: &mut HashSet<WirePath>,
+    path: &WirePath,
+    seen: &mut HashSet<WirePath, S>,
 ) -> Result<PathBuf, ServerError> {
     let native = validate_destination_path(root, path.clone())?;
     if !seen.insert(path.clone()) {
@@ -927,7 +986,7 @@ fn native_path_bytes(path: &std::ffi::OsStr) -> Vec<u8> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        return path.as_bytes().to_vec();
+        path.as_bytes().to_vec()
     }
     #[cfg(not(unix))]
     path.to_string_lossy().as_bytes().to_vec()
@@ -1231,9 +1290,11 @@ impl Server {
             } else {
                 match incoming.recv() {
                     Ok(Ok(Some(frame))) => frame,
-                    Ok(Ok(None)) => return Ok(()),
                     Ok(Err(error)) => return Err(ServerError::Browse(error)),
-                    Err(_) => return Ok(()),
+                    // Clean EOF, or the reader thread's channel closed: both
+                    // mean no further frames will arrive, which ends the
+                    // session normally.
+                    Ok(Ok(None)) | Err(_) => return Ok(()),
                 }
             };
             if !seen_ids.insert(frame.message_id) {
@@ -1506,9 +1567,10 @@ impl Server {
             } else {
                 match incoming.recv() {
                     Ok(Ok(Some(frame))) => frame,
-                    Ok(Ok(None)) => return Err(ServerError::PeerDisconnected),
                     Ok(Err(error)) => return Err(ServerError::Browse(error)),
-                    Err(_) => return Err(ServerError::PeerDisconnected),
+                    // Mid-publish, an EOF and a closed reader channel are both
+                    // the peer going away before the transfer completed.
+                    Ok(Ok(None)) | Err(_) => return Err(ServerError::PeerDisconnected),
                 }
             };
             match frame.message {
@@ -1624,20 +1686,17 @@ impl Server {
                 irreversible: true,
             });
         }
-        let native = match validate_destination_path(&self.root, relative.clone()) {
-            Ok(native) => native,
-            Err(_) => {
-                return Ok(V2Message::DeleteResponse {
-                    related_id,
-                    status: protocol_v2::DeleteStatus::Partial,
-                    removed_count: 0,
-                    failures: vec![protocol_v2::DeleteFailure {
-                        path: path.to_vec(),
-                        errno: libc::EINVAL,
-                    }],
-                    irreversible: true,
-                });
-            }
+        let Ok(native) = validate_destination_path(&self.root, relative.clone()) else {
+            return Ok(V2Message::DeleteResponse {
+                related_id,
+                status: protocol_v2::DeleteStatus::Partial,
+                removed_count: 0,
+                failures: vec![protocol_v2::DeleteFailure {
+                    path: path.to_vec(),
+                    errno: libc::EINVAL,
+                }],
+                irreversible: true,
+            });
         };
         let mut stack = vec![(native, relative, false)];
         let mut failures = Vec::new();
@@ -1711,7 +1770,7 @@ impl Server {
                                                 failures.push(protocol_v2::DeleteFailure {
                                                     path: relative.as_bytes().to_vec(),
                                                     errno: libc::EINVAL,
-                                                })
+                                                });
                                             }
                                         }
                                     }
@@ -1842,13 +1901,9 @@ impl Server {
                 });
             };
             index += 1;
-            let item = match item {
-                Ok(item) => item,
-                Err(_) => continue,
-            };
-            let metadata = match fs::symlink_metadata(item.path()) {
-                Ok(metadata) => metadata,
-                Err(_) => continue,
+            let Ok(item) = item else { continue };
+            let Ok(metadata) = fs::symlink_metadata(item.path()) else {
+                continue;
             };
             let file_type = metadata.file_type();
             let (kind, symlink_target) = if file_type.is_file() {
@@ -2043,7 +2098,7 @@ impl Server {
                         let file_entry = file_entry_from_entry_record(&record)?;
                         validate_unique_destination_path(
                             &self.root,
-                            file_entry.path.clone(),
+                            &file_entry.path,
                             &mut self.seen_destinations,
                         )?;
                         let hash = blake3::hash(&data);
@@ -2097,7 +2152,7 @@ impl Server {
                         .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
                     validate_unique_destination_path(
                         &self.root,
-                        rel_path.clone(),
+                        &rel_path,
                         &mut self.seen_destinations,
                     )?;
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
@@ -2440,7 +2495,7 @@ impl Server {
                         let file_entry = file_entry_from_entry_record(&record)?;
                         validate_unique_destination_path(
                             &self.root,
-                            file_entry.path.clone(),
+                            &file_entry.path,
                             &mut self.seen_destinations,
                         )?;
                         let hash = blake3::hash(&data);
@@ -2528,7 +2583,7 @@ impl Server {
                         .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
                     validate_unique_destination_path(
                         &self.root,
-                        rel_path.clone(),
+                        &rel_path,
                         &mut self.seen_destinations,
                     )?;
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
@@ -7946,7 +8001,7 @@ mod tests {
             std::os::unix::fs::symlink(&outside, root.join("link_dir")).unwrap();
             assert!(validate_destination_path(&root, "link_dir/file.txt").is_err());
 
-            fs::write(&outside.join("file"), b"outside").unwrap();
+            fs::write(outside.join("file"), b"outside").unwrap();
             std::os::unix::fs::symlink(outside.join("file"), root.join("link_file")).unwrap();
             assert!(matches!(
                 validate_destination_path(&root, "link_file/child"),
@@ -7964,14 +8019,14 @@ mod tests {
 
         validate_unique_destination_path(
             &root,
-            WirePath::from_wire(b"same/path".to_vec()).unwrap(),
+            &WirePath::from_wire(b"same/path".to_vec()).unwrap(),
             &mut seen,
         )
         .unwrap();
         assert!(matches!(
             validate_unique_destination_path(
                 &root,
-                WirePath::from_wire(b"same/path".to_vec()).unwrap(),
+                &WirePath::from_wire(b"same/path".to_vec()).unwrap(),
                 &mut seen,
             ),
             Err(ServerError::DuplicatePath(path)) if path == "same/path"

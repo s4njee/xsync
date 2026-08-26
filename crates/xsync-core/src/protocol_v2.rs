@@ -8,6 +8,19 @@ use std::io::Read;
 use thiserror::Error;
 
 use crate::protocol::FRAME_HEADER_LEN;
+
+/// `FRAME_HEADER_LEN` as it appears in the 16-bit header-length field.
+///
+/// The static assertion turns a header that outgrows the field into a build
+/// error rather than a silently truncated length on the wire.
+const FRAME_HEADER_LEN_U16: u16 = {
+    const _: () = assert!(FRAME_HEADER_LEN <= u16::MAX as usize);
+    // Truncation is impossible: the assertion above is evaluated at compile
+    // time, so a header that outgrew the field would fail the build.
+    #[allow(clippy::cast_possible_truncation)]
+    let value = FRAME_HEADER_LEN as u16;
+    value
+};
 use crate::HANDSHAKE_MAGIC;
 
 const MAX_PATH: usize = 1024 * 1024;
@@ -325,6 +338,12 @@ pub enum V2CodecError {
 }
 
 /// Encode a complete uncompressed v2 browse frame.
+///
+/// # Errors
+///
+/// Returns [`V2CodecError::Bound`] when the encoded payload is longer than the
+/// `u32` length field the frame header carries, and propagates any error from
+/// encoding the message body itself.
 pub fn encode_frame(message_id: u64, message: &V2Message) -> Result<Vec<u8>, V2CodecError> {
     let message_type = message_type(message);
     let payload = encode(message)?;
@@ -334,7 +353,7 @@ pub fn encode_frame(message_id: u64, message: &V2Message) -> Result<Vec<u8>, V2C
     })?;
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
     frame.extend_from_slice(HANDSHAKE_MAGIC);
-    frame.extend_from_slice(&(FRAME_HEADER_LEN as u16).to_le_bytes());
+    frame.extend_from_slice(&FRAME_HEADER_LEN_U16.to_le_bytes());
     frame.extend_from_slice(&0_u16.to_le_bytes());
     frame.extend_from_slice(&2_u32.to_le_bytes());
     frame.push(message_type);
@@ -348,6 +367,19 @@ pub fn encode_frame(message_id: u64, message: &V2Message) -> Result<Vec<u8>, V2C
 }
 
 /// Decode one complete v2 browse frame, rejecting trailing bytes.
+///
+/// # Errors
+///
+/// Returns [`V2CodecError::Envelope`] for a header that is truncated, declares
+/// a header length or protocol version this build does not speak, sets a
+/// reserved field, or is followed by a payload whose length disagrees with the
+/// header. Body decode errors are propagated unchanged.
+///
+/// # Panics
+///
+/// Does not panic in practice. The fixed-width `try_into` conversions below are
+/// infallible because the length check at the top of this function has already
+/// established that `header` is exactly `FRAME_HEADER_LEN` bytes.
 pub fn decode_frame(bytes: &[u8]) -> Result<V2Frame, V2CodecError> {
     if bytes.len() < FRAME_HEADER_LEN {
         return Err(V2CodecError::Envelope("truncated header"));
@@ -396,6 +428,18 @@ pub fn decode_frame(bytes: &[u8]) -> Result<V2Frame, V2CodecError> {
 
 /// Read one v2 frame from a persistent stream. `None` means clean EOF before
 /// the next frame, which is the normal session shutdown path.
+///
+/// # Errors
+///
+/// Returns [`V2CodecError::Io`] if the stream fails, and
+/// [`V2CodecError::Envelope`] if it ends part-way through a frame — a partial
+/// frame is a protocol violation, distinct from the clean EOF reported as
+/// `Ok(None)`. Frame validation errors are propagated from [`decode_frame`].
+///
+/// # Panics
+///
+/// Does not panic in practice: the fixed-width conversions read from `header`
+/// only after the full `FRAME_HEADER_LEN` bytes have been read into it.
 pub fn read_frame<R: Read>(reader: &mut R) -> Result<Option<V2Frame>, V2CodecError> {
     let mut header = [0_u8; FRAME_HEADER_LEN];
     let first = reader
@@ -454,6 +498,13 @@ fn message_type(message: &V2Message) -> u8 {
 ///
 /// # Errors
 /// Returns [`V2CodecError`] when a field is malformed or exceeds its bound.
+// One arm per protocol message, deliberately kept in a single function so the
+// wire format can be read top to bottom against protocol.md. Splitting it would
+// scatter the encoding across helpers, and merging arms that coincidentally
+// share a payload shape -- `CancelRequest` and `PublishReady` are both a bare
+// u64 -- would destroy the one-to-one message-to-wire correspondence that makes
+// this auditable.
+#[allow(clippy::too_many_lines, clippy::match_same_arms)]
 pub fn encode(message: &V2Message) -> Result<Vec<u8>, V2CodecError> {
     let mut writer = Writer::default();
     match message {
@@ -693,6 +744,13 @@ pub fn encode(message: &V2Message) -> Result<Vec<u8>, V2CodecError> {
 /// # Errors
 /// Returns [`V2CodecError`] when the type, payload, field value, or bounds are
 /// invalid.
+// One arm per protocol message, deliberately kept in a single function so the
+// wire format can be read top to bottom against protocol.md. Splitting it would
+// scatter the encoding across helpers, and merging arms that coincidentally
+// share a payload shape -- `CancelRequest` and `PublishReady` are both a bare
+// u64 -- would destroy the one-to-one message-to-wire correspondence that makes
+// this auditable.
+#[allow(clippy::too_many_lines, clippy::match_same_arms)]
 pub fn decode(message_type: u8, payload: &[u8]) -> Result<V2Message, V2CodecError> {
     if payload.len() > MAX_PAYLOAD {
         return Err(V2CodecError::Bound {
@@ -935,13 +993,13 @@ fn validate_stat_fields(
 
 fn encode_entry(writer: &mut Writer, entry: &BrowseEntry) -> Result<(), V2CodecError> {
     if !(1..=4).contains(&entry.kind) || (entry.kind != 3 && !entry.symlink_target.is_empty()) {
-        return Err(if !(1..=4).contains(&entry.kind) {
+        return Err(if (1..=4).contains(&entry.kind) {
+            V2CodecError::InvalidEntryFields
+        } else {
             V2CodecError::InvalidEnum {
                 field: "entry kind",
                 value: entry.kind,
             }
-        } else {
-            V2CodecError::InvalidEntryFields
         });
     }
     writer.blob(&entry.name, MAX_PATH, "entry name")?;
