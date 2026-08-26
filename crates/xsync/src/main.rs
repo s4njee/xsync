@@ -18,6 +18,28 @@ enum TransportArg {
     Rsync,
 }
 
+/// What to do when the remote has no xsync binary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum BootstrapArg {
+    /// Never upload; require xsync to already be installed remotely.
+    #[default]
+    Off,
+    /// Upload a verified binary for this run, then remove it.
+    Once,
+    /// Upload a verified binary and leave it in place for later runs.
+    Persist,
+}
+
+impl From<BootstrapArg> for xsync_core::bootstrap::BootstrapPolicy {
+    fn from(value: BootstrapArg) -> Self {
+        match value {
+            BootstrapArg::Off => Self::Disabled,
+            BootstrapArg::Once => Self::Ephemeral,
+            BootstrapArg::Persist => Self::Persist,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 enum CloudFilesArg {
     #[default]
@@ -75,6 +97,16 @@ struct Cli {
     /// Cloud placeholder policy: download, skip, or error.
     #[arg(long, value_enum, default_value_t = CloudFilesArg::Download)]
     cloud_files: CloudFilesArg,
+
+    /// Upload a verified xsync binary when the remote has none.
+    ///
+    /// Off by default: this copies an executable to the remote and runs it, so
+    /// it never happens unless asked for. The binary is checksummed on the
+    /// remote before execution, is written only under the invoking user's home
+    /// directory, and never requires root. `once` removes it afterwards;
+    /// `persist` leaves it for later runs.
+    #[arg(long, value_enum, default_value_t = BootstrapArg::Off)]
+    bootstrap: BootstrapArg,
 
     /// Re-read every written file from disk and verify its BLAKE3 hash.
     #[arg(long)]
@@ -164,6 +196,7 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
         dry_run: cli.dry_run,
         delete: cli.delete,
         checksum: cli.checksum,
+        bootstrap: cli.bootstrap.into(),
         cloud_files: match cli.cloud_files {
             CloudFilesArg::Download => xsync_core::local::CloudFilesPolicy::Download,
             CloudFilesArg::Skip => xsync_core::local::CloudFilesPolicy::Skip,
@@ -307,11 +340,41 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
         )?
     };
 
+    // An ephemeral bootstrap leaves nothing behind. This runs after the
+    // transfer rather than on drop so a failure to clean up can be reported
+    // without turning a completed transfer into a failed one.
+    if cli.bootstrap == BootstrapArg::Once {
+        if let Some(host) = src_authority.as_deref().or(dest_authority.as_deref()) {
+            if let Some(remote_path) =
+                xsync_core::server::bootstrapped_program(cli.rsh.as_deref(), host)
+            {
+                deprovision_remote(cli, host, &remote_path, quiet);
+            }
+        }
+    }
+
     Ok(if report.partial_failure() {
         RunOutcome::Partial
     } else {
         RunOutcome::Complete
     })
+}
+
+/// Remove a binary uploaded for this run only.
+fn deprovision_remote(cli: &Cli, host: &str, remote_path: &str, quiet: bool) {
+    let rsh = cli.rsh.as_deref();
+    let shell = xsync_core::server::learned_remote_shell(rsh, host);
+    if let Err(error) = xsync_core::bootstrap::remove_remote(rsh, host, shell, remote_path) {
+        // The transfer already succeeded; a leftover file is worth reporting
+        // but is not a reason to fail the run.
+        if !quiet {
+            eprintln!(
+                "warning: could not remove the bootstrapped binary at {remote_path}: {error}"
+            );
+        }
+    } else if !quiet {
+        eprintln!("bootstrap: removed {remote_path}");
+    }
 }
 
 fn run_rsync_push(

@@ -110,6 +110,9 @@ pub enum ServerError {
     /// The remote shell positively reported that xsync is unavailable.
     #[error("xs not found on remote host — install it or check PATH")]
     MissingRemoteXsync,
+    /// Provisioning a binary onto a remote that lacked one failed.
+    #[error("remote bootstrap failed: {0}")]
+    Bootstrap(String),
     /// The remote was reached but its shell could not parse the server command.
     ///
     /// Raised for stock Windows OpenSSH, which hands the command to `cmd.exe`.
@@ -4989,7 +4992,7 @@ pub fn sync_push_server<F: FnMut(LocalEvent)>(
         );
     }
     let mut emit = emit;
-    spawn_and_run_session(dest_path, rsh, host, |reader, writer| {
+    spawn_and_run_session(dest_path, rsh, host, options.bootstrap, |reader, writer| {
         run_client_push(
             source_path,
             source_trailing_slash,
@@ -6053,7 +6056,7 @@ pub fn sync_pull_server<F: FnMut(LocalEvent)>(
     emit: F,
 ) -> Result<LocalSyncReport, ServerError> {
     let mut emit = emit;
-    spawn_and_run_session(src_path, rsh, host, |reader, writer| {
+    spawn_and_run_session(src_path, rsh, host, options.bootstrap, |reader, writer| {
         run_client_pull(
             src_path,
             src_trailing_slash,
@@ -6083,6 +6086,7 @@ fn spawn_and_run_session<F>(
     remote_path: &str,
     rsh: Option<&str>,
     host: Option<&str>,
+    bootstrap: crate::bootstrap::BootstrapPolicy,
     mut f: F,
 ) -> Result<LocalSyncReport, ServerError>
 where
@@ -6093,25 +6097,59 @@ where
 {
     let Some(host_name) = host else {
         let child = spawn_server_child_with_shell(remote_path, rsh, host, RemoteShell::Posix)?;
-        return run_server_child_session(child, &mut f);
+        return run_server_child_session(child, RemoteShell::Posix, &mut f);
     };
 
-    let first = remote_shell_for(rsh, host_name);
-    let child = spawn_server_child_with_shell(remote_path, rsh, host, first)?;
-    let result = run_server_child_session(child, &mut f);
+    let mut shell = remote_shell_for(rsh, host_name);
+    let child = spawn_server_child_with_shell(remote_path, rsh, host, shell)?;
+    let mut result = run_server_child_session(child, shell, &mut f);
+
+    // The POSIX form silently succeeded without running anything, which only
+    // stock Windows cmd.exe does. Try the cmd form.
+    if matches!(result, Err(ServerError::RemoteShellMismatch)) && shell == RemoteShell::Posix {
+        shell = RemoteShell::Windows;
+        let child = spawn_server_child_with_shell(remote_path, rsh, host, shell)?;
+        result = run_server_child_session(child, shell, &mut f);
+        // Remember the family whenever the cmd form got further than the POSIX
+        // one did, not only on a completed transfer: "the binary is missing"
+        // is itself proof that cmd parsed the command, and bootstrap needs the
+        // right family to upload with.
+        if !matches!(result, Err(ServerError::RemoteShellMismatch)) {
+            remember_remote_shell(rsh, host_name, shell);
+        }
+    }
+
+    // The remote answered but has no xsync. With bootstrap enabled, provision a
+    // verified binary and run against that. Attempted once per host: the
+    // uploaded path is recorded before the retry, so a second failure is a real
+    // failure rather than an upload loop.
+    if matches!(result, Err(ServerError::MissingRemoteXsync))
+        && bootstrap.enabled()
+        && remote_program_for(rsh, host_name).is_none()
+    {
+        let (platform, home) = crate::bootstrap::detect_remote_platform(rsh, host_name, shell)
+            .map_err(|error| ServerError::Bootstrap(error.to_string()))?;
+        let binary = crate::bootstrap::locate_binary(platform)
+            .map_err(|error| ServerError::Bootstrap(error.to_string()))?;
+        // Reported unconditionally, including under --quiet: copying an
+        // executable onto another machine and running it is a side effect the
+        // operator should always see, not a progress detail.
+        eprintln!(
+            "bootstrap: {host_name} is {} and has no xsync; uploading {}",
+            platform.target_triple(),
+            binary.display()
+        );
+        let uploaded =
+            crate::bootstrap::upload_and_verify(rsh, host_name, shell, &home, &binary, bootstrap)
+                .map_err(|error| ServerError::Bootstrap(error.to_string()))?;
+        eprintln!("bootstrap: checksum verified on {host_name}, running {uploaded}");
+        remember_remote_program(rsh, host_name, uploaded);
+        let child = spawn_server_child_with_shell(remote_path, rsh, host, shell)?;
+        result = run_server_child_session(child, shell, &mut f);
+    }
 
     match result {
-        Err(ServerError::RemoteShellMismatch) if first == RemoteShell::Posix => {
-            let child =
-                spawn_server_child_with_shell(remote_path, rsh, host, RemoteShell::Windows)?;
-            let retried = run_server_child_session(child, &mut f);
-            if retried.is_ok() {
-                remember_remote_shell(rsh, host_name, RemoteShell::Windows);
-            }
-            retried
-        }
-        // A mismatch when the Windows form was already in use is not a shell
-        // problem; report it as the transport failure it actually is.
+        // Still silent after the cmd form was tried: not a shell problem.
         Err(ServerError::RemoteShellMismatch) => Err(ServerError::Transport {
             stream: 0,
             message: "remote xsync server exited without completing the session".to_owned(),
@@ -6124,7 +6162,19 @@ fn parse_rsh_command(rsh: &str) -> Vec<String> {
     shlex::split(rsh).unwrap_or_else(|| vec![rsh.to_owned()])
 }
 
-fn quote_remote_arg(argument: &str) -> String {
+/// Quote a program name, keeping a leading `$HOME` expandable.
+///
+/// A bootstrap-uploaded binary lives under the remote user's home, which is
+/// only known to the remote shell, so that one prefix must survive quoting
+/// while the rest of the path is still protected.
+fn quote_remote_arg_or_path(program: &str) -> String {
+    program.strip_prefix("$HOME/").map_or_else(
+        || quote_remote_arg(program),
+        |rest| format!("\"$HOME\"/{}", quote_remote_arg(rest)),
+    )
+}
+
+pub(crate) fn quote_remote_arg(argument: &str) -> String {
     format!("'{}'", argument.replace('\'', "'\\''"))
 }
 
@@ -6160,7 +6210,7 @@ pub enum RemoteShell {
 /// (which still expands `%VAR%` inside quotes and would leak or corrupt the
 /// path). Neither can be escaped reliably across `cmd` versions, so they are
 /// refused rather than mangled.
-fn quote_windows_arg(argument: &str) -> Result<String, ServerError> {
+pub(crate) fn quote_windows_arg(argument: &str) -> Result<String, ServerError> {
     if argument.contains('"') || argument.contains('%') {
         return Err(ServerError::InvalidPath(format!(
             "remote Windows path may not contain '\"' or '%': {argument}"
@@ -6182,19 +6232,27 @@ fn quote_windows_path(path: &str) -> Result<String, ServerError> {
     quote_windows_arg(path)
 }
 
-fn xsync_remote_command(remote_path: &str, shell: RemoteShell) -> Result<String, ServerError> {
+fn xsync_remote_command(
+    remote_path: &str,
+    shell: RemoteShell,
+    program: Option<&str>,
+) -> Result<String, ServerError> {
+    // A bootstrap-provisioned binary is addressed by absolute path; otherwise
+    // the bare name is resolved from the remote's PATH.
+    let program = program.unwrap_or("xs");
     match shell {
         RemoteShell::Posix => Ok(format!(
             "PATH=\"$HOME/.local/bin:$PATH\" {} {} {}",
-            quote_remote_arg("xs"),
+            quote_remote_arg_or_path(program),
             quote_remote_arg("--server"),
             quote_remote_path(remote_path)
         )),
-        // `set "PATH=..." & xs --server "<path>"`. A single `&` rather than
+        // `set "PATH=..." & "xs" --server "<path>"`. A single `&` rather than
         // `&&` so a `set` that reports failure still runs the server, matching
         // the POSIX form where the assignment prefix cannot fail independently.
         RemoteShell::Windows => Ok(format!(
-            "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & xs --server {}",
+            "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & {} --server {}",
+            quote_windows_arg(program)?,
             quote_windows_path(remote_path)?
         )),
     }
@@ -6227,6 +6285,40 @@ fn remote_shell_for(rsh: Option<&str>, host: &str) -> RemoteShell {
         .unwrap_or_default()
 }
 
+/// Remote program to invoke, when bootstrap has uploaded one for this host.
+///
+/// Kept alongside the shell cache rather than threaded through every sync
+/// entry point, because it is the same shape of fact: something learned about
+/// one host that every later spawn in this process should reuse.
+fn remote_program_cache() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The program name the remote command should invoke: `xs` from the remote's
+/// own PATH unless bootstrap has placed one at a known path.
+fn remote_program_for(rsh: Option<&str>, host: &str) -> Option<String> {
+    remote_program_cache()
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&remote_shell_key(rsh, host)).cloned())
+}
+
+/// The path bootstrap uploaded for `host`, if any. The CLI uses this to remove
+/// an ephemeral binary once the transfer is done.
+#[must_use]
+pub fn bootstrapped_program(rsh: Option<&str>, host: &str) -> Option<String> {
+    remote_program_for(rsh, host)
+}
+
+/// Record the path bootstrap uploaded, so this and later sessions use it.
+pub fn remember_remote_program(rsh: Option<&str>, host: &str, program: String) {
+    if let Ok(mut map) = remote_program_cache().lock() {
+        map.insert(remote_shell_key(rsh, host), program);
+    }
+}
+
 fn remember_remote_shell(rsh: Option<&str>, host: &str, shell: RemoteShell) {
     if let Ok(mut map) = remote_shell_cache().lock() {
         map.insert(remote_shell_key(rsh, host), shell);
@@ -6236,7 +6328,11 @@ fn remember_remote_shell(rsh: Option<&str>, host: &str, shell: RemoteShell) {
 /// `(program, args)` that runs one command string on `host`, without deciding
 /// what that string should be. Shared by the shell probe and the server launch
 /// so they can never disagree about how the remote shell is reached.
-fn base_remote_invocation(rsh: Option<&str>, host: &str, command: &str) -> (String, Vec<String>) {
+pub(crate) fn base_remote_invocation(
+    rsh: Option<&str>,
+    host: &str,
+    command: &str,
+) -> (String, Vec<String>) {
     if let Some(rsh_cmd) = rsh {
         let parts = parse_rsh_command(rsh_cmd);
         let program = parts.first().cloned().unwrap_or_else(|| rsh_cmd.to_owned());
@@ -6261,9 +6357,23 @@ const DEFAULT_RSH: &str = "ssh";
 
 fn is_missing_xsync_stderr(stderr: &str, exit_code: Option<i32>) -> bool {
     let lower = stderr.to_lowercase();
+    // 9009 is cmd.exe's "not recognized as an internal or external command".
+    // It is matched on the code alone because cmd localises the message, so
+    // matching text would only work on English installs.
+    if exit_code == Some(9009) {
+        return true;
+    }
     lower.contains("xs: command not found")
         || lower.contains("xs: not found")
         || (exit_code == Some(127) && lower.contains("xs"))
+}
+
+/// The remote shell family learned for `host`, for callers that need to build
+/// their own remote commands — bootstrap, which must upload and hash a file
+/// using whichever shell the remote actually runs.
+#[must_use]
+pub fn learned_remote_shell(rsh: Option<&str>, host: &str) -> RemoteShell {
+    remote_shell_for(rsh, host)
 }
 
 /// Compute `(program, args)` used to launch the remote `xsync --server`.
@@ -6286,11 +6396,13 @@ pub fn remote_server_command_with_shell(
     host: Option<&str>,
     shell: RemoteShell,
 ) -> Result<(String, Vec<String>), ServerError> {
+    let program = host.and_then(|h| remote_program_for(rsh, h));
+    let program = program.as_deref();
     match host {
         Some(h) => Ok(base_remote_invocation(
             rsh,
             h,
-            &xsync_remote_command(remote_path, shell)?,
+            &xsync_remote_command(remote_path, shell, program)?,
         )),
         // No host: the server runs locally as a child process with no shell in
         // between, so the arguments are passed through verbatim and none of the
@@ -6403,7 +6515,11 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
-fn run_server_child_session<F>(child: Child, f: F) -> Result<LocalSyncReport, ServerError>
+fn run_server_child_session<F>(
+    child: Child,
+    shell: RemoteShell,
+    f: F,
+) -> Result<LocalSyncReport, ServerError>
 where
     F: FnMut(
         &mut BufReader<CountingReader<std::process::ChildStdout>>,
@@ -6463,29 +6579,32 @@ where
         return Err(ServerError::MissingRemoteXsync);
     }
 
-    // The remote shell reported success and yet never spoke a single byte of the
-    // protocol. That pair is the exact, measured signature of the POSIX command
-    // string reaching stock Windows `cmd.exe`: `PATH` is a cmd builtin, so
-    // `PATH="$HOME/.local/bin:$PATH" \'xs\' ...` is read as a `PATH` command that
-    // sets the search path to that literal text and exits 0. Nothing runs, and
-    // no error is reported anywhere.
+    let silent = bytes_from_remote.load(std::sync::atomic::Ordering::Relaxed) == 0;
+
+    // Nothing on the far end ever spoke the protocol. What that means depends
+    // on how the remote exited, and both cases were measured rather than
+    // assumed:
     //
-    // Both halves are load-bearing:
+    //   * Exit 0 with no output is the POSIX command string reaching stock
+    //     Windows `cmd.exe`, where `PATH` is a builtin: the whole command is
+    //     read as a `PATH` invocation that sets the search path to that literal
+    //     text and succeeds. Nothing runs and nothing is reported.
+    //   * A non-zero exit under the cmd form means cmd did run the command and
+    //     it failed. With no protocol bytes, the binary was not there --
+    //     cmd reports "is not recognized" and exits 1, not the 9009 its docs
+    //     suggest, so the code is not matched on and the localised message is
+    //     not parsed.
     //
-    //   * Requiring exit 0 excludes a server that started and then died. A
-    //     transfer killed mid-flight exits non-zero, and its staged data and
-    //     resume journal must survive -- retrying there would resume from the
-    //     checkpoint and publish a file the caller was never told about.
-    //   * Requiring zero bytes excludes a remote that spoke and then failed,
-    //     including a peer that answers with a malformed protocol.
-    //
-    // ssh's own 255 (authentication, host key, connection) fails both tests, so
-    // a rejected credential still costs exactly one connection attempt.
-    if result.is_err()
-        && exit_code == Some(0)
-        && bytes_from_remote.load(std::sync::atomic::Ordering::Relaxed) == 0
-    {
-        return Err(ServerError::RemoteShellMismatch);
+    // ssh reserves 255 for its own failures (authentication, host key,
+    // connection), so those are excluded from both and a rejected credential
+    // still costs exactly one connection attempt.
+    if result.is_err() && silent && exit_code != Some(255) {
+        if exit_code == Some(0) {
+            return Err(ServerError::RemoteShellMismatch);
+        }
+        if shell == RemoteShell::Windows {
+            return Err(ServerError::MissingRemoteXsync);
+        }
     }
 
     if status.is_some_and(|status| !status.success()) && result.is_ok() {
@@ -7607,7 +7726,7 @@ mod tests {
             args,
             [
                 "winbox",
-                "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & xs --server \"C:/backup\""
+                "set \"PATH=%USERPROFILE%\\.local\\bin;%PATH%\" & \"xs\" --server \"C:/backup\""
             ]
         );
     }
@@ -7618,7 +7737,7 @@ mod tests {
             remote_server_command_with_shell("~", None, Some("winbox"), RemoteShell::Windows)
                 .unwrap();
         assert!(
-            args[1].ends_with("xs --server \"%USERPROFILE%\""),
+            args[1].ends_with("\"xs\" --server \"%USERPROFILE%\""),
             "{}",
             args[1]
         );
@@ -7631,7 +7750,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            args[1].ends_with("xs --server \"%USERPROFILE%\\backup\""),
+            args[1].ends_with("\"xs\" --server \"%USERPROFILE%\\backup\""),
             "{}",
             args[1]
         );

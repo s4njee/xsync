@@ -261,6 +261,8 @@ pub struct LocalSyncOptions {
     pub compress: bool,
     /// Requested zstd level, constrained to 1..=22 by the CLI.
     pub compress_level: i32,
+    /// Whether to upload a verified binary to a remote that has none.
+    pub bootstrap: crate::bootstrap::BootstrapPolicy,
 }
 
 impl Default for LocalSyncOptions {
@@ -278,6 +280,7 @@ impl Default for LocalSyncOptions {
             exclude_patterns: Vec::new(),
             compress: true,
             compress_level: 3,
+            bootstrap: crate::bootstrap::BootstrapPolicy::Disabled,
         }
     }
 }
@@ -1836,6 +1839,7 @@ mod tests {
             exclude_patterns: Vec::new(),
             compress: true,
             compress_level: 3,
+            bootstrap: crate::bootstrap::BootstrapPolicy::Disabled,
         }
     }
 

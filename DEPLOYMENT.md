@@ -296,7 +296,10 @@ distribution problem that no amount of packaging solves on its own.
 - Behaviour is covered by an integration test using the `--rsh` harness.
 
 ### Story D5.2 — Remote bootstrap
-- [ ] Optionally push a matching binary to a host that lacks one.
+- [x] `--bootstrap=once|persist` uploads a checksum-verified binary to a host that lacks
+  one. See [docs/remote-bootstrap.md](docs/remote-bootstrap.md). Verified end to end
+  against a stock Windows 11 ARM64 host with no xsync installed: uploaded, verified,
+  10 files transferred byte-identical, and removed afterwards.
 
 **AC**
 - An explicit, opt-in flag copies a verified binary for the remote's detected platform to a

@@ -11,6 +11,7 @@
 //! Epic 2 stories are implemented.
 
 //! xsync-core's public modules.
+pub mod bootstrap;
 pub mod clone;
 pub mod cloud;
 pub mod compression;
