@@ -322,9 +322,12 @@ pub fn validate_options(options: &LocalSyncOptions) -> Result<(), RsyncError> {
 /// Validate a probed peer before source scanning or receiver launch.
 ///
 /// # Errors
-/// Returns an unsupported-peer error for any non-GNU protocol-32 dialect.
+/// Returns an unsupported-peer error for non-GNU peers older than protocol 32.
 pub fn validate_peer(peer: &RsyncPeer) -> Result<(), RsyncError> {
-    if peer.implementation != "GNU rsync" || peer.max_protocol != RSYNC_WIRE_VERSION {
+    // The sender speaks protocol 32 explicitly.  A newer GNU rsync remains
+    // backwards compatible and negotiates down to 32; requiring equality
+    // would unnecessarily reject future (and locally configured) receivers.
+    if peer.implementation != "GNU rsync" || peer.max_protocol < RSYNC_WIRE_VERSION {
         return Err(RsyncError::UnsupportedPeer(format!(
             "{} {} advertises protocol {}; v1 requires GNU rsync protocol {RSYNC_WIRE_VERSION}",
             peer.implementation, peer.version, peer.max_protocol
@@ -341,9 +344,17 @@ pub fn validate_peer(peer: &RsyncPeer) -> Result<(), RsyncError> {
 pub fn probe_remote(rsh: Option<&str>, host: &str) -> Result<RsyncPeer, RsyncError> {
     let output = run_command_capture(remote_command(rsh, host, &[b"rsync", b"--version"])?)?;
     if !output.status.success() {
-        return Err(RsyncError::UnsupportedPeer(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
+        let status = output
+            .status
+            .code()
+            .map_or_else(|| "signal".to_owned(), |code| code.to_string());
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail = if detail.is_empty() {
+            format!("remote shell exited with status {status}")
+        } else {
+            format!("remote shell exited with status {status}: {detail}")
+        };
+        return Err(RsyncError::UnsupportedPeer(detail));
     }
     parse_version_probe(&output.stdout)
 }
@@ -357,7 +368,7 @@ pub fn sync_push<F: FnMut(LocalEvent)>(
     source: &Path,
     source_trailing_slash: bool,
     destination: &str,
-    _destination_trailing_slash: bool,
+    destination_trailing_slash: bool,
     options: &LocalSyncOptions,
     rsh: Option<&str>,
     host: &str,
@@ -413,7 +424,13 @@ pub fn sync_push<F: FnMut(LocalEvent)>(
         command_args.push(b"--dry-run".to_vec());
     }
     command_args.push(b".".to_vec());
-    command_args.push(destination.as_bytes().to_vec());
+    let mut destination_arg = destination.as_bytes().to_vec();
+    // Path parsing keeps the slash separately, but rsync uses it to decide
+    // whether a non-existent destination should be created as a directory.
+    if destination_trailing_slash && !destination_arg.ends_with(b"/") {
+        destination_arg.push(b'/');
+    }
+    command_args.push(destination_arg);
     let command_refs: Vec<&[u8]> = command_args.iter().map(Vec::as_slice).collect();
     let mut child = remote_command(rsh, host, &command_refs)?
         .stdin(Stdio::piped())
@@ -1518,6 +1535,21 @@ mod tests {
         .unwrap();
         assert_eq!(open.implementation, "openrsync");
         assert_eq!(open.max_protocol, 29);
+    }
+
+    #[test]
+    fn newer_gnu_protocol_is_accepted_for_protocol_32_sender() {
+        let peer = RsyncPeer {
+            implementation: "GNU rsync".to_owned(),
+            version: "future".to_owned(),
+            max_protocol: RSYNC_WIRE_VERSION + 1,
+        };
+        assert!(validate_peer(&peer).is_ok());
+        let old = RsyncPeer {
+            max_protocol: RSYNC_WIRE_VERSION - 1,
+            ..peer
+        };
+        assert!(validate_peer(&old).is_err());
     }
 
     #[test]

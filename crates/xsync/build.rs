@@ -13,6 +13,13 @@ fn main() {
         .expect("OUT_DIR must be below target/<profile>/build/<package>");
     let destination = profile_dir.join("xsync-server.cmd");
 
+    let launcher = fs::read_to_string("resources/xsync-server.cmd")
+        .unwrap_or_else(|error| panic!("cannot read resources/xsync-server.cmd: {error}"));
+    assert!(
+        launcher.contains("%~dp0xs.exe"),
+        "Windows server launcher must invoke the xs.exe binary"
+    );
+
     fs::copy("resources/xsync-server.cmd", &destination)
         .unwrap_or_else(|error| panic!("cannot package {}: {error}", destination.display()));
 }

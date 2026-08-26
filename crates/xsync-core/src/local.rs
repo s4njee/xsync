@@ -351,6 +351,14 @@ pub enum LocalSyncError {
     /// A source or destination scan failed before transfer.
     #[error(transparent)]
     Scan(#[from] ScanError),
+    /// The source and effective destination overlap on disk.
+    #[error("source '{}' and destination '{}' overlap", source_path.display(), destination.display())]
+    PathOverlap {
+        /// Source root path.
+        source_path: PathBuf,
+        /// Effective destination root path.
+        destination: PathBuf,
+    },
     /// Metadata planning failed before transfer.
     #[error(transparent)]
     Planning(#[from] PlannerError),
@@ -428,11 +436,19 @@ where
     F: FnMut(LocalEvent),
 {
     validate_options(options)?;
+    let source_path = source.as_ref();
+    let destination_path = destination.as_ref();
+    let source_metadata =
+        fs::symlink_metadata(source_path).map_err(|source| LocalSyncError::SourceRoot {
+            path: source_path.to_path_buf(),
+            source,
+        })?;
+    validate_source_destination_overlap(source_path, destination_path, &source_metadata)?;
     if !options.dry_run && options.cloud_files == CloudFilesPolicy::Download {
         if let Some(report) = try_directory_fast_path(
-            source.as_ref(),
+            source_path,
             source_trailing_slash,
-            destination.as_ref(),
+            destination_path,
             destination_trailing_slash,
             options,
             &mut emit,
@@ -441,9 +457,9 @@ where
         }
     }
     let prepared = prepare_transfer(
-        source.as_ref(),
+        source_path,
         source_trailing_slash,
-        destination.as_ref(),
+        destination_path,
         destination_trailing_slash,
         options,
         &mut emit,
@@ -1217,6 +1233,58 @@ fn source_reader_root(source: &Path, kind: EntryKind) -> PathBuf {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf()
+    }
+}
+
+fn validate_source_destination_overlap(
+    source: &Path,
+    destination: &Path,
+    source_metadata: &fs::Metadata,
+) -> Result<(), LocalSyncError> {
+    let source_real =
+        canonicalize_with_missing(source).map_err(|source_error| LocalSyncError::SourceRoot {
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+    let destination_real = canonicalize_with_missing(destination).map_err(|source_error| {
+        LocalSyncError::SourceRoot {
+            path: destination.to_path_buf(),
+            source: source_error,
+        }
+    })?;
+    let source_is_directory = source_metadata.is_dir() && !source_metadata.file_type().is_symlink();
+    let overlaps = source_real == destination_real
+        || destination_real.starts_with(&source_real)
+        || (source_is_directory && source_real.starts_with(&destination_real));
+    if overlaps {
+        return Err(LocalSyncError::PathOverlap {
+            source_path: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+fn canonicalize_with_missing(path: &Path) -> io::Result<PathBuf> {
+    let mut suffix = Vec::new();
+    let mut current = path;
+    loop {
+        match fs::canonicalize(current) {
+            Ok(mut resolved) => {
+                for component in suffix.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name() else {
+                    return Err(error);
+                };
+                suffix.push(name.to_owned());
+                current = current.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -2044,5 +2112,32 @@ mod tests {
         let actual =
             filetime::FileTime::from_last_modification_time(&fs::metadata(&destination).unwrap());
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn rejects_destination_inside_source_tree() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"data").unwrap();
+        let destination = source.join("nested/new");
+
+        let error = sync(&source, true, &destination, false, &options(), |_| {}).unwrap_err();
+        assert!(matches!(error, LocalSyncError::PathOverlap { .. }));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn rejects_delete_sync_to_source_parent() {
+        let temp = tempdir().unwrap();
+        let source = temp.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("file"), b"data").unwrap();
+        let mut options = options();
+        options.delete = true;
+
+        let error = sync(&source, true, temp.path(), false, &options, |_| {}).unwrap_err();
+        assert!(matches!(error, LocalSyncError::PathOverlap { .. }));
+        assert!(source.join("file").exists());
     }
 }

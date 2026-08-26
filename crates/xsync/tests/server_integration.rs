@@ -89,14 +89,14 @@ fn write_fake_rsh(script_dir: &Path, mode: &str) -> PathBuf {
             } else {
                 xsync_bin().to_owned()
             };
-            format!("#!/bin/sh\nshift\neval \"set -- $1\"\nexec {target} \"$2\" \"$3\"\n")
+            format!("#!/bin/sh\nshift\neval \"set -- $1\"\n# The remote command may begin with PATH=...; discard the command word.\nshift\nexec {target} \"$2\" \"$3\"\n")
         }
         // Start the server, then SIGKILL it shortly after so the client sees a
         // mid-transfer disconnect and leaves only staging artifacts.
         "crash" => {
             let xs = xsync_bin();
             format!(
-                "#!/bin/sh\nshift\neval \"set -- $1\"\n\"{xs}\" \"$2\" \"$3\" &\nPID=$!\nsleep 0.05\nkill -9 $PID\nwait $PID\n"
+                "#!/bin/sh\nshift\neval \"set -- $1\"\nshift\n\"{xs}\" \"$2\" \"$3\" &\nPID=$!\nsleep 0.05\nkill -9 $PID\nwait $PID\n"
             )
         }
         // Start the server and SIGKILL it once the receiver has durably staged
@@ -105,7 +105,7 @@ fn write_fake_rsh(script_dir: &Path, mode: &str) -> PathBuf {
         "crash_after_chunk" => {
             let xs = xsync_bin();
             format!(
-                "#!/bin/sh\nshift\neval \"set -- $1\"\n\"{xs}\" \"$2\" \"$3\" &\nPID=$!\n\
+                "#!/bin/sh\nshift\neval \"set -- $1\"\nshift\n\"{xs}\" \"$2\" \"$3\" &\nPID=$!\n\
                  for i in $(seq 1 400); do\n\
                  \x20 f=$(ls \"$3\"/.xsync.tmp.* 2>/dev/null | head -n1)\n\
                  \x20 if [ -n \"$f\" ] && [ \"$(wc -c < \"$f\" 2>/dev/null || echo 0)\" -ge 8388608 ]; then\n\
@@ -379,6 +379,36 @@ fn test_rsync_remote_destination_is_shell_quoted() {
         "hostile destination executed a second command"
     );
     assert_eq!(fs::read(hostile.join("file.txt")).unwrap(), b"quoted");
+}
+
+#[test]
+fn test_rsync_destination_trailing_slash_preserves_directory_semantics() {
+    let src = tempdir().unwrap();
+    fs::write(src.path().join("file.txt"), b"directory target").unwrap();
+    let base = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), false) else {
+        return;
+    };
+    let destination = base.path().join("new-directory");
+    let output = Command::new(xsync_bin())
+        .arg("--transport=rsync")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(src.path().join("file.txt"))
+        .arg(format!("fakehost:{}/", destination.display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(destination.join("file.txt")).unwrap(),
+        b"directory target"
+    );
+    assert!(destination.is_dir());
 }
 
 #[test]

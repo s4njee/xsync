@@ -243,7 +243,11 @@ impl Sink {
         let final_path = self.destination_path(&entry.path)?;
         let temp_path = self.temporary_path(&entry.path)?;
         create_parent(&final_path)?;
-        if let Ok(metadata) = fs::metadata(&temp_path) {
+        // Do not follow a pre-existing symlink at the staging path. Besides
+        // invalidating the resume guarantee, doing so would let a malicious
+        // or interrupted run redirect chunk writes outside the destination
+        // root.
+        if let Ok(metadata) = fs::symlink_metadata(&temp_path) {
             if metadata.len() == entry.size && !metadata.file_type().is_symlink() {
                 return Ok(());
             }
@@ -405,6 +409,27 @@ impl Sink {
         if relative_path.is_empty() {
             return Err(invalid_path(&relative_path.to_string()));
         }
+        // Never resolve an existing symlink in an ancestor. The final
+        // component may legitimately be replaced (for example, a file being
+        // changed into a directory), but an ancestor would redirect the
+        // operation outside the destination root.
+        let mut ancestor = self.root.clone();
+        let components = relative_path.as_bytes().split(|byte| *byte == b'/');
+        let count = relative_path.depth();
+        for (index, component) in components.enumerate() {
+            if index + 1 == count {
+                break;
+            }
+            let component_path = WirePath::from_wire(component.to_vec())
+                .expect("components of a validated path are safe")
+                .to_native_path(Path::new(""));
+            ancestor.push(component_path);
+            if let Ok(metadata) = fs::symlink_metadata(&ancestor) {
+                if metadata.file_type().is_symlink() {
+                    return Err(invalid_path(&relative_path.to_string()));
+                }
+            }
+        }
         Ok(relative_path.to_native_path(&self.root))
     }
 }
@@ -462,7 +487,12 @@ fn write_at(path: &Path, offset: u64, data: &[u8]) -> Result<(), SinkError> {
     file.seek(SeekFrom::Start(offset))
         .map_err(|source| io_error("seek chunked temp file", path, source))?;
     file.write_all(data)
-        .map_err(|source| io_error("write chunked temp file", path, source))
+        .map_err(|source| io_error("write chunked temp file", path, source))?;
+    // The caller records the completed range in its durable receiver journal
+    // immediately after this function returns. Flush the staged bytes first
+    // so a checkpoint can never acknowledge data that exists only in cache.
+    file.sync_data()
+        .map_err(|source| io_error("sync chunked temp file", path, source))
 }
 
 fn apply_file_metadata(path: &Path, entry: &FileEntry) -> Result<(), SinkError> {
@@ -771,6 +801,48 @@ mod tests {
         );
         // The committed final file is unaffected by a later prepare.
         assert_eq!(fs::read(temp.path().join("large")).unwrap(), b"helloworld");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_large_replaces_a_symlinked_stage_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("target");
+        fs::write(&outside_file, b"must remain unchanged").unwrap();
+        let sink = Sink::new(temp.path()).unwrap();
+        let file = entry("nested/large", EntryKind::File, 20, 0o600, 100);
+        let stage = sink.temporary_path(&file.path).unwrap();
+        fs::create_dir_all(stage.parent().unwrap()).unwrap();
+        symlink(&outside_file, &stage).unwrap();
+
+        sink.prepare_large(&file).unwrap();
+
+        assert!(!fs::symlink_metadata(&stage)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&outside_file).unwrap(), b"must remain unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_destination_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        symlink(outside.path(), temp.path().join("nested")).unwrap();
+        let sink = Sink::new(temp.path()).unwrap();
+        let file = entry("nested/file", EntryKind::File, 4, 0o644, 1);
+
+        let error = sink
+            .write_file_with_retry(&file, &blake3::hash(b"data"), |_| Ok(b"data".to_vec()))
+            .unwrap_err();
+        assert!(matches!(error, SinkError::InvalidPath { .. }));
+        assert!(!outside.path().join("file").exists());
     }
 
     #[cfg(unix)]

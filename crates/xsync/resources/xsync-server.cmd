@@ -6,5 +6,5 @@ set "ROOT=%~1"
 if not defined ROOT set "ROOT=%~dp0data"
 if not exist "%ROOT%" mkdir "%ROOT%"
 
-"%~dp0xsync.exe" --server "%ROOT%"
+"%~dp0xs.exe" --server "%ROOT%"
 exit /b %ERRORLEVEL%

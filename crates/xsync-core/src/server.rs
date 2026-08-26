@@ -2029,6 +2029,11 @@ impl Server {
                     data,
                 } => {
                     if let Some(record) = active_files.remove(&file_id) {
+                        if offset != 0 {
+                            return Err(ServerError::UnexpectedMessage(format!(
+                                "non-zero offset {offset} for complete file {file_id}"
+                            )));
+                        }
                         let file_entry = file_entry_from_entry_record(&record)?;
                         validate_unique_destination_path(
                             &self.root,
@@ -2416,6 +2421,16 @@ impl Server {
                 } => {
                     // Check if regular batch file or large file range.
                     if let Some(record) = active_files.remove(&file_id) {
+                        // A batched file is a complete-file transfer.  The
+                        // offset is not part of this operation and must be
+                        // zero; accepting a non-zero offset would silently
+                        // turn a malformed/racy sender into a successful
+                        // transfer with different semantics.
+                        if offset != 0 {
+                            return Err(ServerError::UnexpectedMessage(format!(
+                                "non-zero offset {offset} for complete file {file_id}"
+                            )));
+                        }
                         let file_entry = file_entry_from_entry_record(&record)?;
                         validate_unique_destination_path(
                             &self.root,
@@ -2614,7 +2629,41 @@ impl Server {
                     writer.flush()?;
                 }
                 Message::LargeFileFinish { file_id, digest } => {
-                    if let Some(entry) = large_files.remove(&file_id) {
+                    let Some(entry) = large_files.remove(&file_id) else {
+                        return Err(ServerError::UnexpectedMessage(format!(
+                            "LargeFileFinish for unregistered file_id {file_id}"
+                        )));
+                    };
+                    {
+                        // `prepare_large` preallocates the staging file, so a
+                        // finish without complete coverage would otherwise
+                        // publish zero-filled holes as if they were received.
+                        // Require one merged range covering the entire file
+                        // before making the atomic commit.
+                        let mut ranges = large_ranges.get(&file_id).cloned().unwrap_or_default();
+                        // In multi-stream mode, data sessions checkpoint into
+                        // the shared journal after this control session has
+                        // received Prepare. Refresh from disk so the barrier
+                        // validates ranges actually written by those peers.
+                        let identity = crate::journal::ResumeIdentity {
+                            path: entry.path.as_bytes().to_vec(),
+                            fingerprint: entry.fingerprint,
+                        };
+                        if let Some(record) = self
+                            .journal
+                            .as_ref()
+                            .expect("journal is initialized during handshake")
+                            .load(&identity)?
+                        {
+                            ranges = crate::journal::merge_ranges(&ranges, &record.ranges);
+                        }
+                        let fully_covered = ranges_cover_file(entry.size, &ranges);
+                        if !fully_covered {
+                            large_ranges.remove(&file_id);
+                            return Err(ServerError::UnexpectedMessage(format!(
+                                "LargeFileFinish for file_id {file_id} has incomplete byte coverage"
+                            )));
+                        }
                         sink.finish_large(&entry)?;
                         // The file is committed; discard its resume record.
                         let journal = self
@@ -3804,8 +3853,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 let b = encode_frame(msg_id, &meta_msg)?;
                 writer.write_all(&b)?;
                 writer.flush()?;
-                match expect_ack_or_delete_warning(&mut decoder, &mut reader)? {
-                    Some(message) => record_delete_failure(
+                let deleted = if let Some(message) =
+                    expect_ack_or_delete_warning(&mut decoder, &mut reader)?
+                {
+                    record_delete_failure(
                         &mut report,
                         &mut emit,
                         &entry,
@@ -3813,10 +3864,16 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                             code: 1001,
                             message,
                         },
-                    ),
-                    None => emit(LocalEvent::Deleted {
+                    );
+                    false
+                } else {
+                    emit(LocalEvent::Deleted {
                         path: entry.path.to_string(),
-                    }),
+                    });
+                    true
+                };
+                if deleted {
+                    report.deleted_entries = report.deleted_entries.saturating_add(1);
                 }
             }
         }
@@ -4788,6 +4845,25 @@ fn encode_exclude_patterns(patterns: &[String]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn ranges_cover_file(size: u64, ranges: &[ByteRange]) -> bool {
+    if size == 0 {
+        return true;
+    }
+    let mut ordered = ranges.to_vec();
+    ordered.sort_by_key(|range| range.offset);
+    let mut cursor = 0_u64;
+    for range in ordered {
+        if range.offset > cursor {
+            return false;
+        }
+        cursor = cursor.max(range.offset.saturating_add(range.length));
+        if cursor >= size {
+            return true;
+        }
+    }
+    false
+}
+
 fn excluded_path(patterns: &[Vec<u8>], path: &WirePath) -> bool {
     let display = path.to_string();
     let mut candidate = Some(display.as_str());
@@ -5041,7 +5117,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             chunk_bytes: 16 * 1024 * 1024,
             window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
             delete: options.delete,
-            checksum: false,
+            checksum: options.checksum,
             paranoid: options.paranoid,
             dry_run: options.dry_run,
             exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
@@ -5117,14 +5193,37 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         // path; do not prepend it a second time.
         String::new()
     };
+    let exclude_patterns = encode_exclude_patterns(&options.exclude_patterns);
+    let hash_cache = options
+        .checksum
+        .then(|| HashCache::open(HashCache::default_path()).ok())
+        .flatten();
+    let source_reader_root = if source_is_dir {
+        source_path.to_path_buf()
+    } else {
+        source_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    };
     let mut mapped = Vec::new();
     for mut entry in source_entries {
+        if options.checksum && entry.kind == ScanEntryKind::File {
+            entry.fingerprint.identity = cached_content_identity(
+                &entry.path.to_native_path(&source_reader_root),
+                &entry,
+                hash_cache.as_ref(),
+            )?;
+        }
         if !prefix.is_empty() {
             entry.path = entry.path.with_prefix(&WirePath::from(prefix.as_str()));
         }
-        mapped.push(entry);
+        if !excluded_path(&exclude_patterns, &entry.path) {
+            mapped.push(entry);
+        }
     }
-    let plan = try_plan(mapped, dest_index)?;
+    let plan = try_plan_with_fingerprint(mapped, dest_index, options.checksum)?;
 
     let mut report = LocalSyncReport {
         local_workers: options.local_workers,
@@ -5149,6 +5248,63 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             path: entry.path.to_string(),
             bytes: entry.size,
         });
+    }
+
+    // The control server has already sent its destination scan, so complete
+    // the dry-run protocol transaction and reap it without opening any data
+    // sessions or sending mutation frames.
+    if options.dry_run {
+        crate::local::emit_plan_actions(&plan, &mut emit);
+        if let Some(cache) = hash_cache.as_ref() {
+            let (hits, misses) = cache.stats();
+            report.checksum_cache_hits = hits;
+            report.checksum_cache_misses = misses;
+        }
+        write_frame(
+            &mut cwriter,
+            calloc(),
+            &Message::Stats {
+                files: 0,
+                bytes: 0,
+                skipped: report.skipped_files as u64,
+                warnings: 0,
+                failed: 0,
+            },
+        )?;
+        expect_ack(&mut cdec, &mut creader)?;
+        let _ = cdec
+            .read(&mut creader)
+            .map_err(|e| map_transport_error(e, 0))?;
+        drop(cwriter);
+        drop(creader);
+        let _ = control.wait();
+        if let Some(handle) = cstderr_handle {
+            let _ = handle.join();
+        }
+        emit(LocalEvent::Finished {
+            transport: None,
+            transferred_files: 0,
+            transferred_bytes: 0,
+            skipped_files: report.skipped_files,
+            failed_entries: 0,
+            deleted_entries: 0,
+            warnings: 0,
+            physical_bytes: 0,
+            wire_bytes: 0,
+            directory_clones: 0,
+            file_clones: 0,
+            byte_copies: 0,
+            local_workers: options.local_workers,
+            streams,
+            partial_failure: false,
+            restarted_files: 0,
+            resumed_bytes: 0,
+            retransmitted_bytes: 0,
+            checkpoint_bytes: 0,
+            checksum_cache_hits: report.checksum_cache_hits,
+            checksum_cache_misses: report.checksum_cache_misses,
+        });
+        return Ok(report);
     }
 
     // ---- Control: create directories and symlinks ----
@@ -5534,19 +5690,26 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                         mtime_ns: 0,
                     },
                 )?;
-                match expect_ack_or_delete_warning(&mut cdec, &mut creader)? {
-                    Some(message) => record_delete_failure(
-                        &mut report,
-                        &mut emit,
-                        &entry,
-                        ServerError::RemoteError {
-                            code: 1001,
-                            message,
-                        },
-                    ),
-                    None => emit(LocalEvent::Deleted {
-                        path: entry.path.to_string(),
-                    }),
+                let deleted =
+                    if let Some(message) = expect_ack_or_delete_warning(&mut cdec, &mut creader)? {
+                        record_delete_failure(
+                            &mut report,
+                            &mut emit,
+                            &entry,
+                            ServerError::RemoteError {
+                                code: 1001,
+                                message,
+                            },
+                        );
+                        false
+                    } else {
+                        emit(LocalEvent::Deleted {
+                            path: entry.path.to_string(),
+                        });
+                        true
+                    };
+                if deleted {
+                    report.deleted_entries = report.deleted_entries.saturating_add(1);
                 }
             }
         }
@@ -5921,6 +6084,13 @@ fn spawn_server_child(
     rsh: Option<&str>,
     host: Option<&str>,
 ) -> Result<Child, ServerError> {
+    if host.is_some_and(|value| value.starts_with('-')) {
+        return Err(ServerError::Transport {
+            stream: 0,
+            message: "remote host must not start with '-' (would be parsed as an ssh option)"
+                .to_owned(),
+        });
+    }
     let (program, args) = remote_server_command(remote_path, rsh, host);
     let mut cmd = Command::new(program);
     cmd.args(args);
