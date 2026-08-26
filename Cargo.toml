@@ -13,7 +13,11 @@ rust-version = "1.88"
 version = "0.1.0"
 authors = ["xsync contributors"]
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/xsync" # placeholder until a real repo exists
+repository = "https://github.com/s4njee/xsync"
+homepage = "https://github.com/s4njee/xsync"
+readme = "README.md"
+keywords = ["rsync", "sync", "backup", "file-transfer", "blake3"]
+categories = ["command-line-utilities", "filesystem"]
 
 # Shared lints for every crate in the workspace.
 [workspace.lints.rust]

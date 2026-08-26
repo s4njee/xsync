@@ -88,6 +88,20 @@ jobs:
         env:
           XSYNC_CARGO: ${{ matrix.cross && 'cross' || 'cargo' }}
         run: scripts/package-release.sh ${{ matrix.target }} dist
+
+      # .deb and .rpm are built only where the binary is native: nfpm packages an
+      # already-built artifact, and the glibc floor the package declares has to
+      # describe the binary actually inside it.
+      - name: Linux packages
+        if: contains(matrix.target, 'linux') && !matrix.cross
+        run: |
+          set -euo pipefail
+          if ! command -v nfpm >/dev/null 2>&1; then
+            go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+            export PATH="$PATH:$(go env GOPATH)/bin"
+          fi
+          scripts/package-linux.sh ${{ matrix.target }} dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: xsync-${{ matrix.target }}
@@ -153,6 +167,11 @@ jobs:
         run: |
           echo "::error::Windows signing secret is set but the signing step is not implemented (D3.2)"
           exit 1
+      # Package-manager manifests are rendered from the published checksums, so
+      # they can only ever describe artifacts that actually shipped.
+      - name: Render package manifests
+        run: scripts/render-manifests.sh "${{ needs.verify.outputs.version }}" dist/SHA256SUMS dist/manifests
+
       - name: Publish release
         # Never on workflow_dispatch: that path exists precisely so the pipeline
         # can be exercised without producing a public release.
@@ -160,7 +179,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
             --title "$GITHUB_REF_NAME" \
             --notes-file <(scripts/release-notes.sh "${GITHUB_REF_NAME#v}") \
             --verify-tag

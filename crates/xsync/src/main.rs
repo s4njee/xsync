@@ -157,6 +157,20 @@ struct Cli {
     #[arg(long)]
     progress_json: bool,
 
+    /// Print the roff man page to stdout and exit.
+    ///
+    /// Generated from the parser, like the completions, so packaging cannot
+    /// ship a man page describing flags that no longer exist.
+    #[arg(long, hide = true)]
+    man: bool,
+
+    /// Print a shell completion script to stdout and exit.
+    ///
+    /// Generated from the parser rather than maintained by hand, so completions
+    /// cannot drift from the flags they complete.
+    #[arg(long, value_name = "SHELL", value_enum)]
+    completions: Option<clap_complete::Shell>,
+
     /// Append structured failure records to FILE, or to stderr when FILE is `-`.
     ///
     /// Independent of `--progress-json`: failures are captured during ordinary
@@ -184,11 +198,11 @@ struct Cli {
     rsh: Option<String>,
 
     /// Source path. Either side may be `[user@]host:path`.
-    #[arg(value_name = "SRC", required_unless_present = "server")]
+    #[arg(value_name = "SRC", required_unless_present_any = ["server", "completions", "man"])]
     src: Option<String>,
 
     /// Destination path. Either side may be `[user@]host:path`.
-    #[arg(value_name = "DEST", required_unless_present = "server")]
+    #[arg(value_name = "DEST", required_unless_present_any = ["server", "completions", "man"])]
     dest: Option<String>,
 }
 
@@ -213,6 +227,23 @@ fn main() -> std::process::ExitCode {
         cli.log_json.is_some() || cli.progress_json,
         cli.progress_json,
     );
+
+    if cli.man {
+        let command = <Cli as clap::CommandFactory>::command();
+        if clap_mangen::Man::new(command)
+            .render(&mut std::io::stdout())
+            .is_err()
+        {
+            return ExitCode::FAILURE;
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(shell) = cli.completions {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        clap_complete::generate(shell, &mut command, "xs", &mut std::io::stdout());
+        return ExitCode::SUCCESS;
+    }
 
     match run(&cli) {
         Ok(RunOutcome::Complete) => ExitCode::SUCCESS,

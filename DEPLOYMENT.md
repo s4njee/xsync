@@ -268,7 +268,11 @@ separates "a binary exists" from "a stranger can run it."
 Ordered by reach per unit of effort.
 
 ### Story D4.1 — Direct download and install script
-- [ ] The lowest-friction path, and the one every other channel falls back to.
+- [x] `scripts/install.sh` — POSIX sh, detects platform and libc, verifies the checksum
+  before installing, installs to `$HOME/.local/bin` without root, and reports whether that
+  is on `PATH`. Verified on macOS and on Linux (mars): happy path, checksum mismatch,
+  missing `SHA256SUMS`, and reinstall-over-existing. It refuses on any verification failure
+  and has no flag to skip verification.
 
 **AC**
 - A documented one-liner installs the correct artifact for the detected platform and
@@ -277,14 +281,22 @@ Ordered by reach per unit of effort.
 - It works without root by installing to a user-local prefix, and says where it put things.
 
 ### Story D4.2 — Homebrew
-- [ ] Covers macOS and Linux developer machines.
+- [~] Formula in `packaging/homebrew/xsync.rb` covering macOS and Linux, both architectures,
+  installing the man page and completions; `scripts/render-manifests.sh` fills it from the
+  published `SHA256SUMS` and refuses rather than emit an unfilled placeholder. **Untested
+  end to end**: `brew install` needs a tap repository and a published release, neither of
+  which exists yet.
 
 **AC**
 - `brew install xsync` works from a tap; formula updates are automated on release.
 - Both `aarch64` and `x86_64` macOS are covered by bottles.
 
 ### Story D4.3 — Linux packages
-- [ ] `.deb` and `.rpm` for the distributions the target users run.
+- [~] `scripts/package-linux.sh` builds both via nfpm. Verified by building real packages
+  and inspecting them: binary at `/usr/bin/xs`, man page and bash/zsh/fish completions at
+  standard locations, licences under `/usr/share/doc`, and `Depends: libc6 >= 2.28` — the
+  D0.4 glibc floor — so installation fails cleanly rather than at runtime.
+  Outstanding: the D6.1 systemd unit, which does not exist yet, so nothing can include it.
 
 **AC**
 - Packages install the binary, man page, and shell completions to standard locations.
@@ -293,7 +305,11 @@ Ordered by reach per unit of effort.
 - The systemd unit from D6.1 is included but not enabled by default.
 
 ### Story D4.4 — Windows distribution
-- [ ] The channel Windows users expect.
+- [~] Scoop manifest in `packaging/scoop/xsync.json`, both architectures, with `checkver`
+  and `autoupdate` wired to the release checksums. Scoop puts shims on `PATH` for the
+  installing user and removes them on uninstall, satisfying the install/uninstall ACs
+  without an installer. **Untested end to end** (needs a published release), and no MSI:
+  that is only required if D6.3's service integration lands, which it has not.
 
 **AC**
 - Published to `winget` and/or `scoop`; an MSI is provided if the service integration in
@@ -302,7 +318,10 @@ Ordered by reach per unit of effort.
 - Uninstall removes everything the installer added, verified on a clean VM.
 
 ### Story D4.5 — crates.io
-- [ ] `cargo install xsync` and library reuse of `xsync-core`.
+- [~] The `example.invalid` placeholder is replaced with the real repository, and both
+  crates now carry the metadata crates.io requires. `cargo package` succeeds for
+  `xsync-core`; `xsync` packages once `xsync-core` is published, which is the normal
+  ordering for a workspace. Publishing itself is deliberately left to a human.
 
 **AC**
 - The placeholder `repository = "https://example.invalid/xsync"` in `Cargo.toml` is replaced

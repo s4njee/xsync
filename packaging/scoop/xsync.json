@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
+  "version": "__VERSION__",
+  "description": "High-performance rsync replacement built on a parallel pipeline and BLAKE3",
+  "homepage": "https://github.com/s4njee/xsync",
+  "license": "MIT|Apache-2.0",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/s4njee/xsync/releases/download/v__VERSION__/xsync-__VERSION__-x86_64-pc-windows-msvc.zip",
+      "hash": "__SHA256_X86_64_PC_WINDOWS_MSVC__",
+      "extract_dir": "xsync-__VERSION__-x86_64-pc-windows-msvc"
+    },
+    "arm64": {
+      "url": "https://github.com/s4njee/xsync/releases/download/v__VERSION__/xsync-__VERSION__-aarch64-pc-windows-msvc.zip",
+      "hash": "__SHA256_AARCH64_PC_WINDOWS_MSVC__",
+      "extract_dir": "xsync-__VERSION__-aarch64-pc-windows-msvc"
+    }
+  },
+  "bin": "xs.exe",
+  "checkver": {
+    "github": "https://github.com/s4njee/xsync"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/s4njee/xsync/releases/download/v$version/xsync-$version-x86_64-pc-windows-msvc.zip",
+        "extract_dir": "xsync-$version-x86_64-pc-windows-msvc"
+      },
+      "arm64": {
+        "url": "https://github.com/s4njee/xsync/releases/download/v$version/xsync-$version-aarch64-pc-windows-msvc.zip",
+        "extract_dir": "xsync-$version-aarch64-pc-windows-msvc"
+      }
+    },
+    "hash": {
+      "url": "https://github.com/s4njee/xsync/releases/download/v$version/SHA256SUMS"
+    }
+  }
+}
