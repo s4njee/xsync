@@ -1293,3 +1293,50 @@ fn test_unwritable_failure_log_is_reported_not_ignored() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("failure log"), "{stderr}");
 }
+
+#[test]
+fn test_version_reports_provenance() {
+    // A bug report must be able to name exactly what ran: version, commit,
+    // build date, and target triple.
+    let output = Command::new(xsync_bin()).arg("-V").output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains(env!("CARGO_PKG_VERSION")), "{text}");
+    // `<version> (<commit> <date>) <target>`
+    assert!(text.contains('('), "{text}");
+    assert!(
+        text.contains("-apple-") || text.contains("-linux-") || text.contains("-windows-"),
+        "target triple missing: {text}"
+    );
+}
+
+#[test]
+fn test_long_version_reports_features_and_protocol() {
+    // `--version` additionally states what this build can do, so D0.2's
+    // compression outcome is visible in the field rather than inferred from the
+    // platform.
+    let output = Command::new(xsync_bin()).arg("--version").output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "commit:",
+        "built:",
+        "target:",
+        "protocol:",
+        "features:",
+        "zstd",
+        "blake3",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+    }
+}
+
+#[test]
+fn test_version_matches_the_manifest_exactly() {
+    // The manifest is the single source of truth; a binary whose reported
+    // version differs from the tag it shipped under is worse than none.
+    let output = Command::new(xsync_bin()).arg("-V").output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let reported = text.split_whitespace().nth(1).unwrap_or_default();
+    assert_eq!(reported, env!("CARGO_PKG_VERSION"));
+}

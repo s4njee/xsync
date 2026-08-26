@@ -22,3 +22,5 @@ benches/results/tuning/**
 
 # macOS finder droppings (4 were previously tracked under benches/results)
 .DS_Store
+dist/
+dist2/

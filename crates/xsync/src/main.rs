@@ -48,11 +48,52 @@ enum CloudFilesArg {
     Error,
 }
 
+/// Provenance recorded at build time, so a bug report can name exactly what ran.
+///
+/// The semantic version is not stamped: it comes from `CARGO_PKG_VERSION`, read
+/// by Cargo from the manifest, which is the single source of truth. A second
+/// source could disagree with the tag the binary shipped under.
+const BUILD_COMMIT: &str = env!("XSYNC_BUILD_COMMIT");
+const BUILD_DATE: &str = env!("XSYNC_BUILD_DATE");
+const BUILD_TARGET: &str = env!("XSYNC_BUILD_TARGET");
+
+/// Short form, shown by `-V`.
+static VERSION_SHORT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "{} ({BUILD_COMMIT} {BUILD_DATE}) {BUILD_TARGET}",
+        xsync_core::version()
+    )
+});
+
+/// Long form, shown by `--version`.
+///
+/// Adds the capabilities this build actually has. zstd is unconditional since
+/// story D0.2 removed the Windows gate, and saying so explicitly is the point:
+/// the field report should state what the binary can do rather than leave it to
+/// be inferred from the platform.
+static VERSION_LONG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let mut features = vec!["blake3", "zstd"];
+    if cfg!(unix) {
+        features.push("unix-permissions");
+        features.push("non-utf8-paths");
+    }
+    if cfg!(target_os = "macos") {
+        features.push("cloud-placeholder-detection");
+    }
+    format!(
+        "{}\ncommit:    {BUILD_COMMIT}\nbuilt:     {BUILD_DATE}\ntarget:    {BUILD_TARGET}\nprotocol:  wire v{}, browse v2\nfeatures:  {}",
+        *VERSION_SHORT,
+        xsync_core::PROTOCOL_VERSION,
+        features.join(", ")
+    )
+});
+
 /// High-performance rsync replacement built on a parallel pipeline and BLAKE3.
 #[derive(Debug, Parser)]
 #[command(
     name = "xs",
-    version = xsync_core::version(),
+    version = VERSION_SHORT.as_str(),
+    long_version = VERSION_LONG.as_str(),
     about = "High-performance rsync replacement",
     long_about = "xsync is an rsync-compatible file synchronization tool with a parallel \
                   pipeline, BLAKE3 integrity, and workload-adaptive transfer strategies."

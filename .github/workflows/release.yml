@@ -1,0 +1,133 @@
+name: Release
+
+# A tag cuts the release. workflow_dispatch runs the same jobs without
+# publishing, so the pipeline can be exercised without minting a version --
+# a release process first tested during a release is tested in the worst
+# possible place.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check artifacts without publishing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Refuse before building anything if the tag and the manifest disagree. A
+  # binary reporting a version different from the tag it shipped under is worse
+  # than no version at all, and the cheapest place to catch that is here.
+  verify:
+    name: Verify version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        run: |
+          set -euo pipefail
+          manifest=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          echo "manifest version: $manifest"
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$manifest" ]; then
+              echo "::error::tag v$tag does not match Cargo.toml version $manifest"
+              exit 1
+            fi
+            echo "tag matches manifest"
+          fi
+      - run: test -f LICENSE-MIT && test -f LICENSE-APACHE
+      - name: Changelog entry exists for this version
+        if: github.ref_type == 'tag'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -q "## \[\?$version\]\?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no entry for $version"
+            exit 1
+          fi
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin,        runner: macos-14 }
+          - { target: x86_64-apple-darwin,         runner: macos-15-intel }
+          - { target: x86_64-unknown-linux-gnu,    runner: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu,   runner: ubuntu-latest, cross: true }
+          - { target: x86_64-pc-windows-msvc,      runner: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the build stamps the commit; a shallow clone hides it
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@cross
+      - name: Package
+        shell: bash
+        env:
+          XSYNC_CARGO: ${{ matrix.cross && 'cross' || 'cargo' }}
+        run: scripts/package-release.sh ${{ matrix.target }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xsync-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+      - name: Collect and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staged -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} dist/ \;
+          cd dist
+          sha256sum ./* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/*
+      - name: Publish release
+        # Never on workflow_dispatch: that path exists precisely so the pipeline
+        # can be exercised without producing a public release.
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file <(scripts/release-notes.sh "${GITHUB_REF_NAME#v}") \
+            --verify-tag
+      - name: Dry run summary
+        if: github.ref_type != 'tag'
+        run: |
+          echo "### Dry run: artifacts built, nothing published" >> "$GITHUB_STEP_SUMMARY"
+          ls -la dist >> "$GITHUB_STEP_SUMMARY"

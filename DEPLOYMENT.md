@@ -159,7 +159,9 @@ The project has none. This epic is what makes every other guarantee in this file
 ## Epic D2 — Reproducible release artifacts
 
 ### Story D2.1 — Version stamping and provenance
-- [ ] A user reporting a bug must be able to say exactly what they ran.
+- [x] `xs -V` reports version, commit (with a `-dirty` marker), build date, and target
+  triple; `xs --version` adds protocol versions and enabled features. The version comes
+  from `Cargo.toml` alone, and the release workflow refuses a tag that disagrees with it.
 
 **AC**
 - `xsync --version` reports the semantic version, the git commit, the build date, and the
@@ -169,7 +171,10 @@ The project has none. This epic is what makes every other guarantee in this file
   whether compression is available — so D0.2's outcome is visible in the field.
 
 ### Story D2.2 — Release build and artifact set
-- [ ] One command, or one tag, produces every artifact.
+- [x] `scripts/package-release.sh <target>` produces one artifact; the release workflow runs
+  it for every Tier 1 target and publishes `SHA256SUMS` plus a provenance attestation.
+  Builds are reproducible — binaries *and* archives — verified twice over on
+  `aarch64-apple-darwin`. See [docs/release-process.md](docs/release-process.md).
 
 **AC**
 - Tagging `vX.Y.Z` produces binaries for every Tier 1 target, named consistently
@@ -180,7 +185,11 @@ The project has none. This epic is what makes every other guarantee in this file
   the sources of nondeterminism are documented.
 
 ### Story D2.3 — Release automation
-- [ ] Cutting a release must not be a manual ritual.
+- [x] `.github/workflows/release.yml` builds, checksums, attests, and publishes on a `v*`
+  tag. `workflow_dispatch` is a dry run that stops before publishing. The pipeline refuses
+  a tag that disagrees with `Cargo.toml`, a version missing from `CHANGELOG.md`, or missing
+  licence files; release notes are extracted from the changelog section, which states the
+  protocol version and wire compatibility.
 
 **AC**
 - A tag triggers build, sign, checksum, and publish without manual steps beyond approving
