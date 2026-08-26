@@ -6047,12 +6047,8 @@ where
 
     match result {
         Err(ServerError::RemoteShellMismatch) if first == RemoteShell::Posix => {
-            let child = spawn_server_child_with_shell(
-                remote_path,
-                rsh,
-                host,
-                RemoteShell::Windows,
-            )?;
+            let child =
+                spawn_server_child_with_shell(remote_path, rsh, host, RemoteShell::Windows)?;
             let retried = run_server_child_session(child, &mut f);
             if retried.is_ok() {
                 remember_remote_shell(rsh, host_name, RemoteShell::Windows);
@@ -6131,10 +6127,7 @@ fn quote_windows_path(path: &str) -> Result<String, ServerError> {
     quote_windows_arg(path)
 }
 
-fn xsync_remote_command(
-    remote_path: &str,
-    shell: RemoteShell,
-) -> Result<String, ServerError> {
+fn xsync_remote_command(remote_path: &str, shell: RemoteShell) -> Result<String, ServerError> {
     match shell {
         RemoteShell::Posix => Ok(format!(
             "PATH=\"$HOME/.local/bin:$PATH\" {} {} {}",
@@ -6188,11 +6181,7 @@ fn remember_remote_shell(rsh: Option<&str>, host: &str, shell: RemoteShell) {
 /// `(program, args)` that runs one command string on `host`, without deciding
 /// what that string should be. Shared by the shell probe and the server launch
 /// so they can never disagree about how the remote shell is reached.
-fn base_remote_invocation(
-    rsh: Option<&str>,
-    host: &str,
-    command: &str,
-) -> (String, Vec<String>) {
+fn base_remote_invocation(rsh: Option<&str>, host: &str, command: &str) -> (String, Vec<String>) {
     if let Some(rsh_cmd) = rsh {
         let parts = parse_rsh_command(rsh_cmd);
         let program = parts.first().cloned().unwrap_or_else(|| rsh_cmd.to_owned());
@@ -7485,14 +7474,13 @@ mod tests {
 
     #[test]
     fn remote_path_is_shell_quoted_as_one_command() {
-        let (_, args) =
-            remote_server_command_with_shell(
-                "/dst'; touch XSYNC_INJECTION; echo '",
-                None,
-                Some("host"),
-                RemoteShell::Posix,
-            )
-            .unwrap();
+        let (_, args) = remote_server_command_with_shell(
+            "/dst'; touch XSYNC_INJECTION; echo '",
+            None,
+            Some("host"),
+            RemoteShell::Posix,
+        )
+        .unwrap();
         assert_eq!(
             args,
             [
@@ -7574,7 +7562,11 @@ mod tests {
         let (_, args) =
             remote_server_command_with_shell("~", None, Some("winbox"), RemoteShell::Windows)
                 .unwrap();
-        assert!(args[1].ends_with("xs --server \"%USERPROFILE%\""), "{}", args[1]);
+        assert!(
+            args[1].ends_with("xs --server \"%USERPROFILE%\""),
+            "{}",
+            args[1]
+        );
 
         let (_, args) = remote_server_command_with_shell(
             "~/backup",

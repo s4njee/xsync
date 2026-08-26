@@ -343,8 +343,8 @@ pub fn parse(spec: &str) -> Result<PathSpec, PathError> {
     // interpreted by the remote shell, where '\\' is a legal filename byte, so
     // only '/' terminates a remote spec regardless of the local platform.
     let is_remote_spec = find_remote_colon(spec).is_some();
-    let trailing_slash = spec.ends_with('/')
-        || (cfg!(windows) && !is_remote_spec && spec.ends_with('\\'));
+    let trailing_slash =
+        spec.ends_with('/') || (cfg!(windows) && !is_remote_spec && spec.ends_with('\\'));
     let spec = if trailing_slash {
         &spec[..spec.len() - 1]
     } else {
