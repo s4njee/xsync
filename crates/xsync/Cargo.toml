@@ -12,6 +12,14 @@ authors.workspace = true
 name = "xs"
 path = "src/main.rs"
 
+# Test-only stand-in for the remote shell. It exists as a bin rather than a
+# shell script so the remote-transport integration tests can run on Windows,
+# which cannot execute the `#!/bin/sh` harness they used before (D1.2).
+# Packaging (D2.2) must ship only `xs`.
+[[bin]]
+name = "fake-rsh"
+path = "src/bin/fake-rsh.rs"
+
 [lints]
 workspace = true
 

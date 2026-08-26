@@ -114,8 +114,19 @@ The project has none. This epic is what makes every other guarantee in this file
 - A red build blocks merge. The Windows job must be able to fail — it currently would.
 
 ### Story D1.2 — Cross-platform integration coverage
-- [~] The integration harness now has a Windows PowerShell-backed `--rsh` helper; full
-  cross-platform CI execution and filesystem edge-case coverage are in progress.
+- [x] `crates/xsync/tests/server_integration.rs` passes on Windows: 24/24, with the
+  remote-transport tests running rather than being skipped.
+
+  The harness previously wrote `#!/bin/sh` scripts and passed them to `-e`, which
+  Windows cannot execute, so 13 of 24 tests failed there. (An earlier note in this
+  file claimed a PowerShell-backed helper existed; it did not.) They are now backed
+  by `crates/xsync/src/bin/fake-rsh.rs`, a real binary built alongside `xs`, so the
+  same tests exercise the same paths on every platform. Packaging (D2.2) must ship
+  only `xs`.
+
+  Still open: a cross-OS transfer test in CI. Verified by hand this session —
+  macOS ARM64 to Windows ARM64 over stock OpenSSH, byte-identical — but not yet
+  automated, since it needs two runners in one job.
 
 **AC**
 - `crates/xsync/tests/server_integration.rs` passes on all three operating systems, not just

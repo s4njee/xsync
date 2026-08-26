@@ -75,58 +75,25 @@ fn test_windows_case_insensitive_destination_is_not_duplicated() {
     );
 }
 
-/// Write an executable fake-rsh script that ignores the host and the literal
-/// `xsync` command word, then execs the local server binary: `xsync --server <path>`.
+/// Build an `-e` value that runs the cross-platform fake-rsh helper.
 ///
-/// `mode` is one of `"exec"`, `"missing"`, or `"crash"`.
-fn write_fake_rsh(script_dir: &Path, mode: &str) -> PathBuf {
-    let script = script_dir.join(format!("fake_rsh_{mode}.sh"));
-    let body = match mode {
-        // Exec the local server directly (ignoring host + the "xsync" word).
-        "exec" | "missing" => {
-            let target = if mode == "missing" {
-                "definitely-not-a-real-xsync-binary".to_owned()
-            } else {
-                xsync_bin().to_owned()
-            };
-            format!("#!/bin/sh\nshift\neval \"set -- $1\"\n# The remote command may begin with PATH=...; discard the command word.\nshift\nexec {target} \"$2\" \"$3\"\n")
-        }
-        // Start the server, then SIGKILL it shortly after so the client sees a
-        // mid-transfer disconnect and leaves only staging artifacts.
-        "crash" => {
-            let xs = xsync_bin();
-            format!(
-                "#!/bin/sh\nshift\neval \"set -- $1\"\nshift\n\"{xs}\" \"$2\" \"$3\" &\nPID=$!\nsleep 0.05\nkill -9 $PID\nwait $PID\n"
-            )
-        }
-        // Start the server and SIGKILL it once the receiver has durably staged
-        // the first 8 MiB chunk, so the resume journal survives with that range
-        // verified and a subsequent run skips it.
-        "crash_after_chunk" => {
-            let xs = xsync_bin();
-            format!(
-                "#!/bin/sh\nshift\neval \"set -- $1\"\nshift\n\"{xs}\" \"$2\" \"$3\" &\nPID=$!\n\
-                 for i in $(seq 1 400); do\n\
-                 \x20 f=$(ls \"$3\"/.xsync.tmp.* 2>/dev/null | head -n1)\n\
-                 \x20 if [ -n \"$f\" ] && [ \"$(wc -c < \"$f\" 2>/dev/null || echo 0)\" -ge 8388608 ]; then\n\
-                 \x20   kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null; exit 0\n\
-                 \x20 fi\n\
-                 \x20 sleep 0.005\n\
-                 done\n\
-                 kill -9 $PID 2>/dev/null; wait $PID 2>/dev/null\n"
-            )
-        }
-        _ => unreachable!(),
-    };
-    fs::write(&script, body).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&script, perms).unwrap();
-    }
-    script
+/// This used to write a `#!/bin/sh` script, which Windows cannot execute, so
+/// every remote-transport test was Unix-only (DEPLOYMENT.md D1.2). The helper
+/// is a real binary built alongside `xs`, so the same tests now run everywhere.
+///
+/// `mode` is one of `"exec"`, `"missing"`, `"crash"`, or `"crash_after_chunk"`.
+fn fake_rsh_with_marker(mode: &str, marker: &Path) -> String {
+    let helper = env!("CARGO_BIN_EXE_fake-rsh").replace('\\', "/");
+    let marker = marker.display().to_string().replace('\\', "/");
+    format!("'{helper}' --mode {mode} --marker '{marker}'")
+}
+
+fn fake_rsh(mode: &str) -> String {
+    // xsync splits `-e` with shlex, which treats a backslash as an escape.
+    // Windows accepts forward slashes in program paths, so normalise rather
+    // than fight the quoting; single quotes then survive spaces in the path.
+    let helper = env!("CARGO_BIN_EXE_fake-rsh").replace('\\', "/");
+    format!("'{helper}' --mode {mode}")
 }
 
 /// Fake remote shell backed by an absolute reference rsync. The xsync process
@@ -270,25 +237,11 @@ fn test_auto_does_not_fallback_on_authentication_failure() {
     let dst = tempdir().unwrap();
     let scripts = tempdir().unwrap();
     let marker = scripts.path().join("calls");
-    let script = scripts.path().join("auth_failure.sh");
-    fs::write(
-        &script,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'Permission denied (publickey)' >&2\nexit 255\n",
-            marker.display()
-        ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap();
-    }
+    let rsh = fake_rsh_with_marker("auth_failure", &marker);
 
     let output = Command::new(xsync_bin())
         .arg("-e")
-        .arg(&script)
+        .arg(&rsh)
         .arg(format!("{}/", src.path().display()))
         .arg(format!("fakehost:{}/", dst.path().display()))
         .output()
@@ -305,33 +258,13 @@ fn test_auto_does_not_fallback_on_host_key_or_native_protocol_failure() {
     let dst = tempdir().unwrap();
     let scripts = tempdir().unwrap();
 
-    for (name, body) in [
-        (
-            "host_key",
-            "echo 'Host key verification failed.' >&2\nexit 255\n",
-        ),
-        ("malformed_native", "printf 'bad native protocol'\nexit 0\n"),
-    ] {
+    for name in ["host_key", "malformed_native"] {
         let marker = scripts.path().join(format!("{name}.calls"));
-        let script = scripts.path().join(format!("{name}.sh"));
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}",
-                marker.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            let mut permissions = fs::metadata(&script).unwrap().permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script, permissions).unwrap();
-        }
+        let rsh = fake_rsh_with_marker(name, &marker);
 
         let output = Command::new(xsync_bin())
             .arg("-e")
-            .arg(&script)
+            .arg(&rsh)
             .arg(format!("{}/", src.path().display()))
             .arg(format!("fakehost:{}/", dst.path().display()))
             .output()
@@ -624,8 +557,7 @@ fn test_native_compression_reports_wire_bytes_for_mixed_corpus() {
     }
     fs::write(src.path().join("random.bin"), random).unwrap();
 
-    let scripts = tempdir().unwrap();
-    let fake_rsh = write_fake_rsh(scripts.path(), "exec");
+    let fake_rsh = fake_rsh("exec");
     let compressed_dst = tempdir().unwrap();
     let compressed = Command::new(xsync_bin())
         .args([
@@ -706,8 +638,7 @@ fn test_native_compression_multi_stream_stress_preserves_mixed_ranges() {
             fs::write(path, bytes).unwrap();
         }
     }
-    let scripts = tempdir().unwrap();
-    let fake_rsh = write_fake_rsh(scripts.path(), "exec");
+    let fake_rsh = fake_rsh("exec");
     let dst = tempdir().unwrap();
     let output = Command::new(xsync_bin())
         .args([
@@ -775,8 +706,7 @@ fn test_push_matches_local_sync_identically() {
 
     let dst_local = tempdir().unwrap();
     let dst_push = tempdir().unwrap();
-    let script_dir = tempdir().unwrap();
-    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let fake_rsh = fake_rsh("exec");
 
     // 1. Run local-to-local sync
     let status_local = Command::new(xsync_bin())
@@ -815,8 +745,7 @@ fn test_pull_matches_push_identically() {
 
     let dst_push = tempdir().unwrap();
     let dst_pull = tempdir().unwrap();
-    let script_dir = tempdir().unwrap();
-    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let fake_rsh = fake_rsh("exec");
 
     // 1. Run remote push sync (fakehost:dest) through a fake-rsh.
     let status_push = Command::new(xsync_bin())
@@ -863,8 +792,7 @@ fn test_rsh_override_uses_fake_rsh_and_matches_push() {
 
     // Remote push driven through an explicit fake-rsh (long `--rsh` form) that
     // ignores the host and execs the local server binary — no sshd, no network.
-    let script_dir = tempdir().unwrap();
-    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let fake_rsh = fake_rsh("exec");
     let output = Command::new(xsync_bin())
         .arg("--rsh")
         .arg(&fake_rsh)
@@ -909,8 +837,7 @@ fn test_fake_rsh_second_run_skips_all_files() {
     populate_test_tree(src.path());
 
     let dst = tempdir().unwrap();
-    let script_dir = tempdir().unwrap();
-    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let fake_rsh = fake_rsh("exec");
 
     let run = || {
         Command::new(xsync_bin())
@@ -942,8 +869,7 @@ fn test_fake_rsh_restart_safety_leaves_no_final_truncated_file() {
     fs::write(src.path().join("big.bin"), vec![0x42; 20 * 1024 * 1024]).unwrap();
 
     let dst = tempdir().unwrap();
-    let script_dir = tempdir().unwrap();
-    let crash_rsh = write_fake_rsh(script_dir.path(), "crash");
+    let crash_rsh = fake_rsh("crash");
 
     // First attempt is killed mid-transfer.
     let first = Command::new(xsync_bin())
@@ -963,7 +889,7 @@ fn test_fake_rsh_restart_safety_leaves_no_final_truncated_file() {
     );
 
     // A clean re-run (with a functional fake-rsh) completes the transfer.
-    let good_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let good_rsh = fake_rsh("exec");
     let second = Command::new(xsync_bin())
         .arg("-e")
         .arg(&good_rsh)
@@ -987,8 +913,7 @@ fn test_missing_remote_binary_reports_clear_error() {
     fs::write(src.path().join("file.txt"), b"data").unwrap();
 
     let dst = tempdir().unwrap();
-    let script_dir = tempdir().unwrap();
-    let missing_rsh = write_fake_rsh(script_dir.path(), "missing");
+    let missing_rsh = fake_rsh("missing");
 
     let output = Command::new(xsync_bin())
         .arg("--transport=xsync")
@@ -1015,8 +940,7 @@ fn test_durable_resume_skips_verified_ranges() {
     fs::write(src.path().join("big.bin"), vec![0xEE; 24 * 1024 * 1024]).unwrap();
 
     let dst = tempdir().unwrap();
-    let script_dir = tempdir().unwrap();
-    let crash_rsh = write_fake_rsh(script_dir.path(), "crash_after_chunk");
+    let crash_rsh = fake_rsh("crash_after_chunk");
 
     // First run is killed by the receiver-side fake transport once the first
     // 8 MiB chunk is durably staged+checkpointed.
@@ -1036,7 +960,7 @@ fn test_durable_resume_skips_verified_ranges() {
     // A clean re-run resumes from the durable journal: it does not retransmit
     // the verified first chunk, completes the file, and reports nonzero resume
     // accounting.
-    let good_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let good_rsh = fake_rsh("exec");
     let second = Command::new(xsync_bin())
         .arg("-e")
         .arg(&good_rsh)
@@ -1143,8 +1067,7 @@ fn test_multi_stream_push_stripes_large_file_and_is_byte_identical() {
 
     let dst_local = tempdir().unwrap();
     let dst_multi = tempdir().unwrap();
-    let script_dir = tempdir().unwrap();
-    let fake_rsh = write_fake_rsh(script_dir.path(), "exec");
+    let fake_rsh = fake_rsh("exec");
 
     // Local baseline.
     let status_local = Command::new(xsync_bin())
