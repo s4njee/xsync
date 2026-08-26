@@ -1,0 +1,3 @@
+tool=xsync
+command=/Users/sanjee/projects/xsync/target/release/xsync --progress-json /Users/sanjee/projects/csearchv2/congress/data/100/ /Users/sanjee/projects/xsync/benches/results/tuning/T1/syscall-trace-20260824-094017/run/xsync-destination/
+started=2026-08-24T14:40:17Z

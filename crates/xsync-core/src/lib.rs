@@ -20,6 +20,7 @@ pub mod local;
 pub mod path;
 pub mod planner;
 pub mod protocol;
+pub mod protocol_v2;
 pub mod rsync;
 pub mod scanner;
 pub mod server;

@@ -1,0 +1,18 @@
+# id	direction	type	payload hex	decoded meaning
+list-request-raw-name	request	14	01000000612a0000000000000064000000	path=[61], page_token=42, page_size=100
+list-page-symlink	response	15	07000000000000000900000000000000010100000002000000ff78010400000000000000feffffffffffffffa401000000000000	related_id=7, page_token=9, final=true, count=1, entry(name=[ff78], kind=1, size=4, mtime_ns=-2, mode=420, target=[])
+stat-request-non-utf8	request	16	01000000ff01	path=[ff], include_digest=true
+stat-response-missing	response	17	09000000000000000100	related_id=9, status=missing, digest_present=false
+cancel-request	request	18	0700000000000000	related_id=7
+keepalive	control	19	2a00000000000000	nonce=42
+keepalive-ack	control	20	2a00000000000000	nonce=42
+browse-error	response	21	0700000000000000020003000000626164	related_id=7, code=2, message="bad"
+
+# Deliberately malformed payloads. The final field names the fail-closed rule.
+unknown-type	malformed	255		invalid message type
+truncated-path	malformed	14	01000000	truncated path
+invalid-boolean	malformed	16	0000000002	invalid boolean
+invalid-stat-status	malformed	17	000000000000000003	invalid stat status enum
+invalid-stat-fields	malformed	17	00000000000000000101	missing response with digest present
+trailing-byte	malformed	19	010000000000000000	trailing payload byte
+oversized-path	malformed	14	01001000	path length exceeds 1 MiB

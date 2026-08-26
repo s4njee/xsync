@@ -744,6 +744,19 @@ fn render_event(
             selection.reason = format!("{}; compression: {}", selection.reason, compression_reason);
         }
     }
+    if let xsync_core::local::LocalEvent::ProtocolNegotiated {
+        selected_version,
+        browse_available,
+        ..
+    } = &event
+    {
+        if let Some(selection) = selection.as_deref_mut() {
+            selection.wire_version = *selected_version;
+            if !browse_available && !selection.unavailable_guarantees.contains(&"browse-v2") {
+                selection.unavailable_guarantees.push("browse-v2");
+            }
+        }
+    }
     if let xsync_core::local::LocalEvent::Finished { transport, .. } = &mut event {
         *transport = selection.cloned();
     }
@@ -822,6 +835,7 @@ fn render_event(
     }
     match event {
         xsync_core::local::LocalEvent::Negotiated { .. }
+        | xsync_core::local::LocalEvent::ProtocolNegotiated { .. }
         | xsync_core::local::LocalEvent::Metrics { .. }
         | xsync_core::local::LocalEvent::Phase { .. }
         | xsync_core::local::LocalEvent::Started { .. }
@@ -879,6 +893,7 @@ fn event_type(event: &xsync_core::local::LocalEvent) -> &'static str {
         LocalEvent::Metrics { .. } => "metrics",
         LocalEvent::Started { .. } => "started",
         LocalEvent::Negotiated { .. } => "negotiated",
+        LocalEvent::ProtocolNegotiated { .. } => "protocol-negotiated",
         LocalEvent::Planned { .. } => "planned",
         LocalEvent::CloudPlaceholders { .. } => "cloud_placeholders",
         LocalEvent::Transferred { .. } => "transferred",
@@ -935,6 +950,18 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "event": "negotiated",
             "compression_algorithm": compression_algorithm,
             "compression_reason": compression_reason,
+        }),
+        LocalEvent::ProtocolNegotiated {
+            selected_version,
+            remote_capabilities,
+            common_capabilities,
+            browse_available,
+        } => serde_json::json!({
+            "event": "protocol-negotiated",
+            "selected_version": selected_version,
+            "remote_capabilities": remote_capabilities,
+            "common_capabilities": common_capabilities,
+            "browse_available": browse_available,
         }),
         LocalEvent::Planned { files, bytes } => serde_json::json!({
             "event": "planned",
@@ -1179,6 +1206,19 @@ mod tests {
         assert_eq!(value["event"], "phase");
         assert_eq!(value["name"], "scan");
         assert_eq!(value["started"], true);
+    }
+
+    #[test]
+    fn progress_json_protocol_negotiation_is_observable() {
+        let value = json_event(&xsync_core::local::LocalEvent::ProtocolNegotiated {
+            selected_version: 1,
+            remote_capabilities: 0,
+            common_capabilities: 0,
+            browse_available: false,
+        });
+        assert_eq!(value["event"], "protocol-negotiated");
+        assert_eq!(value["selected_version"], 1);
+        assert_eq!(value["browse_available"], false);
     }
 
     #[test]

@@ -1,0 +1,45 @@
+{
+  "schema": "xsync.release-bench.v1",
+  "generated_unix_seconds": 1787573727,
+  "tier": "smoke",
+  "seed": 42,
+  "repetitions": 11,
+  "routes": [
+    "same-volume"
+  ],
+  "cells": [
+    {
+      "cell": "mixed-content-churn-same-volume",
+      "class": "mixed",
+      "workload": "content-churn",
+      "route": "same-volume",
+      "status": "passed",
+      "report": "/tmp/xsync-81-checksum-clean/report-mixed-content-churn-same-volume.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 0.11272787500638516,
+          "mad_wall_seconds": 0.007741082998109036,
+          "median_cpu_seconds": 0.044884,
+          "peak_rss_bytes": 5406720,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 0.2145549580018269,
+          "mad_wall_seconds": 0.017000583990011336,
+          "median_cpu_seconds": 0.072862,
+          "peak_rss_bytes": 16580608,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": 0.48681642441672074,
+          "paired_ratio_mad": 0.08205048193839753
+        }
+      }
+    },
+    {
+      "route": "ssh",
+      "status": "blocked",
+      "reason": "the ssh route was not selected; native xsync-over-SSH and RsyncTransport rows require --routes ssh with --ssh-host"
+    }
+  ]
+}

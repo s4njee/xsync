@@ -93,6 +93,17 @@ pub enum LocalEvent {
         /// Human-readable reason for the selected mode.
         compression_reason: &'static str,
     },
+    /// Wire version and capability set observed during the handshake.
+    ProtocolNegotiated {
+        /// Session grammar selected before the first data frame.
+        selected_version: u32,
+        /// Capabilities advertised by the remote endpoint.
+        remote_capabilities: u32,
+        /// Known capabilities shared by both endpoints.
+        common_capabilities: u32,
+        /// Whether browse-only v2 requests are available.
+        browse_available: bool,
+    },
     /// Metadata planning has completed.
     Planned {
         /// Number of regular files requiring transfer.

@@ -1,0 +1,92 @@
+{
+  "schema": "xsync.release-bench.v1",
+  "generated_unix_seconds": 1787573696,
+  "tier": "smoke",
+  "seed": 42,
+  "repetitions": 5,
+  "routes": [
+    "same-volume",
+    "pipe"
+  ],
+  "cells": [
+    {
+      "cell": "mixed-content-churn-same-volume",
+      "class": "mixed",
+      "workload": "content-churn",
+      "route": "same-volume",
+      "status": "passed",
+      "report": "/tmp/xsync-81-checksum-recheck/report-mixed-content-churn-same-volume.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 0.16213829201296903,
+          "mad_wall_seconds": 0.02937087601458188,
+          "median_cpu_seconds": 0.047348999999999995,
+          "peak_rss_bytes": 5357568,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 0.22917799999413543,
+          "mad_wall_seconds": 0.032159709007828524,
+          "median_cpu_seconds": 0.071741,
+          "peak_rss_bytes": 15204352,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": 0.6996814714191582,
+          "paired_ratio_mad": 0.05161210776706482
+        }
+      }
+    },
+    {
+      "cell": "mixed-content-churn-pipe",
+      "class": "mixed",
+      "workload": "content-churn",
+      "route": "pipe",
+      "status": "passed",
+      "report": "/tmp/xsync-81-checksum-recheck/report-mixed-content-churn-pipe.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 0.14711120899301022,
+          "mad_wall_seconds": 0.005604458987363614,
+          "median_cpu_seconds": 0.05434,
+          "peak_rss_bytes": 5652480,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "rsync-az": {
+          "median_wall_seconds": 0.15227383299497887,
+          "mad_wall_seconds": 0.00492270800168626,
+          "median_cpu_seconds": 0.053641999999999995,
+          "peak_rss_bytes": 6717440,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": 0.9924486434516279,
+          "paired_ratio_mad": 0.13130891695194002
+        },
+        "xsync": {
+          "median_wall_seconds": 0.12298420799197628,
+          "mad_wall_seconds": 0.012279001006390913,
+          "median_cpu_seconds": 0.065561,
+          "peak_rss_bytes": 5046272,
+          "median_wire_bytes": 4131,
+          "paired_ratio_median": 1.228807840100138,
+          "paired_ratio_mad": 0.09607624961372174
+        },
+        "xsync-raw": {
+          "median_wall_seconds": 0.10879645799286664,
+          "mad_wall_seconds": 0.0035375840088818222,
+          "median_cpu_seconds": 0.06372599999999999,
+          "peak_rss_bytes": 4816896,
+          "median_wire_bytes": 20633,
+          "paired_ratio_median": 1.355868880165468,
+          "paired_ratio_mad": 0.09617282112537673
+        }
+      }
+    },
+    {
+      "route": "ssh",
+      "status": "blocked",
+      "reason": "the ssh route was not selected; native xsync-over-SSH and RsyncTransport rows require --routes ssh with --ssh-host"
+    }
+  ]
+}

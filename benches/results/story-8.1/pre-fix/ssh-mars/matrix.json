@@ -1,0 +1,197 @@
+{
+  "schema": "xsync.release-bench.v1",
+  "generated_unix_seconds": 1787565879,
+  "tier": "smoke",
+  "seed": 42,
+  "repetitions": 5,
+  "routes": [
+    "ssh"
+  ],
+  "cells": [
+    {
+      "cell": "deep-small-initial-copy-ssh",
+      "class": "deep-small",
+      "workload": "initial-copy",
+      "route": "ssh",
+      "status": "passed",
+      "report": "/tmp/xsync-81-ssh-full/report-deep-small-initial-copy-ssh.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 0.7942583749972982,
+          "mad_wall_seconds": 0.02306625000346685,
+          "median_cpu_seconds": 0.06725199999999999,
+          "peak_rss_bytes": 7487488,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 8.730914041996584,
+          "mad_wall_seconds": 0.08142541599954711,
+          "median_cpu_seconds": 0.691481,
+          "peak_rss_bytes": 7028736,
+          "median_wire_bytes": 93928,
+          "paired_ratio_median": 0.09135817004831548,
+          "paired_ratio_mad": 0.00409032280821385
+        },
+        "xsync-rsync-transport": {
+          "median_wall_seconds": 0.9409772920043906,
+          "mad_wall_seconds": 0.24159758300811518,
+          "median_cpu_seconds": 0.112581,
+          "peak_rss_bytes": 7733248,
+          "median_wire_bytes": 303195,
+          "paired_ratio_median": 0.8685912316329855,
+          "paired_ratio_mad": 0.23854581075117187
+        }
+      }
+    },
+    {
+      "cell": "flat-small-no-op-second-sync-ssh",
+      "class": "flat-small",
+      "workload": "no-op-second-sync",
+      "route": "ssh",
+      "status": "passed",
+      "report": "/tmp/xsync-81-ssh-full/report-flat-small-no-op-second-sync-ssh.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 0.6570240829969407,
+          "mad_wall_seconds": 0.424000207996869,
+          "median_cpu_seconds": 0.035124999999999997,
+          "peak_rss_bytes": 7192576,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 0.23617387500416953,
+          "mad_wall_seconds": 0.014961792003305163,
+          "median_cpu_seconds": 0.045282,
+          "peak_rss_bytes": 7897088,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": 2.97010938138661,
+          "paired_ratio_mad": 2.2429150690188178
+        },
+        "xsync-rsync-transport": {
+          "median_wall_seconds": 1.12163479100127,
+          "mad_wall_seconds": 0.7541157080049743,
+          "median_cpu_seconds": 0.059659,
+          "peak_rss_bytes": 7241728,
+          "median_wire_bytes": 60084,
+          "paired_ratio_median": 0.5804324500702139,
+          "paired_ratio_mad": 0.05361319757421157
+        }
+      }
+    },
+    {
+      "cell": "compressible-initial-copy-ssh",
+      "class": "compressible",
+      "workload": "initial-copy",
+      "route": "ssh",
+      "status": "passed",
+      "report": "/tmp/xsync-81-ssh-full/report-compressible-initial-copy-ssh.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 0.30434329099807655,
+          "mad_wall_seconds": 0.019372458002180792,
+          "median_cpu_seconds": 0.068077,
+          "peak_rss_bytes": 22855680,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 1.040801791998092,
+          "mad_wall_seconds": 0.00981925000087358,
+          "median_cpu_seconds": 0.076053,
+          "peak_rss_bytes": 7110656,
+          "median_wire_bytes": 2944,
+          "paired_ratio_median": 0.3636333356404633,
+          "paired_ratio_mad": 0.1541144868678059
+        },
+        "xsync-rsync-transport": {
+          "median_wall_seconds": 0.955238874994393,
+          "mad_wall_seconds": 0.1416165830087266,
+          "median_cpu_seconds": 0.095656,
+          "peak_rss_bytes": 22429696,
+          "median_wire_bytes": 2102303,
+          "paired_ratio_median": 0.3074022976749038,
+          "paired_ratio_mad": 0.11154319797347498
+        }
+      }
+    },
+    {
+      "cell": "incompressible-initial-copy-ssh",
+      "class": "incompressible",
+      "workload": "initial-copy",
+      "route": "ssh",
+      "status": "passed",
+      "report": "/tmp/xsync-81-ssh-full/report-incompressible-initial-copy-ssh.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 0.35543720799614675,
+          "mad_wall_seconds": 0.1039887499937322,
+          "median_cpu_seconds": 0.05180799999999999,
+          "peak_rss_bytes": 22872064,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 1.04737641599786,
+          "mad_wall_seconds": 0.49118679099774454,
+          "median_cpu_seconds": 0.05080899999999999,
+          "peak_rss_bytes": 7323648,
+          "median_wire_bytes": 2098816,
+          "paired_ratio_median": 0.6149587165517109,
+          "paired_ratio_mad": 0.14055226350723304
+        },
+        "xsync-rsync-transport": {
+          "median_wall_seconds": 1.223541125000338,
+          "mad_wall_seconds": 0.5022890000036568,
+          "median_cpu_seconds": 0.062435,
+          "peak_rss_bytes": 22265856,
+          "median_wire_bytes": 2102303,
+          "paired_ratio_median": 0.621565959352097,
+          "paired_ratio_mad": 0.19254559646395975
+        }
+      }
+    },
+    {
+      "cell": "one-large-file-initial-copy-ssh",
+      "class": "one-large-file",
+      "workload": "initial-copy",
+      "route": "ssh",
+      "status": "passed",
+      "report": "/tmp/xsync-81-ssh-full/report-one-large-file-initial-copy-ssh.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 1.0199044999972102,
+          "mad_wall_seconds": 0.05799600000318628,
+          "median_cpu_seconds": 0.091726,
+          "peak_rss_bytes": 100827136,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 1.0206534579992876,
+          "mad_wall_seconds": 0.1440124580039992,
+          "median_cpu_seconds": 0.087002,
+          "peak_rss_bytes": 73121792,
+          "median_wire_bytes": 8388660,
+          "paired_ratio_median": 0.875705630243868,
+          "paired_ratio_mad": 0.2651740230955476
+        },
+        "xsync-rsync-transport": {
+          "median_wall_seconds": 1.7569297500012908,
+          "mad_wall_seconds": 0.34702708400436677,
+          "median_cpu_seconds": 0.105119,
+          "peak_rss_bytes": 77119488,
+          "median_wire_bytes": 8391901,
+          "paired_ratio_median": 0.5864371737136725,
+          "paired_ratio_mad": 0.2818817122497334
+        }
+      }
+    }
+  ]
+}

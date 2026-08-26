@@ -4,7 +4,6 @@
 //! by field. Rust enum discriminants and serializer layout are not part of the
 //! protocol contract; see `protocol.md` for the frozen v1 layout.
 
-use std::collections::HashSet;
 use std::io::{self, Read, Write};
 
 use thiserror::Error;
@@ -33,8 +32,8 @@ pub const MAX_EXCLUDE_PATTERN_BYTES: usize = 4 * 1024;
 pub const MAX_RESUME_RANGES: usize = 65_536;
 /// Maximum error text length in bytes.
 pub const MAX_ERROR_MESSAGE: usize = 64 * 1024;
-/// Maximum frame IDs retained by a stateful decoder.
-pub const MAX_TRACKED_MESSAGE_IDS: usize = 1_048_576;
+/// Maximum disjoint message-ID ranges retained by a stateful decoder.
+pub const MAX_TRACKED_MESSAGE_ID_RANGES: usize = 1_048_576;
 
 /// Capability bit requesting a data-only receiver session (multi-stream,
 /// Story 4.2): the session skips the destination scan and only accepts
@@ -45,6 +44,36 @@ pub const CAP_DATA_ONLY: u32 = 1 << 0;
 
 /// Endpoint supports zstd-compressed data frames.
 pub const CAP_ZSTD: u32 = 1 << 1;
+
+/// Peer understands the v2 browse capability set.
+pub const CAP_BROWSE_V2: u32 = 1 << 2;
+
+/// Peer understands the version-negotiation handshake extension.
+pub const CAP_VERSION_NEGOTIATION: u32 = 1 << 3;
+
+/// Capability bits with a defined meaning in the current contract.
+pub const KNOWN_CAPABILITIES: u32 =
+    CAP_DATA_ONLY | CAP_ZSTD | CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+
+/// Select the session grammar before the first non-handshake frame.
+#[must_use]
+pub const fn negotiate_protocol_version(local: u32, remote: u32) -> u32 {
+    if local & (CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2)
+        == (CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2)
+        && remote & (CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2)
+            == (CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+/// Return the intersection of capabilities defined by this contract.
+#[must_use]
+pub const fn common_capabilities(local: u32, remote: u32) -> u32 {
+    local & remote & KNOWN_CAPABILITIES
+}
 
 /// Envelope flag indicating that the payload uses zstd compression.
 pub const FRAME_FLAG_ZSTD: u8 = 0x01;
@@ -58,6 +87,8 @@ pub enum Role {
     Source,
     /// The endpoint publishes received metadata and bytes.
     Sink,
+    /// Long-lived request/response browse session.
+    Session,
 }
 
 /// Compression selected for a session.
@@ -300,17 +331,36 @@ impl Default for EncodeOptions {
 }
 
 /// Stateful bounded frame decoder.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FrameDecoder {
-    seen_ids: HashSet<u64>,
+    seen_id_ranges: Vec<(u64, u64)>,
     last_wire_bytes: usize,
+    expected_version: u32,
 }
 
 impl FrameDecoder {
     /// Create an empty decoder with no previously observed frame IDs.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            seen_id_ranges: Vec::new(),
+            last_wire_bytes: 0,
+            expected_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// Create a decoder committed to one envelope version.
+    ///
+    /// The version is intentionally fixed for the decoder's lifetime. A
+    /// session must select its grammar during the handshake rather than
+    /// downgrading after a frame fails to decode.
+    #[must_use]
+    pub fn for_version(version: u32) -> Self {
+        Self {
+            seen_id_ranges: Vec::new(),
+            last_wire_bytes: 0,
+            expected_version: version,
+        }
     }
 
     /// Return the encoded size of the most recently read frame.
@@ -325,7 +375,7 @@ impl FrameDecoder {
     /// Returns [`ProtocolError`] for malformed envelopes, payloads, limits, or
     /// duplicate IDs.
     pub fn decode(&mut self, bytes: &[u8]) -> Result<Frame, ProtocolError> {
-        let frame = decode_frame(bytes)?;
+        let frame = decode_frame_for_version(bytes, self.expected_version)?;
         self.remember(frame.message_id)?;
         Ok(frame)
     }
@@ -343,7 +393,7 @@ impl FrameDecoder {
         reader
             .read_exact(&mut header)
             .map_err(ProtocolError::Read)?;
-        let parsed = parse_header(&header)?;
+        let parsed = parse_header(&header, self.expected_version)?;
         let payload_len =
             usize::try_from(parsed.payload_len).map_err(|_| ProtocolError::LengthOverflow)?;
         let mut payload = vec![0_u8; payload_len];
@@ -357,15 +407,50 @@ impl FrameDecoder {
     }
 
     fn remember(&mut self, message_id: u64) -> Result<(), ProtocolError> {
-        if self.seen_ids.len() >= MAX_TRACKED_MESSAGE_IDS {
-            return Err(ProtocolError::SessionBudget {
-                detail: "message ID tracking limit exceeded",
-            });
-        }
-        if !self.seen_ids.insert(message_id) {
+        let insertion = self.seen_id_ranges.binary_search_by(|(start, end)| {
+            if message_id < *start {
+                std::cmp::Ordering::Greater
+            } else if message_id > *end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        if insertion.is_ok() {
             return Err(ProtocolError::DuplicateId { message_id });
         }
+        let index = insertion.unwrap_err();
+        let joins_previous = index > 0
+            && self.seen_id_ranges[index - 1]
+                .1
+                .checked_add(1)
+                .is_some_and(|end| end == message_id);
+        let joins_next = index < self.seen_id_ranges.len()
+            && self.seen_id_ranges[index].0 == message_id.saturating_add(1);
+        match (joins_previous, joins_next) {
+            (true, true) => {
+                let next_end = self.seen_id_ranges[index].1;
+                self.seen_id_ranges[index - 1].1 = next_end;
+                self.seen_id_ranges.remove(index);
+            }
+            (true, false) => self.seen_id_ranges[index - 1].1 = message_id,
+            (false, true) => self.seen_id_ranges[index].0 = message_id,
+            (false, false) => {
+                if self.seen_id_ranges.len() >= MAX_TRACKED_MESSAGE_ID_RANGES {
+                    return Err(ProtocolError::SessionBudget {
+                        detail: "message ID tracking range limit exceeded",
+                    });
+                }
+                self.seen_id_ranges.insert(index, (message_id, message_id));
+            }
+        }
         Ok(())
+    }
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -375,7 +460,23 @@ impl FrameDecoder {
 /// Returns [`ProtocolError`] when the message exceeds a protocol limit or
 /// cannot be represented by the checked field layout.
 pub fn encode_frame(message_id: u64, message: &Message) -> Result<Vec<u8>, ProtocolError> {
-    encode_frame_with_options(message_id, message, EncodeOptions::default())
+    encode_frame_with_version(message_id, message, PROTOCOL_VERSION)
+}
+
+/// Encode one frame using an explicitly selected envelope version.
+///
+/// The caller must select the version during the handshake. This function does
+/// not perform fallback or reinterpret v2 payloads as v1 messages.
+///
+/// # Errors
+/// Returns [`ProtocolError`] when the message exceeds a protocol limit or the
+/// version is invalid.
+pub fn encode_frame_with_version(
+    message_id: u64,
+    message: &Message,
+    version: u32,
+) -> Result<Vec<u8>, ProtocolError> {
+    encode_frame_with_options_and_version(message_id, message, EncodeOptions::default(), version)
 }
 
 /// Encode one v1 frame with an optional zstd payload.
@@ -398,7 +499,45 @@ pub fn encode_frame_with_options(
         });
     }
 
-    encode_payload_frame(message_id, message, &payload, options.compression, 3)
+    encode_payload_frame(
+        message_id,
+        message,
+        &payload,
+        options.compression,
+        3,
+        PROTOCOL_VERSION,
+    )
+}
+
+fn encode_frame_with_options_and_version(
+    message_id: u64,
+    message: &Message,
+    options: EncodeOptions,
+    version: u32,
+) -> Result<Vec<u8>, ProtocolError> {
+    if !matches!(version, 1 | 2) {
+        return Err(ProtocolError::VersionMismatch {
+            local: PROTOCOL_VERSION,
+            remote: version,
+        });
+    }
+    let payload_capacity = validate_message(message)?;
+    let mut payload = Vec::with_capacity(payload_capacity);
+    encode_message_payload(message, &mut payload)?;
+    if payload.len() > MAX_DECOMPRESSED_PAYLOAD {
+        return Err(ProtocolError::PayloadTooLarge {
+            length: payload.len(),
+            maximum: MAX_DECOMPRESSED_PAYLOAD,
+        });
+    }
+    encode_payload_frame(
+        message_id,
+        message,
+        &payload,
+        options.compression,
+        3,
+        version,
+    )
 }
 
 /// Encode a frame using a caller-selected zstd level.
@@ -421,7 +560,14 @@ pub fn encode_frame_with_compression(
             maximum: MAX_DECOMPRESSED_PAYLOAD,
         });
     }
-    encode_payload_frame(message_id, message, &payload, compression, level)
+    encode_payload_frame(
+        message_id,
+        message,
+        &payload,
+        compression,
+        level,
+        PROTOCOL_VERSION,
+    )
 }
 
 fn encode_payload_frame(
@@ -430,6 +576,7 @@ fn encode_payload_frame(
     payload: &[u8],
     compression: CompressionMode,
     level: i32,
+    version: u32,
 ) -> Result<Vec<u8>, ProtocolError> {
     let (flags, wire_payload) = if compression == CompressionMode::Zstd {
         let decision =
@@ -458,7 +605,7 @@ fn encode_payload_frame(
     let header_len = u16::try_from(FRAME_HEADER_LEN).map_err(|_| ProtocolError::LengthOverflow)?;
     frame.extend_from_slice(&header_len.to_le_bytes());
     frame.extend_from_slice(&0_u16.to_le_bytes());
-    frame.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    frame.extend_from_slice(&version.to_le_bytes());
     frame.push(message_type(message).as_u8());
     frame.push(flags);
     frame.extend_from_slice(&0_u16.to_le_bytes());
@@ -494,13 +641,23 @@ pub fn write_frame<W: Write>(
 /// Returns [`ProtocolError`] for malformed envelopes, payloads, limits, or
 /// trailing bytes.
 pub fn decode_frame(bytes: &[u8]) -> Result<Frame, ProtocolError> {
+    decode_frame_for_version(bytes, PROTOCOL_VERSION)
+}
+
+/// Decode one complete frame while requiring the selected envelope version.
+///
+/// # Errors
+/// Returns [`ProtocolError::VersionMismatch`] when the frame belongs to a
+/// different session grammar. The caller must not retry it with another
+/// version.
+pub fn decode_frame_for_version(bytes: &[u8], version: u32) -> Result<Frame, ProtocolError> {
     if bytes.len() < FRAME_HEADER_LEN {
         return Err(ProtocolError::Truncated {
             expected: FRAME_HEADER_LEN,
             actual: bytes.len(),
         });
     }
-    let parsed = parse_header(&bytes[..FRAME_HEADER_LEN])?;
+    let parsed = parse_header(&bytes[..FRAME_HEADER_LEN], version)?;
     let payload_len =
         usize::try_from(parsed.payload_len).map_err(|_| ProtocolError::LengthOverflow)?;
     let total = FRAME_HEADER_LEN
@@ -529,7 +686,7 @@ struct ParsedHeader {
     message_id: u64,
 }
 
-fn parse_header(header: &[u8]) -> Result<ParsedHeader, ProtocolError> {
+fn parse_header(header: &[u8], expected_version: u32) -> Result<ParsedHeader, ProtocolError> {
     if header.len() != FRAME_HEADER_LEN {
         return Err(ProtocolError::InvalidHeaderLength {
             declared: header.len(),
@@ -553,9 +710,9 @@ fn parse_header(header: &[u8]) -> Result<ParsedHeader, ProtocolError> {
         });
     }
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap_or([0; 4]));
-    if version != PROTOCOL_VERSION {
+    if version != expected_version {
         return Err(ProtocolError::VersionMismatch {
-            local: PROTOCOL_VERSION,
+            local: expected_version,
             remote: version,
         });
     }
@@ -1406,6 +1563,7 @@ fn role_to_wire(role: Role) -> u8 {
     match role {
         Role::Source => 1,
         Role::Sink => 2,
+        Role::Session => 3,
     }
 }
 
@@ -1413,6 +1571,7 @@ fn role_from_wire(value: u8) -> Result<Role, ProtocolError> {
     match value {
         1 => Ok(Role::Source),
         2 => Ok(Role::Sink),
+        3 => Ok(Role::Session),
         _ => Err(ProtocolError::UnknownEnum {
             field: "role",
             value,
@@ -1809,6 +1968,46 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn version_negotiation_is_determined_before_session_data() {
+        let v2 = CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2;
+        assert_eq!(negotiate_protocol_version(v2, v2), 2);
+        assert_eq!(negotiate_protocol_version(v2, CAP_VERSION_NEGOTIATION), 1);
+        assert_eq!(negotiate_protocol_version(v2, 0), 1);
+        assert_eq!(
+            common_capabilities(v2 | CAP_ZSTD, v2 | CAP_ZSTD),
+            v2 | CAP_ZSTD
+        );
+        assert_eq!(common_capabilities(v2, u32::MAX) & !KNOWN_CAPABILITIES, 0);
+    }
+
+    #[test]
+    fn selected_version_is_committed_at_the_frame_boundary() {
+        let message = Message::Ack {
+            acknowledged_id: 42,
+            acknowledged_type: 1,
+        };
+        let v2_frame = encode_frame_with_version(1, &message, 2).unwrap();
+        assert_eq!(u32::from_le_bytes(v2_frame[8..12].try_into().unwrap()), 2);
+        assert_eq!(
+            decode_frame_for_version(&v2_frame, 2).unwrap().message,
+            message
+        );
+
+        let mut v1_decoder = FrameDecoder::new();
+        assert_eq!(
+            v1_decoder.decode(&v2_frame).unwrap_err().to_string(),
+            "xsync version mismatch: local v1 / remote v2"
+        );
+
+        let v1_frame = encode_frame(2, &message).unwrap();
+        let mut v2_decoder = FrameDecoder::for_version(2);
+        assert_eq!(
+            v2_decoder.decode(&v1_frame).unwrap_err().to_string(),
+            "xsync version mismatch: local v2 / remote v1"
+        );
+    }
+
     fn entry(path: &[u8], kind: EntryKind) -> EntryRecord {
         EntryRecord {
             path: path.to_vec(),
@@ -1968,6 +2167,20 @@ mod tests {
         assert!(matches!(
             decoder.read(&mut cursor),
             Err(ProtocolError::DuplicateId { message_id: 7 })
+        ));
+    }
+
+    #[test]
+    fn sequential_message_ids_do_not_exhaust_tracking_budget() {
+        let mut decoder = FrameDecoder::new();
+        for id in 1..=1_100_000 {
+            decoder.remember(id).unwrap();
+        }
+        assert!(matches!(
+            decoder.remember(1_000_000),
+            Err(ProtocolError::DuplicateId {
+                message_id: 1_000_000
+            })
         ));
     }
 

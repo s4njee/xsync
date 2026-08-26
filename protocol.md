@@ -35,8 +35,10 @@ or reading the body. In-memory decoding rejects trailing bytes; stream decoding
 consumes one complete frame and leaves the next frame unread.
 
 Message IDs are unique within a session. `FrameDecoder` retains a bounded set
-of received IDs and rejects duplicates before dispatch. A session may not
-exceed 1,048,576 tracked IDs.
+of disjoint received-ID ranges and rejects duplicates before dispatch. A large
+sequential transfer therefore remains bounded without imposing a frame-count
+limit; a hostile stream with more than 1,048,576 disjoint ranges is rejected by
+the session budget.
 
 ## Payload encoding
 
@@ -106,6 +108,137 @@ stream rather than failing.
 the intersection of the requested mode and both peers' capability bits. If
 either peer lacks `CAP_ZSTD`, the session uses `None`, and this choice is made
 during the handshake before any data frame is sent.
+
+## v2 message table
+
+Protocol v2 uses the same 32-byte envelope shape and `xsn1` magic. The envelope
+version is `2` after the handshake selects v2. The v1 opening handshake and its
+acknowledgement remain v1 envelope frames as specified by
+[`v2handshake.md`](v2handshake.md). V1 message types 1 through 13 retain their
+payload layouts; new v2 message types begin at 14.
+
+The v2 reader remains fail-closed. It accepts only the types listed below,
+checks every bound before allocation, and rejects trailing payload bytes. A v1
+peer never receives these types because the handshake selects v1 before
+`SessionConfig`.
+
+The consuming implementations are xsync and f2. A change to this table is a
+protocol change and must update both consumers or add a versioned amendment;
+implementation enum order is never the wire contract.
+
+The v1 handshake role values are `1` source, `2` sink, and `3` long-lived
+session. Role `3` requires the v2 negotiation and browse capability bits; it
+never enters the v1 sync state machine.
+
+| Type | Message | Payload fields in order |
+|---:|---|---|
+| 14 | ListRequest | path, page token `u64`, page size `u32` |
+| 15 | ListPage | related request ID `u64`, page token `u64`, final-page boolean, count, entries |
+| 16 | StatRequest | path, include-digest boolean |
+| 17 | StatResponse | related request ID `u64`, status `u8`, entry record, optional digest `[32]`, error message |
+| 18 | CancelRequest | related request ID `u64` |
+| 19 | Keepalive | nonce `u64` |
+| 20 | KeepaliveAck | nonce `u64` |
+| 21 | BrowseError | related request ID `u64`, code `u16`, UTF-8 message |
+| 22 | RenameRequest | source path, destination path |
+| 23 | RenameResponse | related request ID `u64`, mutation status `u8`, error message |
+| 24 | CreateDirectoryRequest | path |
+| 25 | CreateDirectoryResponse | related request ID `u64`, mutation status `u8`, error message |
+| 26 | DeleteRequest | path |
+| 27 | DeleteProgress | related request ID `u64`, path, removed boolean, error message |
+| 28 | DeleteResponse | related request ID `u64`, delete status `u8`, removed count `u64`, irreversible boolean, failure collection |
+| 29 | FetchRequest | path |
+| 30 | FetchStart | related request ID `u64`, size `u64`, mtime ns `i64`, device `u64`, file `u64`, BLAKE3 digest `[32]` |
+| 31 | FetchChunk | related request ID `u64`, offset `u64`, data |
+| 32 | PublishRequest | path, fetched size `u64`, fetched mtime ns `i64`, fetched device `u64`, fetched file `u64`, fetched digest `[32]` |
+| 33 | PublishReady | related request ID `u64` |
+| 34 | PublishChunk | related request ID `u64`, offset `u64`, data |
+| 35 | PublishResponse | related request ID `u64`, publish status `u8`, current identity, error message |
+
+The envelope message ID remains unique for every frame. Response messages also
+carry `related request ID` because a long-lived session may have more than one
+request in flight and the response's own envelope ID is not the request ID.
+The server processes requests in arrival order for v2. A cancellation applies
+only to the related request and is acknowledged by either the request's normal
+final response or a `BrowseError` with the cancellation code.
+
+### v2 field encoding and bounds
+
+- `path` and symlink targets are raw byte strings with a maximum encoded length
+  of 1 MiB. Paths are relative to the configured server root; `ListRequest`
+  accepts the empty path for the root. A list entry name is one relative path
+  component and uses the same 1 MiB maximum.
+- `page token` is an opaque server-issued cursor. Zero requests the first page;
+  a non-final page returns the token for the next page. Tokens are scoped to the
+  related request and must not be reused after the final page.
+- `page size` is bounded to `1..=65,536`. The server may return fewer entries
+  than requested without marking the page final.
+- Collection counts are `u32` and capped at 65,536 before reserving memory.
+- Each list/stat entry is encoded in this order: name/path blob, kind `u8`,
+  size `u64`, mtime ns `i64`, mode `u32`, symlink-target blob. The target blob
+  is empty unless kind is symlink. `ListPage` repeats this entry structure
+  exactly `count` times.
+- File sizes are `u64`, mtimes are signed nanoseconds `i64`, modes are `u32`,
+  and kinds use the frozen v1 wire values: `1` file, `2` directory, `3` symlink,
+  and `4` other. Symlink entries include a raw target; regular files,
+  directories, and other entries encode an empty target.
+- `StatResponse.status` is `ok`, `missing`, or `error`. `missing` is a normal
+  negative answer and carries no entry. For `ok`, the entry follows the status,
+  then a digest-present boolean and the optional digest. For `missing`, only a
+  digest-present boolean with value false follows. For `error`, the entry and
+  digest are absent and the bounded UTF-8 error message follows.
+- `include-digest=true` permits a BLAKE3 digest only for a regular file. The
+  digest is omitted for directories, symlinks, missing paths, and errors.
+- `BrowseError` messages are UTF-8 and capped at 64 KiB. Its code values are
+  frozen as `1 cancelled`, `2 invalid request`, `3 permission denied`,
+  `4 unavailable`, and `5 internal error`.
+- Rename refuses an existing destination and uses the filesystem rename operation,
+  preserving its atomicity. Mutation responses use status values `0 ok`,
+  `1 already exists`, `2 permission denied`, `3 parent missing`, `4 cross-device`
+  (`EXDEV`, rename only), and `5 error`. A non-zero status carries a bounded
+  UTF-8 error message; status `ok` carries no message.
+- `CreateDirectoryRequest` creates exactly one directory and does not create
+  missing parents. Both mutation requests and responses are request-scoped and
+  use the same path and error bounds as browse requests.
+- `DeleteRequest` is irreversible and recursively removes the requested path.
+  It never follows symlinks. `DeleteProgress` is emitted once per attempted
+  item, including failures. Delete status values are `0 complete`, `1 partial`,
+  and `2 cancelled`; a response always sets `irreversible=true` and includes
+  every failed path with its signed platform errno. A directory changed during
+  traversal is handled as a snapshot: entries observed after a directory is
+  read are not part of the operation, while removal failures for entries that
+  disappear or become non-empty are reported in the final failure list.
+- `FetchRequest` accepts only a regular file. The server performs the existing
+  stable source read, sends one `FetchStart`, then ordered chunks of at most 1
+  MiB. The start metadata and digest describe the exact bytes in those chunks;
+  a failed stable read is a request-scoped error and sends no data.
+- `PublishRequest` is accepted only when the target's current size, mtime, and
+  filesystem identity equal the fetched identity. A mismatch returns status
+  `changed` and the current identity, including an explicit absent identity.
+  Status values are `0 ok`, `1 changed`, and `2 error`. After `PublishReady`,
+  ordered chunks are verified by size and BLAKE3, staged through the sink's
+  deterministic temporary path, and atomically renamed into place.
+- Keepalive frames carry no filesystem state and are valid only while the
+  session is established. An unknown nonce is a protocol error.
+- The existing 16 MiB encoded and decoded payload caps, checked length
+  arithmetic, reserved-field rules, and compression rules apply unchanged.
+
+### v1 and v2 message handling
+
+- A v2 session accepts the v1 `Ack` and `Error` frames required to complete the
+  opening handshake. After the selected-version boundary, it accepts only the
+  v2 table above plus v1 transfer messages explicitly reused by a later
+  story's transfer contract.
+- A v1 session accepts no type above 13 and must never be sent one. A v2 server
+  communicating with a v1 client selects v1 and uses only the frozen v1 table.
+- V2 does not reinterpret a v1 message with a new payload. If a future feature
+  needs different fields, it receives a new type or a new protocol version.
+- Browse errors are per-request and do not terminate the session unless the
+  error is a framing, bounds, duplicate-ID, or other protocol error.
+
+This table is the v2 freeze for Stories 9.1, 9.2, 11.1, 12.1, and 12.2. Additional
+session controls receive new type assignments in a later protocol revision or
+an explicitly amended v2 table; they must not reuse these numbers.
 
 Malformed compression, a compressed output larger than the declared bounded
 length, or a declared decompressed length over 16 MiB is rejected before any

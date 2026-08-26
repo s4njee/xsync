@@ -20,11 +20,13 @@
     clippy::redundant_closure_for_method_calls
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use filetime::{set_file_mtime, FileTime};
@@ -37,13 +39,16 @@ use crate::planner::{
     try_plan, try_plan_with_fingerprint, DestinationIndex, IndexConfig, PlannerError,
 };
 use crate::protocol::{
-    encode_frame, encode_frame_with_compression, negotiate_compression, ByteRange, CompressionMode,
-    EntryRecord, FrameDecoder, Message, MetadataOperation, ProtocolError, Role, CAP_ZSTD,
+    common_capabilities, encode_frame, encode_frame_with_compression, negotiate_compression,
+    negotiate_protocol_version, ByteRange, CompressionMode, EntryRecord, FrameDecoder, Message,
+    MetadataOperation, ProtocolError, Role, CAP_BROWSE_V2, CAP_VERSION_NEGOTIATION, CAP_ZSTD,
     DEFAULT_UNACKNOWLEDGED_WINDOW, MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
 };
+use crate::protocol_v2::{self, V2CodecError, V2Frame, V2Message};
+use crate::protocol_v2::{BrowseEntry, MutationStatus};
 use crate::scanner::{
-    permission_mode, scan, EntryKind as ScanEntryKind, FileEntry, FileIdentity, ScanError,
-    SourceFingerprint,
+    fingerprint_from_metadata, permission_mode, scan, EntryKind as ScanEntryKind, FileEntry,
+    FileIdentity, ScanError, SourceFingerprint,
 };
 use crate::sink::{Sink, SinkError, SymlinkTargetKind};
 use crate::source::{SourceReadError, SourceReader};
@@ -99,6 +104,9 @@ pub enum ServerError {
         /// Remote diagnostic message.
         message: String,
     },
+    /// A browse-session frame was malformed or used the wrong message shape.
+    #[error("v2 session error: {0}")]
+    Browse(#[from] V2CodecError),
     /// The remote shell positively reported that xsync is unavailable.
     #[error("xs not found on remote host — install it or check PATH")]
     MissingRemoteXsync,
@@ -110,6 +118,532 @@ pub enum ServerError {
         /// Diagnostic message.
         message: String,
     },
+    /// The persistent browse peer closed its stream cleanly.
+    #[error("browse peer disconnected")]
+    PeerDisconnected,
+}
+
+/// Result of probing a peer before opening a browse session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeStatus {
+    /// The peer supports the current browse protocol.
+    Ready,
+    /// The peer answered, but is older and cannot provide browse v2.
+    OlderPeer { selected_version: u32 },
+    /// The peer answered with an unusable role or protocol state.
+    Unusable { detail: String },
+}
+
+impl ProbeStatus {
+    /// Action a caller can present for this probe result.
+    #[must_use]
+    pub const fn action(&self) -> &'static str {
+        match self {
+            Self::Ready => "open the browse session",
+            Self::OlderPeer { .. } => "upgrade the remote xsync binary before browsing",
+            Self::Unusable { .. } => "check the remote xsync installation and protocol settings",
+        }
+    }
+}
+
+/// Handshake facts exposed by a pre-session probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProbe {
+    /// Local application version.
+    pub local_version: &'static str,
+    /// Remote application version when the peer exposes one.
+    pub remote_version: Option<String>,
+    /// Capabilities advertised by the remote peer.
+    pub remote_capabilities: u32,
+    /// Capability intersection computed during the probe.
+    pub common_capabilities: u32,
+    /// Selected wire version.
+    pub selected_version: u32,
+    /// Typed probe outcome.
+    pub status: ProbeStatus,
+}
+
+/// A successful probe with the connection still available for reuse.
+pub struct ProbedConnection<R, W> {
+    /// Probe facts.
+    pub probe: AgentProbe,
+    /// Already-handshaken reader.
+    pub reader: R,
+    /// Already-handshaken writer.
+    pub writer: W,
+}
+
+impl<R: Read, W: Write> ProbedConnection<R, W> {
+    /// Continue directly into a browse session without another connection or handshake.
+    pub fn into_browse_session(self) -> Result<BrowseSession<R, W>, ServerError> {
+        if !matches!(self.probe.status, ProbeStatus::Ready) {
+            return Err(ServerError::UnexpectedMessage(format!(
+                "cannot open browse session after probe: {:?}",
+                self.probe.status
+            )));
+        }
+        Ok(BrowseSession {
+            reader: self.reader,
+            writer: self.writer,
+            next_message_id: 2,
+            remote_capabilities: self.probe.remote_capabilities,
+            common_capabilities: self.probe.common_capabilities,
+        })
+    }
+}
+
+/// Perform the v1-compatible opening handshake without starting a session operation.
+pub fn probe_session<R: Read, W: Write>(
+    mut reader: R,
+    mut writer: W,
+    job_id: [u8; 16],
+) -> Result<ProbedConnection<R, W>, ServerError> {
+    let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+    let handshake = Message::Handshake {
+        role: Role::Session,
+        capabilities,
+        max_payload: MAX_COMPLETE_PAYLOAD as u32,
+        max_segment: MAX_DATA_SEGMENT as u32,
+        window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+        job_id,
+        compression: CompressionMode::None,
+        compression_level: 3,
+    };
+    writer.write_all(&encode_frame(1, &handshake)?)?;
+    writer.flush()?;
+    let mut decoder = FrameDecoder::new();
+    let server_handshake = decoder.read(&mut reader)?;
+    let remote_capabilities = match server_handshake.message {
+        Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            ..
+        } => capabilities,
+        other => {
+            return Ok(ProbedConnection {
+                probe: AgentProbe {
+                    local_version: crate::version(),
+                    remote_version: None,
+                    remote_capabilities: 0,
+                    common_capabilities: 0,
+                    selected_version: 0,
+                    status: ProbeStatus::Unusable {
+                        detail: format!("expected Session handshake, got {other:?}"),
+                    },
+                },
+                reader,
+                writer,
+            })
+        }
+    };
+    let ack = decoder.read(&mut reader)?;
+    if !matches!(ack.message, Message::Ack { .. }) {
+        return Ok(ProbedConnection {
+            probe: AgentProbe {
+                local_version: crate::version(),
+                remote_version: None,
+                remote_capabilities,
+                common_capabilities: common_capabilities(capabilities, remote_capabilities),
+                selected_version: 0,
+                status: ProbeStatus::Unusable {
+                    detail: format!("expected handshake acknowledgement, got {:?}", ack.message),
+                },
+            },
+            reader,
+            writer,
+        });
+    }
+    let selected_version = negotiate_protocol_version(capabilities, remote_capabilities);
+    let status = if selected_version == 2 {
+        ProbeStatus::Ready
+    } else {
+        ProbeStatus::OlderPeer { selected_version }
+    };
+    Ok(ProbedConnection {
+        probe: AgentProbe {
+            local_version: crate::version(),
+            remote_version: None,
+            remote_capabilities,
+            common_capabilities: common_capabilities(capabilities, remote_capabilities),
+            selected_version,
+            status,
+        },
+        reader,
+        writer,
+    })
+}
+
+/// Client-side driver for a persistent v2 browse session.
+///
+/// The constructor performs the v1-compatible opening handshake and commits
+/// to v2 before returning. Requests and responses thereafter use only the v2
+/// browse envelope; a malformed frame is returned as an error and is never
+/// retried as v1.
+pub struct BrowseSession<R, W> {
+    reader: R,
+    writer: W,
+    next_message_id: u64,
+    remote_capabilities: u32,
+    common_capabilities: u32,
+}
+
+/// Metadata returned after a single-file fetch is verified locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchedFile {
+    /// Number of bytes published.
+    pub size: u64,
+    /// Modification time in nanoseconds since the Unix epoch.
+    pub mtime_ns: i64,
+    /// Source filesystem identity at the stable read.
+    pub identity: FileIdentity,
+    /// BLAKE3 digest of the fetched bytes.
+    pub digest: [u8; 32],
+}
+
+impl<R: Read, W: Write> BrowseSession<R, W> {
+    /// Establish a browse session over an already-connected stream pair.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] when the peer does not negotiate v2 or the
+    /// opening handshake is malformed.
+    pub fn connect(reader: R, writer: W, job_id: [u8; 16]) -> Result<Self, ServerError> {
+        probe_session(reader, writer, job_id)?.into_browse_session()
+    }
+
+    /// Capabilities advertised by the remote browse peer.
+    #[must_use]
+    pub const fn remote_capabilities(&self) -> u32 {
+        self.remote_capabilities
+    }
+
+    /// Known capabilities shared by both endpoints.
+    #[must_use]
+    pub const fn common_capabilities(&self) -> u32 {
+        self.common_capabilities
+    }
+
+    /// Return the underlying stream pair, consuming the session driver.
+    #[must_use]
+    pub fn into_parts(self) -> (R, W) {
+        (self.reader, self.writer)
+    }
+
+    /// Send one v2 request and return its envelope ID.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] when encoding or writing fails.
+    pub fn send(&mut self, message: &V2Message) -> Result<u64, ServerError> {
+        let message_id = self.next_message_id;
+        self.next_message_id = self.next_message_id.saturating_add(1);
+        self.writer
+            .write_all(&protocol_v2::encode_frame(message_id, message)?)?;
+        self.writer.flush()?;
+        Ok(message_id)
+    }
+
+    /// Receive the next v2 response in stream order.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] when decoding or reading fails.
+    pub fn receive(&mut self) -> Result<V2Frame, ServerError> {
+        protocol_v2::read_frame(&mut self.reader)?.ok_or(ServerError::PeerDisconnected)
+    }
+
+    /// Send one request and wait for its next response.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] when the request or response cannot be sent or
+    /// decoded.
+    pub fn request(&mut self, message: &V2Message) -> Result<V2Frame, ServerError> {
+        self.send(message)?;
+        self.receive()
+    }
+
+    /// Request one bounded directory page.
+    ///
+    /// The returned token is zero when the page is final; otherwise pass it
+    /// back unchanged to retrieve the next page.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] when the peer returns a non-list response or
+    /// the request cannot be sent.
+    pub fn list_page(
+        &mut self,
+        path: Vec<u8>,
+        page_token: u64,
+        page_size: u32,
+    ) -> Result<(u64, bool, Vec<BrowseEntry>), ServerError> {
+        let response = self.request(&V2Message::ListRequest {
+            path,
+            page_token,
+            page_size,
+        })?;
+        match response.message {
+            V2Message::ListPage {
+                page_token,
+                final_page,
+                entries,
+                ..
+            } => Ok((page_token, final_page, entries)),
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected ListPage, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Request metadata for one path without following a final symlink.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] when the peer returns a non-stat response or
+    /// the request cannot be sent.
+    pub fn stat(&mut self, path: Vec<u8>, include_digest: bool) -> Result<V2Message, ServerError> {
+        let response = self.request(&V2Message::StatRequest {
+            path,
+            include_digest,
+        })?;
+        match response.message {
+            V2Message::StatResponse { .. } => Ok(response.message),
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected StatResponse, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Cancel a request and require its cancellation acknowledgement.
+    ///
+    /// Cancelling an already completed or unknown request is a no-op
+    /// acknowledgement, not a session error.
+    pub fn cancel(&mut self, related_id: u64) -> Result<(), ServerError> {
+        let response = self.request(&V2Message::CancelRequest { related_id })?;
+        match response.message {
+            V2Message::BrowseError {
+                related_id: response_id,
+                code: 1,
+                ..
+            } if response_id == related_id => Ok(()),
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected cancellation acknowledgement, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Send a keepalive and require the matching acknowledgement.
+    ///
+    /// # Errors
+    /// Returns [`ServerError`] when the peer closes, sends another response,
+    /// or acknowledges a different nonce.
+    pub fn keepalive(&mut self, nonce: u64) -> Result<(), ServerError> {
+        let response = self.request(&V2Message::Keepalive { nonce })?;
+        if response.message == (V2Message::KeepaliveAck { nonce }) {
+            Ok(())
+        } else {
+            Err(ServerError::UnexpectedMessage(format!(
+                "expected KeepaliveAck, got {:?}",
+                response.message
+            )))
+        }
+    }
+
+    /// Rename a remote path without replacing an existing destination.
+    pub fn rename(&mut self, source: Vec<u8>, destination: Vec<u8>) -> Result<(), ServerError> {
+        let response = self.request(&V2Message::RenameRequest {
+            source,
+            destination,
+        })?;
+        match response.message {
+            V2Message::RenameResponse {
+                status: MutationStatus::Ok,
+                ..
+            } => Ok(()),
+            V2Message::RenameResponse { status, error, .. } => Err(ServerError::RemoteError {
+                code: status as u16,
+                message: String::from_utf8_lossy(&error).into_owned(),
+            }),
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected RenameResponse, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Create one remote directory, without creating missing parents.
+    pub fn create_directory(&mut self, path: Vec<u8>) -> Result<(), ServerError> {
+        let response = self.request(&V2Message::CreateDirectoryRequest { path })?;
+        match response.message {
+            V2Message::CreateDirectoryResponse {
+                status: MutationStatus::Ok,
+                ..
+            } => Ok(()),
+            V2Message::CreateDirectoryResponse { status, error, .. } => {
+                Err(ServerError::RemoteError {
+                    code: status as u16,
+                    message: String::from_utf8_lossy(&error).into_owned(),
+                })
+            }
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected CreateDirectoryResponse, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Delete a remote tree, calling `progress` once for every attempted item.
+    pub fn delete_with_progress<F>(
+        &mut self,
+        path: Vec<u8>,
+        mut progress: F,
+    ) -> Result<V2Message, ServerError>
+    where
+        F: FnMut(&V2Message),
+    {
+        let related_id = self.send(&V2Message::DeleteRequest { path })?;
+        loop {
+            let response = self.receive()?;
+            match &response.message {
+                V2Message::DeleteProgress { related_id: id, .. } if *id == related_id => {
+                    progress(&response.message);
+                }
+                V2Message::DeleteResponse { related_id: id, .. } if *id == related_id => {
+                    return Ok(response.message);
+                }
+                V2Message::BrowseError { code: 1, .. } => {}
+                other => {
+                    return Err(ServerError::UnexpectedMessage(format!(
+                        "expected delete progress or response, got {other:?}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Fetch one remote regular file to a local path, publishing atomically.
+    pub fn fetch(
+        &mut self,
+        remote_path: Vec<u8>,
+        local_path: impl AsRef<Path>,
+    ) -> Result<FetchedFile, ServerError> {
+        let related_id = self.send(&V2Message::FetchRequest { path: remote_path })?;
+        let start = loop {
+            let response = self.receive()?;
+            match response.message {
+                V2Message::FetchStart { related_id: id, .. } if id == related_id => {
+                    break response.message
+                }
+                V2Message::BrowseError { code, message, .. } => {
+                    return Err(ServerError::RemoteError {
+                        code,
+                        message: String::from_utf8_lossy(&message).into_owned(),
+                    })
+                }
+                other => {
+                    return Err(ServerError::UnexpectedMessage(format!(
+                        "expected FetchStart, got {other:?}"
+                    )))
+                }
+            }
+        };
+        let V2Message::FetchStart {
+            size,
+            mtime_ns,
+            device,
+            file,
+            digest,
+            ..
+        } = start
+        else {
+            unreachable!()
+        };
+        let local_path = local_path.as_ref();
+        let parent = local_path.parent().unwrap_or_else(|| Path::new("."));
+        let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(ServerError::Io)?;
+        let mut expected_offset = 0_u64;
+        let mut hasher = blake3::Hasher::new();
+        while expected_offset < size {
+            let response = self.receive()?;
+            let V2Message::FetchChunk {
+                related_id: id,
+                offset,
+                data,
+            } = response.message
+            else {
+                return Err(ServerError::UnexpectedMessage(
+                    "expected FetchChunk while fetching".to_owned(),
+                ));
+            };
+            if id != related_id || offset != expected_offset {
+                return Err(ServerError::UnexpectedMessage(
+                    "fetch chunk is out of order".to_owned(),
+                ));
+            }
+            expected_offset = expected_offset
+                .checked_add(data.len() as u64)
+                .ok_or_else(|| ServerError::UnexpectedMessage("fetch size overflow".to_owned()))?;
+            if expected_offset > size {
+                return Err(ServerError::UnexpectedMessage(
+                    "fetch exceeded advertised size".to_owned(),
+                ));
+            }
+            hasher.update(&data);
+            staged.write_all(&data)?;
+        }
+        if *hasher.finalize().as_bytes() != digest {
+            return Err(ServerError::UnexpectedMessage(
+                "fetched digest does not match source".to_owned(),
+            ));
+        }
+        staged
+            .persist(local_path)
+            .map_err(|error| ServerError::Io(error.error))?;
+        Ok(FetchedFile {
+            size,
+            mtime_ns,
+            identity: FileIdentity { device, file },
+            digest,
+        })
+    }
+
+    /// Publish a locally edited file only when the fetched remote identity is unchanged.
+    pub fn publish(
+        &mut self,
+        remote_path: Vec<u8>,
+        local_path: impl AsRef<Path>,
+        fetched: FetchedFile,
+    ) -> Result<V2Message, ServerError> {
+        let bytes = fs::read(local_path).map_err(ServerError::Io)?;
+        if bytes.len() as u64 != fetched.size || *blake3::hash(&bytes).as_bytes() != fetched.digest
+        {
+            return Err(ServerError::UnexpectedMessage(
+                "local file no longer matches fetched identity".to_owned(),
+            ));
+        }
+        let related_id = self.send(&V2Message::PublishRequest {
+            path: remote_path,
+            size: fetched.size,
+            mtime_ns: fetched.mtime_ns,
+            device: fetched.identity.device,
+            file: fetched.identity.file,
+            digest: fetched.digest,
+        })?;
+        match self.receive()?.message {
+            V2Message::PublishReady { related_id: id } if id == related_id => {
+                for (offset, data) in bytes.chunks(1024 * 1024).enumerate() {
+                    self.send(&V2Message::PublishChunk {
+                        related_id,
+                        offset: (offset * 1024 * 1024) as u64,
+                        data: data.to_vec(),
+                    })?;
+                }
+                match self.receive()?.message {
+                    response @ V2Message::PublishResponse { .. } => Ok(response),
+                    other => Err(ServerError::UnexpectedMessage(format!(
+                        "expected PublishResponse, got {other:?}"
+                    ))),
+                }
+            }
+            response @ V2Message::PublishResponse { .. } => Ok(response),
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected PublishReady or PublishResponse, got {other:?}"
+            ))),
+        }
+    }
 }
 
 #[must_use]
@@ -270,7 +804,11 @@ pub fn file_entry_from_entry_record(record: &EntryRecord) -> Result<FileEntry, S
     })
 }
 
-/// Validate that a relative path does not escape the root via traversal or symlinks.
+/// Validate a relative mutation path before touching its destination.
+///
+/// Every existing ancestor is checked with `symlink_metadata`, and any
+/// symlink in the parent chain is refused. This keeps mutation operations
+/// inside the configured root even when a link points outside it.
 ///
 /// # Errors
 /// Returns [`ServerError::InvalidPath`] or [`ServerError::SymlinkEscape`].
@@ -286,7 +824,11 @@ pub fn validate_destination_path(
     }
     let current = relative_path.to_native_path(root);
     let mut ancestor = root.to_path_buf();
-    for component in relative_path.as_bytes().split(|byte| *byte == b'/') {
+    let components: Vec<&[u8]> = relative_path
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .collect();
+    for (index, component) in components.iter().enumerate() {
         #[cfg(unix)]
         {
             use std::ffi::OsString;
@@ -295,9 +837,10 @@ pub fn validate_destination_path(
         }
         #[cfg(not(unix))]
         ancestor.push(String::from_utf8_lossy(component).as_ref());
-        // Check if an intermediate ancestor is a symlink.
+        // The final component may itself be replaced by a mutation, but an
+        // existing symlink in the parent chain can redirect that mutation.
         if let Ok(metadata) = fs::symlink_metadata(&ancestor) {
-            if metadata.file_type().is_symlink() && ancestor.is_dir() {
+            if metadata.file_type().is_symlink() && index + 1 < components.len() {
                 return Err(ServerError::SymlinkEscape(relative_path.to_string()));
             }
         }
@@ -305,7 +848,164 @@ pub fn validate_destination_path(
     Ok(current)
 }
 
-/// A server instance executing either Source or Sink roles over framed streams.
+/// Validate and register one normalized destination for a mutation session.
+///
+/// `WirePath` is the protocol's normalized representation, so equivalent
+/// destinations are compared as paths rather than as presentation strings.
+pub fn validate_unique_destination_path(
+    root: &Path,
+    path: WirePath,
+    seen: &mut HashSet<WirePath>,
+) -> Result<PathBuf, ServerError> {
+    let native = validate_destination_path(root, path.clone())?;
+    if !seen.insert(path.clone()) {
+        return Err(ServerError::DuplicatePath(path.to_string()));
+    }
+    Ok(native)
+}
+
+fn browse_directory_path(root: &Path, path: &[u8]) -> Result<PathBuf, ServerError> {
+    let relative = WirePath::from_wire(path.to_vec())
+        .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
+    if relative.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let mut ancestor = root.to_path_buf();
+    for component in relative.as_bytes().split(|byte| *byte == b'/') {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            ancestor.push(OsString::from_vec(component.to_vec()));
+        }
+        #[cfg(not(unix))]
+        ancestor.push(String::from_utf8_lossy(component).as_ref());
+        if let Ok(metadata) = fs::symlink_metadata(&ancestor) {
+            if metadata.file_type().is_symlink() {
+                return Err(ServerError::SymlinkEscape(relative.to_string()));
+            }
+        }
+    }
+    Ok(relative.to_native_path(root))
+}
+
+fn browse_stat_path(root: &Path, path: &[u8]) -> Result<PathBuf, ServerError> {
+    let relative = WirePath::from_wire(path.to_vec())
+        .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
+    if relative.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    let components: Vec<&[u8]> = relative.as_bytes().split(|byte| *byte == b'/').collect();
+    let mut ancestor = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            ancestor.push(OsString::from_vec(component.to_vec()));
+        }
+        #[cfg(not(unix))]
+        ancestor.push(String::from_utf8_lossy(component).as_ref());
+        if index + 1 != components.len() {
+            if let Ok(metadata) = fs::symlink_metadata(&ancestor) {
+                if metadata.file_type().is_symlink() {
+                    return Err(ServerError::SymlinkEscape(relative.to_string()));
+                }
+            }
+        }
+    }
+    Ok(relative.to_native_path(root))
+}
+
+fn native_path_bytes(path: &std::ffi::OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return path.as_bytes().to_vec();
+    }
+    #[cfg(not(unix))]
+    path.to_string_lossy().as_bytes().to_vec()
+}
+
+fn mutation_failure(error: &ServerError) -> (MutationStatus, String) {
+    (MutationStatus::Error, error.to_string())
+}
+
+fn rename_status(error: &io::Error) -> MutationStatus {
+    match error.kind() {
+        io::ErrorKind::AlreadyExists => MutationStatus::AlreadyExists,
+        io::ErrorKind::PermissionDenied => MutationStatus::PermissionDenied,
+        io::ErrorKind::NotFound => MutationStatus::ParentMissing,
+        _ if error.raw_os_error() == Some(libc::EXDEV) => MutationStatus::CrossDevice,
+        _ => MutationStatus::Error,
+    }
+}
+
+fn mkdir_status(error: &io::Error) -> MutationStatus {
+    match error.kind() {
+        io::ErrorKind::AlreadyExists => MutationStatus::AlreadyExists,
+        io::ErrorKind::PermissionDenied => MutationStatus::PermissionDenied,
+        io::ErrorKind::NotFound => MutationStatus::ParentMissing,
+        _ => MutationStatus::Error,
+    }
+}
+
+fn mutation_response(
+    related_id: u64,
+    result: Result<(), (MutationStatus, String)>,
+    rename: bool,
+) -> V2Message {
+    let (status, error) = match result {
+        Ok(()) => (MutationStatus::Ok, Vec::new()),
+        Err((status, error)) => (status, error.into_bytes()),
+    };
+    if rename {
+        V2Message::RenameResponse {
+            related_id,
+            status,
+            error,
+        }
+    } else {
+        V2Message::CreateDirectoryResponse {
+            related_id,
+            status,
+            error,
+        }
+    }
+}
+
+fn publish_changed_response(related_id: u64, current: Option<(u64, i64, u64, u64)>) -> V2Message {
+    let (current_present, size, mtime_ns, device, file) = current
+        .map_or((false, 0, 0, 0, 0), |(size, mtime_ns, device, file)| {
+            (true, size, mtime_ns, device, file)
+        });
+    V2Message::PublishResponse {
+        related_id,
+        status: protocol_v2::PublishStatus::Changed,
+        current_present,
+        size,
+        mtime_ns,
+        device,
+        file,
+        error: b"remote file changed underneath the editor".to_vec(),
+    }
+}
+
+fn publish_error_response(related_id: u64, error: &str) -> V2Message {
+    V2Message::PublishResponse {
+        related_id,
+        status: protocol_v2::PublishStatus::Error,
+        current_present: false,
+        size: 0,
+        mtime_ns: 0,
+        device: 0,
+        file: 0,
+        error: error.as_bytes().to_vec(),
+    }
+}
+
+/// A server instance executing Source, Sink, or long-lived Session roles over
+/// framed streams.
 #[derive(Debug)]
 pub struct Server {
     root: PathBuf,
@@ -330,7 +1030,7 @@ impl Server {
             journal: None,
             compression: CompressionMode::None,
             compression_level: 3,
-            capabilities: CAP_ZSTD,
+            capabilities: CAP_ZSTD | CAP_VERSION_NEGOTIATION,
         }
     }
 
@@ -355,7 +1055,7 @@ impl Server {
     ///
     /// # Errors
     /// Returns [`ServerError`] on protocol, I/O, or state errors.
-    pub fn run<R: Read, W: Write>(
+    pub fn run<R: Read + Send + 'static, W: Write>(
         &mut self,
         mut reader: R,
         mut writer: W,
@@ -382,12 +1082,27 @@ impl Server {
             "received handshake: frame_id={}, role={client_role:?}, capabilities=0x{client_capabilities:x}",
             frame.message_id
         ));
+        let advertised_capabilities = if client_role == Role::Session {
+            self.capabilities | CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION
+        } else {
+            self.capabilities
+        };
         self.compression =
-            negotiate_compression(compression, self.capabilities, client_capabilities);
+            negotiate_compression(compression, advertised_capabilities, client_capabilities);
         self.compression_level = compression_level;
 
-        // Establish the durable resume journal for this session's job ID.
-        self.journal = Some(crate::journal::ResumeJournal::new(&job_id)?);
+        let selected_version =
+            negotiate_protocol_version(advertised_capabilities, client_capabilities);
+        if client_role == Role::Session && selected_version != 2 {
+            return Err(ServerError::UnexpectedMessage(
+                "session role requires negotiated protocol v2".to_owned(),
+            ));
+        }
+
+        // Browse sessions do not own sync state or a resume journal.
+        if client_role != Role::Session {
+            self.journal = Some(crate::journal::ResumeJournal::new(&job_id)?);
+        }
 
         // A data-only session (multi-stream) skips the destination scan and
         // only writes segment traffic; the control session owns metadata and
@@ -398,12 +1113,13 @@ impl Server {
         let server_role = match client_role {
             Role::Source => Role::Sink,
             Role::Sink => Role::Source,
+            Role::Session => Role::Session,
         };
 
         // Send Server Handshake and Ack.
         let server_handshake = Message::Handshake {
             role: server_role,
-            capabilities: self.capabilities,
+            capabilities: advertised_capabilities,
             max_payload: MAX_COMPLETE_PAYLOAD as u32,
             max_segment: MAX_DATA_SEGMENT as u32,
             window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
@@ -423,6 +1139,10 @@ impl Server {
         let bytes = encode_frame(msg_id, &ack)?;
         writer.write_all(&bytes)?;
         writer.flush()?;
+
+        if client_role == Role::Session {
+            return self.run_browse_session(reader, &mut writer);
+        }
 
         // 2. Receive SessionConfig from client.
         let frame = self.decoder.read(&mut reader)?;
@@ -479,7 +1199,790 @@ impl Server {
                 }
             }
             Role::Source => self.run_source(&mut reader, &mut writer),
+            Role::Session => unreachable!("browse sessions return before sync dispatch"),
         }
+    }
+
+    fn run_browse_session<R: Read + Send + 'static, W: Write>(
+        &mut self,
+        mut reader: R,
+        writer: &mut W,
+    ) -> Result<(), ServerError> {
+        let (frames, incoming) = mpsc::channel();
+        thread::spawn(move || loop {
+            let frame = protocol_v2::read_frame(&mut reader);
+            let done = matches!(frame, Ok(None) | Err(_));
+            if frames.send(frame).is_err() || done {
+                break;
+            }
+        });
+        let mut seen_ids = HashSet::new();
+        let mut active_requests = HashSet::new();
+        let mut pending = VecDeque::new();
+        loop {
+            let frame = if let Some(frame) = pending.pop_front() {
+                frame
+            } else {
+                match incoming.recv() {
+                    Ok(Ok(Some(frame))) => frame,
+                    Ok(Ok(None)) => return Ok(()),
+                    Ok(Err(error)) => return Err(ServerError::Browse(error)),
+                    Err(_) => return Ok(()),
+                }
+            };
+            if !seen_ids.insert(frame.message_id) {
+                return Err(ServerError::UnexpectedMessage(format!(
+                    "duplicate v2 session message ID {}",
+                    frame.message_id
+                )));
+            }
+            let response: Option<V2Message> = match frame.message {
+                V2Message::Keepalive { nonce } => Some(V2Message::KeepaliveAck { nonce }),
+                V2Message::CancelRequest { related_id } => {
+                    let message = if active_requests.remove(&related_id) {
+                        b"request cancelled".to_vec()
+                    } else {
+                        b"request already complete".to_vec()
+                    };
+                    Some(V2Message::BrowseError {
+                        related_id,
+                        code: 1,
+                        message,
+                    })
+                }
+                V2Message::ListRequest {
+                    path,
+                    page_token,
+                    page_size,
+                } => match self.browse_list_page(&path, page_token, page_size, frame.message_id) {
+                    Ok(page) => Some(page),
+                    Err(error)
+                        if matches!(
+                            &error,
+                            ServerError::InvalidPath(_) | ServerError::SymlinkEscape(_)
+                        ) =>
+                    {
+                        Some(V2Message::BrowseError {
+                            related_id: frame.message_id,
+                            code: 2,
+                            message: error.to_string().into_bytes(),
+                        })
+                    }
+                    Err(error) => Some(V2Message::BrowseError {
+                        related_id: frame.message_id,
+                        code: 3,
+                        message: error.to_string().into_bytes(),
+                    }),
+                },
+                V2Message::StatRequest {
+                    path,
+                    include_digest,
+                } => match self.browse_stat_response(&path, include_digest, frame.message_id) {
+                    Ok(response) => Some(response),
+                    Err(error)
+                        if matches!(
+                            &error,
+                            ServerError::InvalidPath(_) | ServerError::SymlinkEscape(_)
+                        ) =>
+                    {
+                        Some(V2Message::BrowseError {
+                            related_id: frame.message_id,
+                            code: 2,
+                            message: error.to_string().into_bytes(),
+                        })
+                    }
+                    Err(error) => Some(V2Message::StatResponse {
+                        related_id: frame.message_id,
+                        status: protocol_v2::StatStatus::Error,
+                        entry: None,
+                        digest: None,
+                        error: error.to_string().into_bytes(),
+                    }),
+                },
+                V2Message::RenameRequest {
+                    source,
+                    destination,
+                } => Some(self.browse_rename_response(&source, &destination, frame.message_id)),
+                V2Message::CreateDirectoryRequest { path } => {
+                    Some(self.browse_create_directory_response(&path, frame.message_id))
+                }
+                V2Message::DeleteRequest { path } => {
+                    active_requests.insert(frame.message_id);
+                    Some(self.browse_delete(
+                        &path,
+                        frame.message_id,
+                        &incoming,
+                        &mut pending,
+                        writer,
+                    )?)
+                }
+                V2Message::FetchRequest { path } => {
+                    match self.browse_fetch(&path, frame.message_id, writer) {
+                        Ok(()) => None,
+                        Err(error) => Some(V2Message::BrowseError {
+                            related_id: frame.message_id,
+                            code: if matches!(
+                                &error,
+                                ServerError::InvalidPath(_) | ServerError::SymlinkEscape(_)
+                            ) {
+                                2
+                            } else {
+                                4
+                            },
+                            message: error.to_string().into_bytes(),
+                        }),
+                    }
+                }
+                V2Message::PublishRequest {
+                    path,
+                    size,
+                    mtime_ns,
+                    device,
+                    file,
+                    digest,
+                } => match self.browse_publish(
+                    &path,
+                    frame.message_id,
+                    size,
+                    mtime_ns,
+                    device,
+                    file,
+                    digest,
+                    &incoming,
+                    &mut pending,
+                    writer,
+                ) {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        Some(publish_error_response(frame.message_id, &error.to_string()))
+                    }
+                },
+                V2Message::ListPage { .. }
+                | V2Message::StatResponse { .. }
+                | V2Message::RenameResponse { .. }
+                | V2Message::CreateDirectoryResponse { .. }
+                | V2Message::DeleteProgress { .. }
+                | V2Message::DeleteResponse { .. }
+                | V2Message::FetchStart { .. }
+                | V2Message::FetchChunk { .. }
+                | V2Message::PublishReady { .. }
+                | V2Message::PublishChunk { .. }
+                | V2Message::PublishResponse { .. }
+                | V2Message::KeepaliveAck { .. }
+                | V2Message::BrowseError { .. } => {
+                    return Err(ServerError::UnexpectedMessage(
+                        "v2 session received a response message".to_owned(),
+                    ));
+                }
+            };
+            let Some(response) = response else {
+                continue;
+            };
+            if let V2Message::ListPage {
+                related_id,
+                final_page,
+                ..
+            } = &response
+            {
+                if *final_page {
+                    active_requests.remove(related_id);
+                } else {
+                    active_requests.insert(*related_id);
+                }
+            }
+            if let V2Message::DeleteResponse { related_id, .. } = &response {
+                active_requests.remove(related_id);
+            }
+            let bytes = protocol_v2::encode_frame(self.next_id(), &response)?;
+            writer.write_all(&bytes)?;
+            writer.flush()?;
+        }
+    }
+
+    fn browse_fetch(
+        &mut self,
+        path: &[u8],
+        related_id: u64,
+        writer: &mut impl Write,
+    ) -> Result<(), ServerError> {
+        let relative = WirePath::from_wire(path.to_vec())
+            .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
+        let native = validate_destination_path(&self.root, relative.clone())?;
+        let metadata = fs::symlink_metadata(&native)?;
+        if !metadata.file_type().is_file() {
+            return Err(ServerError::UnexpectedMessage(
+                "fetch source is not a regular file".to_owned(),
+            ));
+        }
+        let mtime = metadata.modified().map_err(ServerError::Io)?;
+        let fingerprint = fingerprint_from_metadata(&metadata, ScanEntryKind::File, mtime)
+            .map_err(ServerError::Io)?;
+        let entry = FileEntry {
+            path: relative,
+            kind: ScanEntryKind::File,
+            size: metadata.len(),
+            mtime,
+            mode: permission_mode(&metadata),
+            fingerprint,
+        };
+        let stable = SourceReader::new(&self.root).read(&entry)?;
+        let start = V2Message::FetchStart {
+            related_id,
+            size: stable.entry.size,
+            mtime_ns: system_time_to_nanos(stable.entry.mtime),
+            device: stable.entry.fingerprint.identity.device,
+            file: stable.entry.fingerprint.identity.file,
+            digest: *stable.blake3.as_bytes(),
+        };
+        writer.write_all(&protocol_v2::encode_frame(self.next_id(), &start)?)?;
+        for (offset, data) in stable.bytes.chunks(1024 * 1024).enumerate() {
+            let chunk = V2Message::FetchChunk {
+                related_id,
+                offset: (offset * 1024 * 1024) as u64,
+                data: data.to_vec(),
+            };
+            writer.write_all(&protocol_v2::encode_frame(self.next_id(), &chunk)?)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn browse_publish(
+        &mut self,
+        path: &[u8],
+        related_id: u64,
+        size: u64,
+        mtime_ns: i64,
+        device: u64,
+        file: u64,
+        digest: [u8; 32],
+        incoming: &mpsc::Receiver<Result<Option<V2Frame>, V2CodecError>>,
+        pending: &mut VecDeque<V2Frame>,
+        writer: &mut impl Write,
+    ) -> Result<V2Message, ServerError> {
+        let relative = WirePath::from_wire(path.to_vec())
+            .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
+        let native = validate_destination_path(&self.root, relative.clone())?;
+        let metadata = match fs::symlink_metadata(&native) {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => {
+                return Ok(publish_error_response(
+                    related_id,
+                    "remote target is not a regular file",
+                ))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(publish_changed_response(related_id, None));
+            }
+            Err(error) => return Ok(publish_error_response(related_id, &error.to_string())),
+        };
+        let current_mtime = metadata.modified().map_err(ServerError::Io)?;
+        let current_fp = fingerprint_from_metadata(&metadata, ScanEntryKind::File, current_mtime)
+            .map_err(ServerError::Io)?;
+        let current = (
+            metadata.len(),
+            system_time_to_nanos(current_mtime),
+            current_fp.identity.device,
+            current_fp.identity.file,
+        );
+        if current != (size, mtime_ns, device, file) {
+            return Ok(publish_changed_response(related_id, Some(current)));
+        }
+        let ready = V2Message::PublishReady { related_id };
+        writer.write_all(&protocol_v2::encode_frame(self.next_id(), &ready)?)?;
+        writer.flush()?;
+
+        let mut bytes = Vec::new();
+        let mut offset = 0_u64;
+        while offset < size {
+            let frame = if let Some(frame) = pending.pop_front() {
+                frame
+            } else {
+                match incoming.recv() {
+                    Ok(Ok(Some(frame))) => frame,
+                    Ok(Ok(None)) => return Err(ServerError::PeerDisconnected),
+                    Ok(Err(error)) => return Err(ServerError::Browse(error)),
+                    Err(_) => return Err(ServerError::PeerDisconnected),
+                }
+            };
+            match frame.message {
+                V2Message::PublishChunk {
+                    related_id: id,
+                    offset: chunk_offset,
+                    data,
+                } if id == related_id && chunk_offset == offset => {
+                    offset = offset.saturating_add(data.len() as u64);
+                    if offset > size {
+                        return Ok(publish_error_response(
+                            related_id,
+                            "publish exceeded advertised size",
+                        ));
+                    }
+                    bytes.extend_from_slice(&data);
+                }
+                other => {
+                    return Ok(publish_error_response(
+                        related_id,
+                        &format!("unexpected publish frame: {other:?}"),
+                    ));
+                }
+            }
+        }
+        if blake3::hash(&bytes).as_bytes() != &digest {
+            return Ok(publish_error_response(
+                related_id,
+                "publish digest does not match",
+            ));
+        }
+        let latest = fs::symlink_metadata(&native).ok().and_then(|metadata| {
+            let mtime = metadata.modified().ok()?;
+            let fp = fingerprint_from_metadata(&metadata, ScanEntryKind::File, mtime).ok()?;
+            Some((
+                metadata.len(),
+                system_time_to_nanos(mtime),
+                fp.identity.device,
+                fp.identity.file,
+            ))
+        });
+        if latest != Some(current) {
+            return Ok(publish_changed_response(related_id, latest));
+        }
+        let entry = FileEntry {
+            path: relative,
+            kind: ScanEntryKind::File,
+            size,
+            mtime: nanos_to_system_time(mtime_ns),
+            mode: permission_mode(&metadata),
+            fingerprint: SourceFingerprint {
+                identity: FileIdentity { device, file },
+                kind: ScanEntryKind::File,
+                size,
+                mtime: nanos_to_system_time(mtime_ns),
+                ctime: None,
+            },
+        };
+        match Sink::new(&self.root)
+            .map_err(ServerError::Sink)
+            .and_then(|sink| {
+                sink.write_file_with_retry(&entry, &blake3::Hash::from_bytes(digest), |_| {
+                    Ok(bytes.clone())
+                })
+                .map_err(ServerError::Sink)
+            }) {
+            Ok(()) => Ok(V2Message::PublishResponse {
+                related_id,
+                status: protocol_v2::PublishStatus::Ok,
+                current_present: true,
+                size,
+                mtime_ns,
+                device,
+                file,
+                error: Vec::new(),
+            }),
+            Err(error) => Ok(publish_error_response(related_id, &error.to_string())),
+        }
+    }
+
+    fn browse_delete(
+        &mut self,
+        path: &[u8],
+        related_id: u64,
+        incoming: &mpsc::Receiver<Result<Option<V2Frame>, V2CodecError>>,
+        pending: &mut VecDeque<V2Frame>,
+        writer: &mut impl Write,
+    ) -> Result<V2Message, ServerError> {
+        let relative = match WirePath::from_wire(path.to_vec()) {
+            Ok(relative) => relative,
+            Err(_error) => {
+                return Ok(V2Message::DeleteResponse {
+                    related_id,
+                    status: protocol_v2::DeleteStatus::Partial,
+                    removed_count: 0,
+                    failures: vec![protocol_v2::DeleteFailure {
+                        path: path.to_vec(),
+                        errno: libc::EINVAL,
+                    }],
+                    irreversible: true,
+                });
+            }
+        };
+        if relative.is_empty() {
+            return Ok(V2Message::DeleteResponse {
+                related_id,
+                status: protocol_v2::DeleteStatus::Partial,
+                removed_count: 0,
+                failures: vec![protocol_v2::DeleteFailure {
+                    path: Vec::new(),
+                    errno: libc::EINVAL,
+                }],
+                irreversible: true,
+            });
+        }
+        let native = match validate_destination_path(&self.root, relative.clone()) {
+            Ok(native) => native,
+            Err(_) => {
+                return Ok(V2Message::DeleteResponse {
+                    related_id,
+                    status: protocol_v2::DeleteStatus::Partial,
+                    removed_count: 0,
+                    failures: vec![protocol_v2::DeleteFailure {
+                        path: path.to_vec(),
+                        errno: libc::EINVAL,
+                    }],
+                    irreversible: true,
+                });
+            }
+        };
+        let mut stack = vec![(native, relative, false)];
+        let mut failures = Vec::new();
+        let mut removed_count = 0_u64;
+        let mut cancelled = false;
+
+        while let Some((native, relative, after_children)) = stack.pop() {
+            while let Ok(message) = incoming.try_recv() {
+                match message {
+                    Ok(Some(frame)) if matches!(frame.message, V2Message::CancelRequest { related_id: id } if id == related_id) =>
+                    {
+                        let acknowledgement = V2Message::BrowseError {
+                            related_id,
+                            code: 1,
+                            message: b"request cancelled".to_vec(),
+                        };
+                        writer.write_all(&protocol_v2::encode_frame(
+                            self.next_id(),
+                            &acknowledgement,
+                        )?)?;
+                        writer.flush()?;
+                        cancelled = true;
+                    }
+                    Ok(Some(frame)) => pending.push_back(frame),
+                    Ok(None) | Err(_) => break,
+                }
+                if cancelled {
+                    break;
+                }
+            }
+            if cancelled {
+                break;
+            }
+
+            if !after_children {
+                let metadata = match fs::symlink_metadata(&native) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        failures.push(protocol_v2::DeleteFailure {
+                            path: relative.as_bytes().to_vec(),
+                            errno: error.raw_os_error().unwrap_or(0),
+                        });
+                        self.write_delete_progress(
+                            writer,
+                            related_id,
+                            &relative,
+                            false,
+                            &error.to_string(),
+                        )?;
+                        continue;
+                    }
+                };
+                if metadata.file_type().is_dir() {
+                    let mut children = Vec::new();
+                    match fs::read_dir(&native) {
+                        Ok(entries) => {
+                            for entry in entries {
+                                match entry {
+                                    Ok(entry) => {
+                                        let child = WirePath::from_wire(
+                                            [
+                                                relative.as_bytes(),
+                                                b"/",
+                                                &native_path_bytes(&entry.file_name()),
+                                            ]
+                                            .concat(),
+                                        );
+                                        match child {
+                                            Ok(child) => children.push((entry.path(), child)),
+                                            Err(_error) => {
+                                                failures.push(protocol_v2::DeleteFailure {
+                                                    path: relative.as_bytes().to_vec(),
+                                                    errno: libc::EINVAL,
+                                                })
+                                            }
+                                        }
+                                    }
+                                    Err(error) => failures.push(protocol_v2::DeleteFailure {
+                                        path: relative.as_bytes().to_vec(),
+                                        errno: error.raw_os_error().unwrap_or(0),
+                                    }),
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            failures.push(protocol_v2::DeleteFailure {
+                                path: relative.as_bytes().to_vec(),
+                                errno: error.raw_os_error().unwrap_or(0),
+                            });
+                            self.write_delete_progress(
+                                writer,
+                                related_id,
+                                &relative,
+                                false,
+                                &error.to_string(),
+                            )?;
+                            continue;
+                        }
+                    }
+                    stack.push((native, relative, true));
+                    for child in children.into_iter().rev() {
+                        stack.push((child.0, child.1, false));
+                    }
+                    continue;
+                }
+            }
+
+            let result = if after_children {
+                fs::remove_dir(&native)
+            } else {
+                fs::remove_file(&native)
+            };
+            match result {
+                Ok(()) => {
+                    removed_count = removed_count.saturating_add(1);
+                    self.write_delete_progress(writer, related_id, &relative, true, "")?;
+                }
+                Err(error) => {
+                    failures.push(protocol_v2::DeleteFailure {
+                        path: relative.as_bytes().to_vec(),
+                        errno: error.raw_os_error().unwrap_or(0),
+                    });
+                    self.write_delete_progress(
+                        writer,
+                        related_id,
+                        &relative,
+                        false,
+                        &error.to_string(),
+                    )?;
+                }
+            }
+        }
+
+        let status = if cancelled {
+            protocol_v2::DeleteStatus::Cancelled
+        } else if failures.is_empty() {
+            protocol_v2::DeleteStatus::Complete
+        } else {
+            protocol_v2::DeleteStatus::Partial
+        };
+        Ok(V2Message::DeleteResponse {
+            related_id,
+            status,
+            removed_count,
+            failures,
+            irreversible: true,
+        })
+    }
+
+    fn write_delete_progress(
+        &mut self,
+        writer: &mut impl Write,
+        related_id: u64,
+        path: &WirePath,
+        removed: bool,
+        error: &str,
+    ) -> Result<(), ServerError> {
+        let progress = V2Message::DeleteProgress {
+            related_id,
+            path: path.as_bytes().to_vec(),
+            removed,
+            error: error.as_bytes().to_vec(),
+        };
+        writer.write_all(&protocol_v2::encode_frame(self.next_id(), &progress)?)?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn browse_list_page(
+        &self,
+        path: &[u8],
+        page_token: u64,
+        page_size: u32,
+        related_id: u64,
+    ) -> Result<V2Message, ServerError> {
+        let directory = browse_directory_path(&self.root, path)?;
+        let start = usize::try_from(page_token)
+            .map_err(|_| ServerError::InvalidPath("page token is too large".to_owned()))?;
+        let mut entries = Vec::with_capacity(page_size as usize);
+        let mut index = 0usize;
+        let mut directory_entries = fs::read_dir(directory)?.peekable();
+
+        while index < start {
+            if directory_entries.next().is_none() {
+                return Ok(V2Message::ListPage {
+                    related_id,
+                    page_token: 0,
+                    final_page: true,
+                    entries,
+                });
+            }
+            index += 1;
+        }
+
+        while entries.len() < page_size as usize {
+            let Some(item) = directory_entries.next() else {
+                return Ok(V2Message::ListPage {
+                    related_id,
+                    page_token: 0,
+                    final_page: true,
+                    entries,
+                });
+            };
+            index += 1;
+            let item = match item {
+                Ok(item) => item,
+                Err(_) => continue,
+            };
+            let metadata = match fs::symlink_metadata(item.path()) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let file_type = metadata.file_type();
+            let (kind, symlink_target) = if file_type.is_file() {
+                (1, Vec::new())
+            } else if file_type.is_dir() {
+                (2, Vec::new())
+            } else if file_type.is_symlink() {
+                let target = fs::read_link(item.path())
+                    .map(|target| native_path_bytes(target.as_os_str()))
+                    .unwrap_or_default();
+                (3, target)
+            } else {
+                (4, Vec::new())
+            };
+            entries.push(BrowseEntry {
+                name: native_path_bytes(&item.file_name()),
+                kind,
+                size: metadata.len(),
+                mtime_ns: metadata
+                    .modified()
+                    .map(system_time_to_nanos)
+                    .unwrap_or_default(),
+                mode: permission_mode(&metadata),
+                symlink_target,
+            });
+        }
+
+        let final_page = directory_entries.peek().is_none();
+        Ok(V2Message::ListPage {
+            related_id,
+            page_token: if final_page { 0 } else { index as u64 },
+            final_page,
+            entries,
+        })
+    }
+
+    fn browse_stat_response(
+        &self,
+        path: &[u8],
+        include_digest: bool,
+        related_id: u64,
+    ) -> Result<V2Message, ServerError> {
+        let native_path = browse_stat_path(&self.root, path)?;
+        let metadata = match fs::symlink_metadata(&native_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(V2Message::StatResponse {
+                    related_id,
+                    status: protocol_v2::StatStatus::Missing,
+                    entry: None,
+                    digest: None,
+                    error: Vec::new(),
+                });
+            }
+            Err(error) => return Err(ServerError::Io(error)),
+        };
+        let file_type = metadata.file_type();
+        let (kind, symlink_target) = if file_type.is_file() {
+            (1, Vec::new())
+        } else if file_type.is_dir() {
+            (2, Vec::new())
+        } else if file_type.is_symlink() {
+            let target = fs::read_link(&native_path)
+                .map(|target| native_path_bytes(target.as_os_str()))
+                .unwrap_or_default();
+            (3, target)
+        } else {
+            (4, Vec::new())
+        };
+        let name = path
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .unwrap_or_default()
+            .to_vec();
+        let entry = BrowseEntry {
+            name,
+            kind,
+            size: metadata.len(),
+            mtime_ns: metadata
+                .modified()
+                .map(system_time_to_nanos)
+                .unwrap_or_default(),
+            mode: permission_mode(&metadata),
+            symlink_target,
+        };
+        let digest = if include_digest && kind == 1 {
+            let hash = hash_file_streaming(&native_path)?;
+            Some(*hash.as_bytes())
+        } else {
+            None
+        };
+        Ok(V2Message::StatResponse {
+            related_id,
+            status: protocol_v2::StatStatus::Ok,
+            entry: Some(entry),
+            digest,
+            error: Vec::new(),
+        })
+    }
+
+    fn browse_rename_response(
+        &self,
+        source: &[u8],
+        destination: &[u8],
+        related_id: u64,
+    ) -> V2Message {
+        let result = (|| -> Result<(), (MutationStatus, String)> {
+            let source = validate_destination_path(
+                &self.root,
+                WirePath::from_wire(source.to_vec())
+                    .map_err(|error| (MutationStatus::Error, error.to_string()))?,
+            )
+            .map_err(|error| mutation_failure(&error))?;
+            let destination = validate_destination_path(
+                &self.root,
+                WirePath::from_wire(destination.to_vec())
+                    .map_err(|error| (MutationStatus::Error, error.to_string()))?,
+            )
+            .map_err(|error| mutation_failure(&error))?;
+            if fs::symlink_metadata(&destination).is_ok() {
+                return Err((
+                    MutationStatus::AlreadyExists,
+                    "destination already exists".to_owned(),
+                ));
+            }
+            fs::rename(source, destination)
+                .map_err(|error| (rename_status(&error), error.to_string()))
+        })();
+        mutation_response(related_id, result, true)
+    }
+
+    fn browse_create_directory_response(&self, path: &[u8], related_id: u64) -> V2Message {
+        let result = (|| -> Result<(), (MutationStatus, String)> {
+            let path = WirePath::from_wire(path.to_vec())
+                .map_err(|error| (MutationStatus::Error, error.to_string()))?;
+            let path = validate_destination_path(&self.root, path)
+                .map_err(|error| mutation_failure(&error))?;
+            fs::create_dir(path).map_err(|error| (mkdir_status(&error), error.to_string()))
+        })();
+        mutation_response(related_id, result, false)
     }
 
     /// A data-only receiver session (multi-stream Story 4.2): skips the
@@ -527,10 +2030,11 @@ impl Server {
                 } => {
                     if let Some(record) = active_files.remove(&file_id) {
                         let file_entry = file_entry_from_entry_record(&record)?;
-                        validate_destination_path(&self.root, &file_entry.path)?;
-                        if !self.seen_destinations.insert(file_entry.path.clone()) {
-                            return Err(ServerError::DuplicatePath(file_entry.path.to_string()));
-                        }
+                        validate_unique_destination_path(
+                            &self.root,
+                            file_entry.path.clone(),
+                            &mut self.seen_destinations,
+                        )?;
                         let hash = blake3::hash(&data);
                         sink.write_file_with_retry(
                             &file_entry,
@@ -580,10 +2084,11 @@ impl Server {
                 } => {
                     let rel_path = WirePath::from_wire(path)
                         .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
-                    validate_destination_path(&self.root, &rel_path)?;
-                    if !self.seen_destinations.insert(rel_path.clone()) {
-                        return Err(ServerError::DuplicatePath(rel_path.to_string()));
-                    }
+                    validate_unique_destination_path(
+                        &self.root,
+                        rel_path.clone(),
+                        &mut self.seen_destinations,
+                    )?;
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
                     let file = u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
                     let mtime = nanos_to_system_time(mtime_ns);
@@ -912,10 +2417,11 @@ impl Server {
                     // Check if regular batch file or large file range.
                     if let Some(record) = active_files.remove(&file_id) {
                         let file_entry = file_entry_from_entry_record(&record)?;
-                        validate_destination_path(&self.root, &file_entry.path)?;
-                        if !self.seen_destinations.insert(file_entry.path.clone()) {
-                            return Err(ServerError::DuplicatePath(file_entry.path.to_string()));
-                        }
+                        validate_unique_destination_path(
+                            &self.root,
+                            file_entry.path.clone(),
+                            &mut self.seen_destinations,
+                        )?;
                         let hash = blake3::hash(&data);
                         sink.write_file_with_retry(
                             &file_entry,
@@ -999,10 +2505,11 @@ impl Server {
                 } => {
                     let rel_path = WirePath::from_wire(path)
                         .map_err(|error| ServerError::InvalidPath(error.to_string()))?;
-                    validate_destination_path(&self.root, &rel_path)?;
-                    if !self.seen_destinations.insert(rel_path.clone()) {
-                        return Err(ServerError::DuplicatePath(rel_path.to_string()));
-                    }
+                    validate_unique_destination_path(
+                        &self.root,
+                        rel_path.clone(),
+                        &mut self.seen_destinations,
+                    )?;
                     let device = u64::from_le_bytes(fingerprint[0..8].try_into().unwrap_or([0; 8]));
                     let file = u64::from_le_bytes(fingerprint[8..16].try_into().unwrap_or([0; 8]));
                     let mtime = nanos_to_system_time(mtime_ns);
@@ -1489,12 +2996,10 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut server = Server::new(root);
-    let stdin_lock = stdin.lock();
-    let stdout_lock = stdout.lock();
-    let mut reader = BufReader::new(stdin_lock);
-    let mut writer = BufWriter::new(stdout_lock);
+    let reader = BufReader::new(stdin);
+    let mut writer = BufWriter::new(stdout);
     server_log("waiting for client handshake");
-    let result = server.run(&mut reader, &mut writer);
+    let result = server.run(reader, &mut writer);
     match &result {
         Ok(()) => server_log("session finished successfully"),
         Err(error) => server_log(format_args!("session failed: {error}")),
@@ -1571,9 +3076,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     });
 
     // 1. Send Handshake (Client is Source).
+    let local_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION;
     let handshake = Message::Handshake {
         role: Role::Source,
-        capabilities: CAP_ZSTD,
+        capabilities: local_capabilities,
         max_payload: MAX_COMPLETE_PAYLOAD as u32,
         max_segment: MAX_DATA_SEGMENT as u32,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
@@ -1629,6 +3135,13 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         } else {
             "both peers advertise zstd"
         },
+    });
+    let selected_version = negotiate_protocol_version(local_capabilities, remote_capabilities);
+    emit(LocalEvent::ProtocolNegotiated {
+        selected_version,
+        remote_capabilities,
+        common_capabilities: common_capabilities(local_capabilities, remote_capabilities),
+        browse_available: selected_version >= 2,
     });
 
     // 2. Send SessionConfig.
@@ -2477,9 +3990,10 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     // 1. Send Handshake (Client is Sink).
     let job_id = session_job_id(src_path, dest_path.to_string_lossy().as_ref());
     let resume_journal = crate::journal::ResumeJournal::new(&job_id)?;
+    let local_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION;
     let handshake = Message::Handshake {
         role: Role::Sink,
-        capabilities: CAP_ZSTD,
+        capabilities: local_capabilities,
         max_payload: MAX_COMPLETE_PAYLOAD as u32,
         max_segment: MAX_DATA_SEGMENT as u32,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
@@ -2534,6 +4048,13 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         } else {
             "both peers advertise zstd"
         },
+    });
+    let selected_version = negotiate_protocol_version(local_capabilities, remote_capabilities);
+    emit(LocalEvent::ProtocolNegotiated {
+        selected_version,
+        remote_capabilities,
+        common_capabilities: common_capabilities(local_capabilities, remote_capabilities),
+        browse_available: selected_version >= 2,
     });
 
     // 2. Send SessionConfig.
@@ -4335,7 +5856,7 @@ fn quote_remote_path(path: &str) -> String {
 
 fn xsync_remote_command(remote_path: &str) -> String {
     format!(
-        "{} {} {}",
+        "PATH=\"$HOME/.local/bin:$PATH\" {} {} {}",
         quote_remote_arg("xs"),
         quote_remote_arg("--server"),
         quote_remote_path(remote_path)
@@ -4507,6 +6028,748 @@ mod tests {
     }
 
     #[test]
+    fn probe_reports_ready_and_older_peers_without_reconnecting() {
+        fn peer_bytes(capabilities: u32) -> Vec<u8> {
+            let handshake = Message::Handshake {
+                role: Role::Session,
+                capabilities,
+                max_payload: MAX_COMPLETE_PAYLOAD as u32,
+                max_segment: MAX_DATA_SEGMENT as u32,
+                window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+                job_id: [14; 16],
+                compression: CompressionMode::None,
+                compression_level: 3,
+            };
+            let mut bytes = encode_frame(100, &handshake).unwrap();
+            bytes.extend_from_slice(
+                &encode_frame(
+                    101,
+                    &Message::Ack {
+                        acknowledged_id: 1,
+                        acknowledged_type: 1,
+                    },
+                )
+                .unwrap(),
+            );
+            bytes
+        }
+
+        let ready = probe_session(
+            Cursor::new(peer_bytes(CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION)),
+            Vec::new(),
+            [15; 16],
+        )
+        .unwrap();
+        assert_eq!(ready.probe.status, ProbeStatus::Ready);
+        assert_eq!(ready.probe.selected_version, 2);
+        assert_eq!(ready.probe.status.action(), "open the browse session");
+        assert!(ready.into_browse_session().is_ok());
+
+        let older = probe_session(
+            Cursor::new(peer_bytes(CAP_VERSION_NEGOTIATION)),
+            Vec::new(),
+            [16; 16],
+        )
+        .unwrap();
+        assert_eq!(
+            older.probe.status,
+            ProbeStatus::OlderPeer {
+                selected_version: 1
+            }
+        );
+        assert_eq!(
+            older.probe.status.action(),
+            "upgrade the remote xsync binary before browsing"
+        );
+        assert!(older.into_browse_session().is_err());
+    }
+
+    #[test]
+    fn browse_session_handles_multiple_requests_until_eof() {
+        let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+        let handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [9; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let mut input = encode_frame(1, &handshake).unwrap();
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(2, &V2Message::Keepalive { nonce: 7 }).unwrap(),
+        );
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(
+                3,
+                &V2Message::ListRequest {
+                    path: Vec::new(),
+                    page_token: 0,
+                    page_size: 10,
+                },
+            )
+            .unwrap(),
+        );
+
+        let mut output = Vec::new();
+        Server::new(tempdir().unwrap().path())
+            .run(Cursor::new(input), &mut output)
+            .unwrap();
+
+        let mut v1_decoder = FrameDecoder::new();
+        let mut output_cursor = Cursor::new(output);
+        let server_handshake = v1_decoder.read(&mut output_cursor).unwrap();
+        assert!(matches!(
+            server_handshake.message,
+            Message::Handshake {
+                role: Role::Session,
+                capabilities,
+                ..
+            } if capabilities & CAP_BROWSE_V2 != 0
+        ));
+        assert!(matches!(
+            v1_decoder.read(&mut output_cursor).unwrap().message,
+            Message::Ack { .. }
+        ));
+        let position = output_cursor.position() as usize;
+        let bytes = output_cursor.into_inner();
+        let mut v2_cursor = Cursor::new(bytes);
+        v2_cursor.set_position(position as u64);
+        let first = protocol_v2::read_frame(&mut v2_cursor).unwrap().unwrap();
+        assert_eq!(first.message_id, 1002);
+        assert_eq!(first.message, V2Message::KeepaliveAck { nonce: 7 });
+        let second = protocol_v2::read_frame(&mut v2_cursor).unwrap().unwrap();
+        assert_eq!(second.message_id, 1003);
+        assert_eq!(
+            second.message,
+            V2Message::ListPage {
+                related_id: 3,
+                page_token: 0,
+                final_page: true,
+                entries: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn list_pages_are_bounded_and_report_symlinks_without_following() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("one"), b"one").unwrap();
+        fs::write(temp.path().join("two"), b"two").unwrap();
+        fs::write(temp.path().join("three"), b"three").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink("one", temp.path().join("link")).unwrap();
+        }
+
+        let server = Server::new(temp.path());
+        let first = server.browse_list_page(b"", 0, 2, 41).unwrap();
+        let V2Message::ListPage {
+            page_token,
+            final_page,
+            entries: first_entries,
+            ..
+        } = first
+        else {
+            panic!("expected first list page");
+        };
+        assert_eq!(first_entries.len(), 2);
+        assert!(!final_page);
+        assert!(page_token > 0);
+
+        let second = server.browse_list_page(b"", page_token, 2, 41).unwrap();
+        let V2Message::ListPage {
+            final_page,
+            entries: second_entries,
+            ..
+        } = second
+        else {
+            panic!("expected second list page");
+        };
+        assert!(final_page);
+        assert!(!second_entries.is_empty());
+        #[cfg(unix)]
+        {
+            let link = first_entries
+                .iter()
+                .chain(second_entries.iter())
+                .find(|entry| entry.name == b"link")
+                .unwrap();
+            assert_eq!(link.kind, 3);
+            assert_eq!(link.symlink_target, b"one");
+        }
+        assert!(matches!(
+            server.browse_list_page(b"../", 0, 2, 41),
+            Err(ServerError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    #[ignore = "filesystem benchmark; run explicitly with --ignored --nocapture"]
+    fn list_first_page_100k_entry_benchmark() {
+        let temp = tempdir().unwrap();
+        for index in 0..100_000 {
+            fs::write(temp.path().join(format!("entry-{index:06}")), []).unwrap();
+        }
+        let server = Server::new(temp.path());
+        let started = std::time::Instant::now();
+        let page = server.browse_list_page(b"", 0, 100, 1).unwrap();
+        let elapsed = started.elapsed();
+        let V2Message::ListPage {
+            entries,
+            final_page,
+            ..
+        } = page
+        else {
+            panic!("expected list page");
+        };
+        assert_eq!(entries.len(), 100);
+        assert!(!final_page);
+        eprintln!("list first page: 100/100000 entries in {elapsed:?}");
+    }
+
+    #[test]
+    fn stat_reports_file_directory_symlink_and_missing_without_following() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("file"), b"contents").unwrap();
+        fs::create_dir(temp.path().join("directory")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("file", temp.path().join("link")).unwrap();
+
+        let server = Server::new(temp.path());
+        let file = server.browse_stat_response(b"file", true, 1).unwrap();
+        let V2Message::StatResponse {
+            status,
+            entry,
+            digest,
+            ..
+        } = file
+        else {
+            panic!("expected file stat");
+        };
+        assert_eq!(status, protocol_v2::StatStatus::Ok);
+        assert_eq!(entry.as_ref().unwrap().kind, 1);
+        assert_eq!(digest, Some(*blake3::hash(b"contents").as_bytes()));
+
+        let directory = server.browse_stat_response(b"directory", true, 2).unwrap();
+        let V2Message::StatResponse {
+            status,
+            entry,
+            digest,
+            ..
+        } = directory
+        else {
+            panic!("expected directory stat");
+        };
+        assert_eq!(status, protocol_v2::StatStatus::Ok);
+        assert_eq!(entry.as_ref().unwrap().kind, 2);
+        assert_eq!(digest, None);
+
+        #[cfg(unix)]
+        {
+            let link = server.browse_stat_response(b"link", true, 3).unwrap();
+            let V2Message::StatResponse { entry, digest, .. } = link else {
+                panic!("expected symlink stat");
+            };
+            let entry = entry.unwrap();
+            assert_eq!(entry.kind, 3);
+            assert_eq!(entry.symlink_target, b"file");
+            assert_eq!(digest, None);
+        }
+
+        let missing = server.browse_stat_response(b"missing", true, 4).unwrap();
+        assert!(matches!(
+            missing,
+            V2Message::StatResponse {
+                status: protocol_v2::StatStatus::Missing,
+                entry: None,
+                digest: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            server.browse_stat_response(b"../escape", false, 5),
+            Err(ServerError::InvalidPath(_))
+        ));
+    }
+
+    #[test]
+    fn mutations_are_atomic_scoped_and_actionable() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("old"), b"data").unwrap();
+        fs::write(temp.path().join("existing"), b"keep").unwrap();
+        let server = Server::new(temp.path());
+
+        assert_eq!(
+            server.browse_rename_response(b"old", b"new", 1),
+            V2Message::RenameResponse {
+                related_id: 1,
+                status: MutationStatus::Ok,
+                error: Vec::new(),
+            }
+        );
+        assert!(temp.path().join("new").is_file());
+        assert_eq!(
+            server.browse_rename_response(b"new", b"existing", 2),
+            V2Message::RenameResponse {
+                related_id: 2,
+                status: MutationStatus::AlreadyExists,
+                error: b"destination already exists".to_vec(),
+            }
+        );
+        assert!(matches!(
+            server.browse_create_directory_response(b"parent/child", 3),
+            V2Message::CreateDirectoryResponse {
+                related_id: 3,
+                status: MutationStatus::ParentMissing,
+                error,
+            } if !error.is_empty()
+        ));
+        assert!(matches!(
+            server.browse_create_directory_response(b"../escape", 4),
+            V2Message::CreateDirectoryResponse {
+                status: MutationStatus::Error,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn recursive_delete_reports_each_item_and_is_irreversible() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("tree")).unwrap();
+        fs::create_dir(temp.path().join("tree/nested")).unwrap();
+        fs::write(temp.path().join("tree/file"), b"data").unwrap();
+        fs::write(temp.path().join("tree/nested/other"), b"data").unwrap();
+
+        let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+        let handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [11; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let mut input = encode_frame(1, &handshake).unwrap();
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(
+                2,
+                &V2Message::DeleteRequest {
+                    path: b"tree".to_vec(),
+                },
+            )
+            .unwrap(),
+        );
+        let mut output = Vec::new();
+        Server::new(temp.path())
+            .run(Cursor::new(input), &mut output)
+            .unwrap();
+        assert!(!temp.path().join("tree").exists());
+
+        let mut v1 = FrameDecoder::new();
+        let mut cursor = Cursor::new(output);
+        v1.read(&mut cursor).unwrap();
+        v1.read(&mut cursor).unwrap();
+        let position = cursor.position();
+        let bytes = cursor.into_inner();
+        let mut v2 = Cursor::new(bytes);
+        v2.set_position(position);
+        let mut progress = 0;
+        let mut final_response = None;
+        while let Some(frame) = protocol_v2::read_frame(&mut v2).unwrap() {
+            match frame.message {
+                V2Message::DeleteProgress { .. } => progress += 1,
+                response @ V2Message::DeleteResponse { .. } => final_response = Some(response),
+                other => panic!("unexpected delete response: {other:?}"),
+            }
+        }
+        assert_eq!(progress, 4);
+        assert!(matches!(
+            final_response,
+            Some(V2Message::DeleteResponse {
+                status: protocol_v2::DeleteStatus::Complete,
+                removed_count: 4,
+                irreversible: true,
+                ref failures,
+                ..
+            }) if failures.is_empty()
+        ));
+    }
+
+    #[test]
+    fn fetch_reads_a_stable_file_and_returns_identity_and_digest() {
+        let temp = tempdir().unwrap();
+        let contents = vec![b'x'; 1024 * 1024 + 3];
+        fs::write(temp.path().join("edit.txt"), &contents).unwrap();
+        let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+        let handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [12; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let mut input = encode_frame(1, &handshake).unwrap();
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(
+                2,
+                &V2Message::FetchRequest {
+                    path: b"edit.txt".to_vec(),
+                },
+            )
+            .unwrap(),
+        );
+        let mut output = Vec::new();
+        Server::new(temp.path())
+            .run(Cursor::new(input), &mut output)
+            .unwrap();
+        let mut v1 = FrameDecoder::new();
+        let mut cursor = Cursor::new(output);
+        v1.read(&mut cursor).unwrap();
+        v1.read(&mut cursor).unwrap();
+        let position = cursor.position();
+        let bytes = cursor.into_inner();
+        let mut v2 = Cursor::new(bytes);
+        v2.set_position(position);
+        let start = protocol_v2::read_frame(&mut v2).unwrap().unwrap();
+        let V2Message::FetchStart {
+            size,
+            digest,
+            related_id,
+            ..
+        } = start.message
+        else {
+            panic!("expected fetch start");
+        };
+        assert_eq!(related_id, 2);
+        assert_eq!(size, contents.len() as u64);
+        assert_eq!(digest, *blake3::hash(&contents).as_bytes());
+        let mut fetched = Vec::new();
+        while let Some(frame) = protocol_v2::read_frame(&mut v2).unwrap() {
+            match frame.message {
+                V2Message::FetchChunk { data, .. } => fetched.extend(data),
+                other => panic!("unexpected fetch frame: {other:?}"),
+            }
+        }
+        assert_eq!(fetched, contents);
+    }
+
+    #[test]
+    fn publish_refuses_changed_remote_identity_and_commits_matching_file_atomically() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("edit.txt");
+        fs::write(&path, b"old").unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let mtime = metadata.modified().unwrap();
+        let fingerprint = fingerprint_from_metadata(&metadata, ScanEntryKind::File, mtime).unwrap();
+        let digest = *blake3::hash(b"new").as_bytes();
+        let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+        let handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [13; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let mut input = encode_frame(1, &handshake).unwrap();
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(
+                2,
+                &V2Message::PublishRequest {
+                    path: b"edit.txt".to_vec(),
+                    size: 3,
+                    mtime_ns: system_time_to_nanos(mtime),
+                    device: fingerprint.identity.device,
+                    file: fingerprint.identity.file,
+                    digest,
+                },
+            )
+            .unwrap(),
+        );
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(
+                3,
+                &V2Message::PublishChunk {
+                    related_id: 2,
+                    offset: 0,
+                    data: b"new".to_vec(),
+                },
+            )
+            .unwrap(),
+        );
+        let mut output = Vec::new();
+        Server::new(temp.path())
+            .run(Cursor::new(input), &mut output)
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let mut v1 = FrameDecoder::new();
+        let mut cursor = Cursor::new(output);
+        v1.read(&mut cursor).unwrap();
+        v1.read(&mut cursor).unwrap();
+        let position = cursor.position();
+        let bytes = cursor.into_inner();
+        let mut v2 = Cursor::new(bytes);
+        v2.set_position(position);
+        assert!(matches!(
+            protocol_v2::read_frame(&mut v2).unwrap().unwrap().message,
+            V2Message::PublishReady { related_id: 2 }
+        ));
+        assert!(matches!(
+            protocol_v2::read_frame(&mut v2).unwrap().unwrap().message,
+            V2Message::PublishResponse {
+                status: protocol_v2::PublishStatus::Ok,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn browse_session_rejects_duplicate_ids_and_v1_frames_after_selection() {
+        let handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities: CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [8; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let opening = encode_frame(1, &handshake).unwrap();
+
+        let mut duplicate = opening.clone();
+        let keepalive = protocol_v2::encode_frame(2, &V2Message::Keepalive { nonce: 1 }).unwrap();
+        duplicate.extend_from_slice(&keepalive);
+        duplicate.extend_from_slice(&keepalive);
+        let duplicate_error = Server::new(tempdir().unwrap().path())
+            .run(Cursor::new(duplicate), &mut Vec::new())
+            .unwrap_err();
+        assert!(duplicate_error
+            .to_string()
+            .contains("duplicate v2 session message ID 2"));
+
+        let mut mixed = opening;
+        mixed.extend_from_slice(
+            &encode_frame(
+                2,
+                &Message::Ack {
+                    acknowledged_id: 1,
+                    acknowledged_type: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let mixed_error = Server::new(tempdir().unwrap().path())
+            .run(Cursor::new(mixed), &mut Vec::new())
+            .unwrap_err();
+        assert!(mixed_error
+            .to_string()
+            .contains("malformed v2 envelope: wrong version"));
+    }
+
+    #[test]
+    fn browse_session_cancels_a_non_final_list_without_emitting_more_pages() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("one"), b"one").unwrap();
+        fs::write(root.path().join("two"), b"two").unwrap();
+        let handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities: CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [7; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let mut input = encode_frame(1, &handshake).unwrap();
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(
+                2,
+                &V2Message::ListRequest {
+                    path: Vec::new(),
+                    page_token: 0,
+                    page_size: 1,
+                },
+            )
+            .unwrap(),
+        );
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(3, &V2Message::CancelRequest { related_id: 2 }).unwrap(),
+        );
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(4, &V2Message::CancelRequest { related_id: 99 }).unwrap(),
+        );
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(5, &V2Message::Keepalive { nonce: 55 }).unwrap(),
+        );
+        let mut output = Vec::new();
+        Server::new(root.path())
+            .run(Cursor::new(input), &mut output)
+            .unwrap();
+
+        let mut v1 = FrameDecoder::new();
+        let mut cursor = Cursor::new(output);
+        v1.read(&mut cursor).unwrap();
+        v1.read(&mut cursor).unwrap();
+        let first = protocol_v2::read_frame(&mut cursor).unwrap().unwrap();
+        assert!(matches!(
+            first.message,
+            V2Message::ListPage {
+                final_page: false,
+                ..
+            }
+        ));
+        let second = protocol_v2::read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(
+            second.message,
+            V2Message::BrowseError {
+                related_id: 2,
+                code: 1,
+                message: b"request cancelled".to_vec(),
+            }
+        );
+        let completed = protocol_v2::read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(
+            completed.message,
+            V2Message::BrowseError {
+                related_id: 99,
+                code: 1,
+                message: b"request already complete".to_vec(),
+            }
+        );
+        let keepalive = protocol_v2::read_frame(&mut cursor).unwrap().unwrap();
+        assert_eq!(keepalive.message, V2Message::KeepaliveAck { nonce: 55 });
+        assert!(protocol_v2::read_frame(&mut cursor).unwrap().is_none());
+    }
+
+    #[test]
+    fn browse_client_driver_negotiates_and_keeps_alive() {
+        let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+        let server_handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [4; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let mut peer_bytes = encode_frame(1000, &server_handshake).unwrap();
+        peer_bytes.extend_from_slice(
+            &encode_frame(
+                1001,
+                &Message::Ack {
+                    acknowledged_id: 1,
+                    acknowledged_type: 1,
+                },
+            )
+            .unwrap(),
+        );
+        peer_bytes.extend_from_slice(
+            &protocol_v2::encode_frame(1002, &V2Message::KeepaliveAck { nonce: 11 }).unwrap(),
+        );
+        peer_bytes.extend_from_slice(
+            &protocol_v2::encode_frame(
+                1003,
+                &V2Message::ListPage {
+                    related_id: 3,
+                    page_token: 0,
+                    final_page: true,
+                    entries: vec![BrowseEntry {
+                        name: b"file".to_vec(),
+                        kind: 1,
+                        size: 4,
+                        mtime_ns: 0,
+                        mode: 0o644,
+                        symlink_target: Vec::new(),
+                    }],
+                },
+            )
+            .unwrap(),
+        );
+
+        let mut session =
+            BrowseSession::connect(Cursor::new(peer_bytes), Vec::new(), [3; 16]).unwrap();
+        assert_eq!(session.remote_capabilities(), capabilities);
+        assert_eq!(session.common_capabilities(), capabilities);
+        session.keepalive(11).unwrap();
+        let (next_token, final_page, entries) = session.list_page(Vec::new(), 0, 100).unwrap();
+        assert_eq!(next_token, 0);
+        assert!(final_page);
+        assert_eq!(entries[0].name, b"file");
+        let (reader, writer) = session.into_parts();
+        assert!(reader.position() > 0);
+
+        let mut sent = Cursor::new(writer);
+        let mut decoder = FrameDecoder::new();
+        assert!(matches!(
+            decoder.read(&mut sent).unwrap().message,
+            Message::Handshake {
+                role: Role::Session,
+                ..
+            }
+        ));
+        let v2_position = sent.position();
+        let mut v2_sent = Cursor::new(sent.into_inner());
+        v2_sent.set_position(v2_position);
+        let request = protocol_v2::read_frame(&mut v2_sent).unwrap().unwrap();
+        assert_eq!(request.message_id, 2);
+        assert_eq!(request.message, V2Message::Keepalive { nonce: 11 });
+        let list_request = protocol_v2::read_frame(&mut v2_sent).unwrap().unwrap();
+        assert_eq!(list_request.message_id, 3);
+        assert!(matches!(
+            list_request.message,
+            V2Message::ListRequest { .. }
+        ));
+    }
+
+    #[test]
+    fn browse_client_names_clean_peer_disconnect() {
+        let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+        let handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [5; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let mut peer_bytes = encode_frame(1000, &handshake).unwrap();
+        peer_bytes.extend_from_slice(
+            &encode_frame(
+                1001,
+                &Message::Ack {
+                    acknowledged_id: 1,
+                    acknowledged_type: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let mut session =
+            BrowseSession::connect(Cursor::new(peer_bytes), Vec::new(), [6; 16]).unwrap();
+        assert_eq!(
+            session.receive().unwrap_err().to_string(),
+            "browse peer disconnected"
+        );
+    }
+
+    #[test]
     fn delete_failure_is_reported_as_a_warning_and_partial_failure() {
         let entry = FileEntry {
             path: WirePath::from("stale.txt"),
@@ -4605,7 +6868,7 @@ mod tests {
 
         let mut server = Server::new(dst.path());
         let mut output = Vec::new();
-        let result = server.run(Cursor::new(&input), &mut output);
+        let result = server.run(Cursor::new(input), &mut output);
         assert!(
             matches!(
                 &result,
@@ -4699,7 +6962,7 @@ mod tests {
 
         let mut server = Server::new(dst.path());
         let mut output = Vec::new();
-        let result = server.run(Cursor::new(&input), &mut output);
+        let result = server.run(Cursor::new(input), &mut output);
         assert!(
             result.is_ok(),
             "data session must terminate cleanly: {result:?}"
@@ -4738,14 +7001,27 @@ mod tests {
     fn default_remote_shell_is_ssh_over_host() {
         let (program, args) = remote_server_command("/dest", None, Some("user@mars"));
         assert_eq!(program, "ssh");
-        assert_eq!(args, ["user@mars", "'xs' '--server' '/dest'"]);
+        assert_eq!(
+            args,
+            [
+                "user@mars",
+                "PATH=\"$HOME/.local/bin:$PATH\" 'xs' '--server' '/dest'"
+            ]
+        );
     }
 
     #[test]
     fn explicit_rsh_replaces_the_shell_but_preserves_host_and_args() {
         let (program, args) = remote_server_command("/dest", Some("myrsh -oK=1"), Some("host"));
         assert_eq!(program, "myrsh");
-        assert_eq!(args, ["-oK=1", "host", "'xs' '--server' '/dest'"]);
+        assert_eq!(
+            args,
+            [
+                "-oK=1",
+                "host",
+                "PATH=\"$HOME/.local/bin:$PATH\" 'xs' '--server' '/dest'"
+            ]
+        );
     }
 
     #[test]
@@ -4756,7 +7032,7 @@ mod tests {
             args,
             [
                 "host",
-                "'xs' '--server' '/dst'\\''; touch XSYNC_INJECTION; echo '\\'''"
+                "PATH=\"$HOME/.local/bin:$PATH\" 'xs' '--server' '/dst'\\''; touch XSYNC_INJECTION; echo '\\'''"
             ]
         );
     }
@@ -4764,10 +7040,22 @@ mod tests {
     #[test]
     fn remote_home_path_is_expanded_by_the_remote_shell() {
         let (_, args) = remote_server_command("~", None, Some("host"));
-        assert_eq!(args, ["host", "'xs' '--server' \"$HOME\""]);
+        assert_eq!(
+            args,
+            [
+                "host",
+                "PATH=\"$HOME/.local/bin:$PATH\" 'xs' '--server' \"$HOME\""
+            ]
+        );
 
         let (_, args) = remote_server_command("~/nested", None, Some("host"));
-        assert_eq!(args, ["host", "'xs' '--server' \"$HOME\"/'nested'"]);
+        assert_eq!(
+            args,
+            [
+                "host",
+                "PATH=\"$HOME/.local/bin:$PATH\" 'xs' '--server' \"$HOME\"/'nested'"
+            ]
+        );
     }
 
     #[test]
@@ -5099,6 +7387,37 @@ mod tests {
         {
             std::os::unix::fs::symlink(&outside, root.join("link_dir")).unwrap();
             assert!(validate_destination_path(&root, "link_dir/file.txt").is_err());
+
+            fs::write(&outside.join("file"), b"outside").unwrap();
+            std::os::unix::fs::symlink(outside.join("file"), root.join("link_file")).unwrap();
+            assert!(matches!(
+                validate_destination_path(&root, "link_file/child"),
+                Err(ServerError::SymlinkEscape(_))
+            ));
         }
+    }
+
+    #[test]
+    fn mutation_validation_registers_only_unique_normalized_paths() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("dest");
+        fs::create_dir(&root).unwrap();
+        let mut seen = HashSet::new();
+
+        validate_unique_destination_path(
+            &root,
+            WirePath::from_wire(b"same/path".to_vec()).unwrap(),
+            &mut seen,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_unique_destination_path(
+                &root,
+                WirePath::from_wire(b"same/path".to_vec()).unwrap(),
+                &mut seen,
+            ),
+            Err(ServerError::DuplicatePath(path)) if path == "same/path"
+        ));
+        assert_eq!(seen.len(), 1);
     }
 }

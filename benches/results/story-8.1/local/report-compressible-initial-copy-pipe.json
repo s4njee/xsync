@@ -1,0 +1,737 @@
+{
+  "schema": "xsync.bench.report.v1",
+  "generated_unix_nanos": 1787568221861590000,
+  "build": {
+    "source_revision": "f5e10179c9590e193265a5001965d3ad985003b0-dirty",
+    "build_id": "99bf54177460607ca9e072dcb5abbb73",
+    "profile": "release"
+  },
+  "environment": {
+    "hardware": "Apple M1 Max, 10 logical cores, 64 GiB RAM",
+    "os": "macOS-26.6.1-arm64-arm-64bit-Mach-O",
+    "kernel": "25.6.0",
+    "filesystem": "apfs (/dev/disk3s5)",
+    "transport": "pipe (child xsync --server over stdio)",
+    "route": "pipe"
+  },
+  "session": {
+    "streams": 1,
+    "compression": "adaptive zstd"
+  },
+  "corpus": {
+    "schema": "xsync.corpus.v1",
+    "manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+    "description": "class=compressible tier=smoke workload=initial-copy seed=42"
+  },
+  "tools": [
+    {
+      "name": "xsync",
+      "version": "xsync 0.1.0",
+      "command": "xsync --progress-json SRC/ DEST/"
+    },
+    {
+      "name": "rsync",
+      "version": "rsync  version 3.4.4  protocol version 32",
+      "command": "rsync -a SRC/ DEST/"
+    }
+  ],
+  "results": [
+    {
+      "name": "rsync-a",
+      "baseline": null,
+      "samples": [
+        {
+          "repetition": 0,
+          "method_order": 0,
+          "wall_seconds": 0.06414825000683777,
+          "cpu_seconds": 0.030814,
+          "peak_rss_bytes": 5226496,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.003103833005297929,
+            "transfer": 0.06414825000683777,
+            "verify_oracle": 0.015375125003629364
+          },
+          "cache_state": "first_pass",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 1,
+          "method_order": 3,
+          "wall_seconds": 0.08069470900227316,
+          "cpu_seconds": 0.031246,
+          "peak_rss_bytes": 5226496,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.002265041999635286,
+            "transfer": 0.08069470900227316,
+            "verify_oracle": 0.013886749991797842
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 2,
+          "method_order": 2,
+          "wall_seconds": 0.08522891599568538,
+          "cpu_seconds": 0.030918,
+          "peak_rss_bytes": 5128192,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.02723845800210256,
+            "transfer": 0.08522891599568538,
+            "verify_oracle": 0.015845832997001708
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 3,
+          "method_order": 1,
+          "wall_seconds": 0.05958583299070597,
+          "cpu_seconds": 0.03239,
+          "peak_rss_bytes": 5177344,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.0025910420081345364,
+            "transfer": 0.05958583299070597,
+            "verify_oracle": 0.016099250002298504
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 4,
+          "method_order": 0,
+          "wall_seconds": 0.061676666999119334,
+          "cpu_seconds": 0.03486,
+          "peak_rss_bytes": 5210112,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.002238250002847053,
+            "transfer": 0.061676666999119334,
+            "verify_oracle": 0.016039125010138378
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        }
+      ],
+      "median_wall_seconds": 0.06414825000683777,
+      "mad_wall_seconds": 0.004562417016131803,
+      "median_cpu_seconds": 0.031246,
+      "peak_rss_bytes": 5226496,
+      "item_count": 33,
+      "logical_bytes": 2097152,
+      "median_wire_bytes": 0,
+      "phase_medians_seconds": {
+        "seed_destination": 0.0025910420081345364,
+        "transfer": 0.06414825000683777,
+        "verify_oracle": 0.015845832997001708
+      },
+      "paired_observations": [],
+      "paired_ratio_median": null,
+      "paired_ratio_mad": null
+    },
+    {
+      "name": "rsync-az",
+      "baseline": "rsync-a",
+      "samples": [
+        {
+          "repetition": 0,
+          "method_order": 1,
+          "wall_seconds": 0.08030554199649487,
+          "cpu_seconds": 0.026906999999999997,
+          "peak_rss_bytes": 8306688,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.0019008749950444328,
+            "transfer": 0.08030554199649487,
+            "verify_oracle": 0.016746166002121754
+          },
+          "cache_state": "first_pass",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 1,
+          "method_order": 0,
+          "wall_seconds": 0.07885999999416526,
+          "cpu_seconds": 0.026858,
+          "peak_rss_bytes": 8372224,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.0019077910110354424,
+            "transfer": 0.07885999999416526,
+            "verify_oracle": 0.01438816700829193
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 2,
+          "method_order": 3,
+          "wall_seconds": 0.07936595799401402,
+          "cpu_seconds": 0.028213,
+          "peak_rss_bytes": 8306688,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.0022248749883146957,
+            "transfer": 0.07936595799401402,
+            "verify_oracle": 0.020070208003744483
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 3,
+          "method_order": 2,
+          "wall_seconds": 0.07968816699576564,
+          "cpu_seconds": 0.030037,
+          "peak_rss_bytes": 8388608,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.0017126669990830123,
+            "transfer": 0.07968816699576564,
+            "verify_oracle": 0.014778500000829808
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 4,
+          "method_order": 1,
+          "wall_seconds": 0.08409233301063068,
+          "cpu_seconds": 0.029448,
+          "peak_rss_bytes": 8273920,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "seed_destination": 0.001683583002886735,
+            "transfer": 0.08409233301063068,
+            "verify_oracle": 0.016829833009978756
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        }
+      ],
+      "median_wall_seconds": 0.07968816699576564,
+      "mad_wall_seconds": 0.0006173750007292256,
+      "median_cpu_seconds": 0.028213,
+      "peak_rss_bytes": 8388608,
+      "item_count": 33,
+      "logical_bytes": 2097152,
+      "median_wire_bytes": 0,
+      "phase_medians_seconds": {
+        "seed_destination": 0.0019008749950444328,
+        "transfer": 0.07968816699576564,
+        "verify_oracle": 0.016746166002121754
+      },
+      "paired_observations": [
+        {
+          "repetition": 0,
+          "baseline_seconds": 0.06414825000683777,
+          "candidate_seconds": 0.08030554199649487,
+          "speedup": 0.7988022795442645
+        },
+        {
+          "repetition": 1,
+          "baseline_seconds": 0.08069470900227316,
+          "candidate_seconds": 0.07885999999416526,
+          "speedup": 1.0232653944743044
+        },
+        {
+          "repetition": 2,
+          "baseline_seconds": 0.08522891599568538,
+          "candidate_seconds": 0.07936595799401402,
+          "speedup": 1.073872452999478
+        },
+        {
+          "repetition": 3,
+          "baseline_seconds": 0.05958583299070597,
+          "candidate_seconds": 0.07968816699576564,
+          "speedup": 0.7477375278800447
+        },
+        {
+          "repetition": 4,
+          "baseline_seconds": 0.061676666999119334,
+          "candidate_seconds": 0.08409233301063068,
+          "speedup": 0.733439836796089
+        }
+      ],
+      "paired_ratio_median": 0.7988022795442645,
+      "paired_ratio_mad": 0.06536244274817549
+    },
+    {
+      "name": "xsync",
+      "baseline": "rsync-a",
+      "samples": [
+        {
+          "repetition": 0,
+          "method_order": 2,
+          "wall_seconds": 0.04449850000673905,
+          "cpu_seconds": 0.028123,
+          "peak_rss_bytes": 6635520,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2944,
+          "phases_seconds": {
+            "seed_destination": 0.002105541992932558,
+            "transfer": 0.04449850000673905,
+            "verify_oracle": 0.013286332992720418
+          },
+          "cache_state": "first_pass",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 1,
+          "method_order": 1,
+          "wall_seconds": 0.043382957999710925,
+          "cpu_seconds": 0.030014,
+          "peak_rss_bytes": 6684672,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2944,
+          "phases_seconds": {
+            "seed_destination": 0.002180750001571141,
+            "transfer": 0.043382957999710925,
+            "verify_oracle": 0.014542958000674844
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 2,
+          "method_order": 0,
+          "wall_seconds": 0.04059745901031419,
+          "cpu_seconds": 0.027619,
+          "peak_rss_bytes": 6684672,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2944,
+          "phases_seconds": {
+            "seed_destination": 0.002199750000727363,
+            "transfer": 0.04059745901031419,
+            "verify_oracle": 0.014272707994678058
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 3,
+          "method_order": 3,
+          "wall_seconds": 0.038461207994259894,
+          "cpu_seconds": 0.026847999999999997,
+          "peak_rss_bytes": 6684672,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2944,
+          "phases_seconds": {
+            "seed_destination": 0.0020709579985123128,
+            "transfer": 0.038461207994259894,
+            "verify_oracle": 0.014104624991887247
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 4,
+          "method_order": 2,
+          "wall_seconds": 0.040486500001861714,
+          "cpu_seconds": 0.028158999999999997,
+          "peak_rss_bytes": 6619136,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2944,
+          "phases_seconds": {
+            "seed_destination": 0.0018484159954823551,
+            "transfer": 0.040486500001861714,
+            "verify_oracle": 0.015846790993236937
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        }
+      ],
+      "median_wall_seconds": 0.04059745901031419,
+      "mad_wall_seconds": 0.0021362510160542955,
+      "median_cpu_seconds": 0.028123,
+      "peak_rss_bytes": 6684672,
+      "item_count": 33,
+      "logical_bytes": 2097152,
+      "median_wire_bytes": 2944,
+      "phase_medians_seconds": {
+        "seed_destination": 0.002105541992932558,
+        "transfer": 0.04059745901031419,
+        "verify_oracle": 0.014272707994678058
+      },
+      "paired_observations": [
+        {
+          "repetition": 0,
+          "baseline_seconds": 0.06414825000683777,
+          "candidate_seconds": 0.04449850000673905,
+          "speedup": 1.4415823004623274
+        },
+        {
+          "repetition": 1,
+          "baseline_seconds": 0.08069470900227316,
+          "candidate_seconds": 0.043382957999710925,
+          "speedup": 1.8600554854468627
+        },
+        {
+          "repetition": 2,
+          "baseline_seconds": 0.08522891599568538,
+          "candidate_seconds": 0.04059745901031419,
+          "speedup": 2.099365774937592
+        },
+        {
+          "repetition": 3,
+          "baseline_seconds": 0.05958583299070597,
+          "candidate_seconds": 0.038461207994259894,
+          "speedup": 1.5492449691023433
+        },
+        {
+          "repetition": 4,
+          "baseline_seconds": 0.061676666999119334,
+          "candidate_seconds": 0.040486500001861714,
+          "speedup": 1.5233884627291374
+        }
+      ],
+      "paired_ratio_median": 1.5492449691023433,
+      "paired_ratio_mad": 0.10766266864001595
+    },
+    {
+      "name": "xsync-raw",
+      "baseline": "rsync-a",
+      "samples": [
+        {
+          "repetition": 0,
+          "method_order": 3,
+          "wall_seconds": 0.03920045799168293,
+          "cpu_seconds": 0.027184,
+          "peak_rss_bytes": 6225920,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2098816,
+          "phases_seconds": {
+            "seed_destination": 0.0020216249977238476,
+            "transfer": 0.03920045799168293,
+            "verify_oracle": 0.015226792005705647
+          },
+          "cache_state": "first_pass",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 1,
+          "method_order": 2,
+          "wall_seconds": 0.04341220800415613,
+          "cpu_seconds": 0.028142,
+          "peak_rss_bytes": 6242304,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2098816,
+          "phases_seconds": {
+            "seed_destination": 0.001738250008202158,
+            "transfer": 0.04341220800415613,
+            "verify_oracle": 0.013465957992593758
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 2,
+          "method_order": 1,
+          "wall_seconds": 0.0390149580052821,
+          "cpu_seconds": 0.026445,
+          "peak_rss_bytes": 6176768,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2098816,
+          "phases_seconds": {
+            "seed_destination": 0.002048624999588355,
+            "transfer": 0.0390149580052821,
+            "verify_oracle": 0.01760095899226144
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 3,
+          "method_order": 0,
+          "wall_seconds": 0.04968341698986478,
+          "cpu_seconds": 0.032915,
+          "peak_rss_bytes": 6488064,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2098816,
+          "phases_seconds": {
+            "seed_destination": 0.003215040997019969,
+            "transfer": 0.04968341698986478,
+            "verify_oracle": 0.02446745800261851
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        },
+        {
+          "repetition": 4,
+          "method_order": 3,
+          "wall_seconds": 0.04664116699132137,
+          "cpu_seconds": 0.030788999999999997,
+          "peak_rss_bytes": 6078464,
+          "item_count": 33,
+          "logical_bytes": 2097152,
+          "wire_bytes": 2098816,
+          "phases_seconds": {
+            "seed_destination": 0.002439374991809018,
+            "transfer": 0.04664116699132137,
+            "verify_oracle": 0.016136999998707324
+          },
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "actual_manifest_digest": "22ad89d98ddb78189bbc1a1a9c1194a8b9ce8f003423c12ddd18e267f5a60897",
+            "item_count": 33,
+            "logical_bytes": 2097152,
+            "mismatch_count": 0,
+            "mismatches": []
+          }
+        }
+      ],
+      "median_wall_seconds": 0.04341220800415613,
+      "mad_wall_seconds": 0.004211750012473196,
+      "median_cpu_seconds": 0.028142,
+      "peak_rss_bytes": 6488064,
+      "item_count": 33,
+      "logical_bytes": 2097152,
+      "median_wire_bytes": 2098816,
+      "phase_medians_seconds": {
+        "seed_destination": 0.002048624999588355,
+        "transfer": 0.04341220800415613,
+        "verify_oracle": 0.016136999998707324
+      },
+      "paired_observations": [
+        {
+          "repetition": 0,
+          "baseline_seconds": 0.06414825000683777,
+          "candidate_seconds": 0.03920045799168293,
+          "speedup": 1.6364158301530036
+        },
+        {
+          "repetition": 1,
+          "baseline_seconds": 0.08069470900227316,
+          "candidate_seconds": 0.04341220800415613,
+          "speedup": 1.8588022289616721
+        },
+        {
+          "repetition": 2,
+          "baseline_seconds": 0.08522891599568538,
+          "candidate_seconds": 0.0390149580052821,
+          "speedup": 2.1845189730601926
+        },
+        {
+          "repetition": 3,
+          "baseline_seconds": 0.05958583299070597,
+          "candidate_seconds": 0.04968341698986478,
+          "speedup": 1.199310285016452
+        },
+        {
+          "repetition": 4,
+          "baseline_seconds": 0.061676666999119334,
+          "candidate_seconds": 0.04664116699132137,
+          "speedup": 1.3223654333219332
+        }
+      ],
+      "paired_ratio_median": 1.6364158301530036,
+      "paired_ratio_mad": 0.3140503968310704
+    }
+  ]
+}

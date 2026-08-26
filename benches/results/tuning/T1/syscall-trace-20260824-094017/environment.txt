@@ -1,0 +1,7 @@
+captured=2026-08-24T14:40:24Z
+macos=26.6.1
+kernel=Darwin mbp-9.local 25.6.0 Darwin Kernel Version 25.6.0: Sat Jul 11 15:26:21 PDT 2026; root:xnu-12377.161.13~4/RELEASE_ARM64_T6000 arm64
+source=/Users/sanjee/projects/csearchv2/congress/data/100
+xsync=/Users/sanjee/projects/xsync/target/release/xsync
+xsync_sha256=7d5798f6fbc04b0466d21decd43692657eb349c5ef1b7eeeb40e9a2f9b75d3e0
+rsync=rsync  version 3.4.4  protocol version 32
