@@ -159,3 +159,37 @@ machine, would need the entry re-learned rather than trusted indefinitely.
 Note the failed first attempt is harmless: it is the `PATH` builtin setting a
 junk search path inside a shell that then exits. Nothing is written and no
 process is started on the remote.
+
+---
+
+## The rsync fallback rejects the rsync shipped by current Ubuntu LTS
+
+**Raised:** 2026-08-26, while making the Linux CI job pass.
+**Status:** open — product decision, not a defect in the code as written.
+
+`rsync::validate_peer` requires `GNU rsync` advertising protocol >= 32
+(`RSYNC_WIRE_VERSION`). The GitHub `ubuntu-latest` runner's system rsync
+advertises a lower protocol, so xsync refuses it during the version probe.
+
+This matters more than a skipped test. The rsync transport exists so that a
+remote *without* xsync still works — DEPLOYMENT.md D5.1 offers it explicitly as
+the fallback when the remote binary is missing, and it is the reason
+"works with what is already installed" is claimed at all. If the protocol floor
+excludes the rsync on current Ubuntu LTS, that fallback does not fire on a large
+share of realistic Linux destinations, and those users get a hard failure rather
+than a degraded transfer.
+
+Two ways forward, both requiring a decision rather than a patch:
+
+- Lower the floor to protocol 31 and state what is lost. This needs an audit of
+  which wire features the sender relies on above 31, plus test vectors against a
+  protocol-31 peer.
+- Keep the floor and make the failure actionable: name the peer's protocol, say
+  that xsync requires 32, and point at installing xsync on the remote (D5.2
+  bootstrap) as the real fix rather than reporting an opaque unsupported-peer
+  error.
+
+Until then `test_rsync_nonzero_receiver_exit_is_failure` and its siblings skip
+wherever no protocol-32 rsync exists, which is honest but means Linux CI does
+not exercise the rsync transport at all. Installing a protocol-32 rsync in the
+CI job would restore that coverage independently of the decision above.

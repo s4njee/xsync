@@ -15,6 +15,7 @@ jobs:
   format:
     name: Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -25,6 +26,10 @@ jobs:
   target:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # Without a ceiling a job that cannot get a runner sits in the queue until
+    # the 24-hour maximum, so a retired runner label reads as "still running"
+    # for a day instead of failing fast.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -33,7 +38,12 @@ jobs:
             runner: macos-14
             tool: cargo
           - target: x86_64-apple-darwin
-            runner: macos-13
+            # macos-13 was retired in December 2025; jobs requesting it wait for
+            # a runner that no longer exists until the 24h ceiling. macos-15-intel
+            # is the Intel replacement and is available until August 2027, after
+            # which x86_64-apple-darwin needs a Tier 1 decision (see
+            # docs/TARGET-MATRIX.md).
+            runner: macos-15-intel
             tool: cargo
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
@@ -72,6 +82,7 @@ jobs:
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0

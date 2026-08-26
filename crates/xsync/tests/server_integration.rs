@@ -519,7 +519,16 @@ fn test_rsync_nonzero_receiver_exit_is_failure() {
     fs::write(src.path().join("file"), b"data").unwrap();
     let dst = tempdir().unwrap();
     let scripts = tempdir().unwrap();
-    let reference = reference_rsync().unwrap_or("/usr/bin/rsync");
+    // This test drives a *supported* peer to a disk-full failure, so it needs a
+    // reference rsync xsync will actually talk to. Falling back to
+    // /usr/bin/rsync unconditionally made the test fail on any host whose
+    // system rsync advertises a protocol below 32 -- xsync rejects the peer
+    // during the version probe and never reaches the disk-full path, so the
+    // assertion below saw an unsupported-peer error instead. Skip, as the other
+    // rsync tests already do, rather than assert on an unrelated failure.
+    let Some(reference) = reference_rsync() else {
+        return;
+    };
     let rsh = scripts.path().join("disk_full.sh");
     fs::write(
         &rsh,
