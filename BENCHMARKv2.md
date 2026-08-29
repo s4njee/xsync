@@ -653,6 +653,22 @@ steps held 979-984 MB/s throughout, with a single 842 MB/s dip. No SLC cliff
 within 64 GB, so it is a clean write target and the ZFS -> USB configuration
 below isolates xsync from destination cache state.
 
+> **The drive is an Inland Premium 256 GB** (M.2 2280, PCIe NVMe 3.0 x4,
+> **TLC** 3D NAND, rated 2,900 MB/s read / 950 MB/s write). The TLC rating
+> explains the flat sustained-write result directly — there is no QLC SLC cliff
+> to hit.
+>
+> It also corrects an attribution made above: writes were **drive-limited, not
+> link-limited**. 979 MB/s measured against 950 MB/s rated is the drive, not the
+> 10 Gbps enclosure. Reads were link-limited (882 MB/s measured against 2,900
+> rated). The bottleneck therefore differs by direction and by host:
+>
+> | Host | USB link | Write | Read | Limited by |
+> |---|---|---:|---:|---|
+> | freya | 10 Gbps | 979 MB/s | 882 MB/s | drive on write, link on read |
+> | orion (Pi 5) | 5 Gbps | 357 MB/s | 322 MB/s | link, both directions |
+> | this Mac (M1 Max) | 10 Gbps | 913 MB/s | — | drive on write |
+
 ### Worker scaling, cold, congress-1m
 
 3 reps each, caches dropped before every rep, `sync()` inside the timed region.
