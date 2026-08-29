@@ -978,6 +978,36 @@ Nothing in that sweep is comparable to anything else in it, so it is not
 reported. The redesign is a bounded ~6 GiB subset of large files, which keeps the
 large-file character while staying inside the SLC cache.
 
+### cb7 on Windows: worker count stops mattering
+
+62,621 entries (59,311 files + 3,310 symlinks) / 5.5 GiB, C: -> C:. Each run stays
+*inside* the ~8 GB SLC cache, so unlike Manga these numbers measure the tool.
+
+| Workers | Median | Files/s |
+|---:|---:|---:|
+| 4 | 44.14 s | 1,419 |
+| 8 | 44.57 s | 1,405 |
+| 16 | 43.55 s | 1,438 |
+
+**Flat.** Where congress-100k scaled 1.81x from 1 to 16 workers on this host, cb7
+shows nothing outside noise across a 4x range. The difference is composition: cb7
+carries 68% of its bytes in 78 files above 8 MB, so it is far more
+bandwidth-bound than congress, and extra workers have little per-file latency
+left to hide.
+
+One caveat on the opening arm: its three reps were 43.97, 44.14 and **108.79 s**.
+The median is unaffected, but a 2.5x outlier on an otherwise tight arm is the
+signature this file keeps running into, and is why medians rather than means are
+used throughout.
+
+### All 3,310 symlinks survived NTFS
+
+cb7 is the first corpus to exercise symlinks at scale on Windows, and every one of
+its 3,310 links was recreated — 62,621 entries landed, matching 59,311 files plus
+3,310 links exactly. This depends on Developer Mode being enabled; without it,
+symlink creation on Windows requires elevation, which is a deployment caveat
+rather than an xsync limitation.
+
 ### Three drives, three failure modes
 
 Every consumer SSD used in this project has misled a measurement in a different
