@@ -315,6 +315,35 @@ Unix ownership, and V3.3 conflated the two. Replaced with an explicit
 
 ---
 
+## Phase 5 — Very low priority
+
+Recorded so they are not lost, explicitly *not* scheduled.
+
+### 4.11 — Detect hardlinks and alternate data streams on Windows
+
+- [ ] **Very low priority.** These are undetected on NTFS but no longer
+  unreported: `Preflight::unchecked` names them every run, so a user is told
+  xsync cannot see them rather than being told nothing. The reporting gap — the
+  part that actually risked data loss going unnoticed — is closed.
+
+Detection would require one of:
+
+| Category | What it needs | Cost |
+|---|---|---|
+| Hardlinks | `std::os::windows::fs::MetadataExt::number_of_links`, behind the unstable `windows_by_handle` feature | pins the project to nightly, or a `windows-sys` dependency plus `unsafe` |
+| Alternate data streams | `FindFirstStreamW` / `FindNextStreamW` | a `windows-sys` dependency plus `unsafe` |
+| Junction vs symlink | reading the reparse tag (`FSCTL_GET_REPARSE_POINT`) | same |
+
+All three mean either nightly Rust or a **second `unsafe` exemption**, against a
+crate that currently has exactly one and documents it prominently. Measured
+consequences if a user does hit them: a hardlinked pair arrives as two
+independent copies, an alternate data stream is dropped, and a junction becomes a
+symlink.
+
+**Only take this on if** a real workload is known to depend on it. The
+cost-benefit is poor otherwise: an `unsafe` exemption is permanent, and the
+current reporting already prevents the silent-loss failure mode.
+
 ## Phase 4 — Carried forward
 
 Not ordered against each other; pulled from `backlogv3.md` because they are still
