@@ -853,17 +853,27 @@ conclusion, below. On both Linux hosts, worker counts past the optimum were
 turns over: 16 workers is 2.5% worse than 8, and 32 is 6.5% worse. The 8-worker
 arm has 0.3% MAD, so the difference is not noise.
 
-> **⚠ Unresolved confound: the sweep ran in ascending worker order.** 1, 2, 4, 8,
-> 16, 32 executed back to back over ~79 minutes of continuous load, so the 16 and
-> 32 arms ran last, on an enclosure that had been writing for over an hour and was
-> reported hot to the touch. Accumulated heat is therefore **perfectly correlated
-> with worker count**, and thermal throttling of the USB enclosure would produce
-> exactly the observed turn-over. Nothing in this data distinguishes the two
-> explanations.
+> **Confound raised and tested: enclosure heat. Not the cause.** The sweep ran in
+> ascending worker order over ~79 minutes of continuous load, so 16 and 32 ran
+> last on an enclosure that was hot to the touch — accumulated heat was perfectly
+> correlated with worker count, and throttling would have produced exactly this
+> turn-over.
 >
-> The 10% figure for the cap (4 vs 8) is unaffected — both arms ran early. What is
-> in doubt is the claim that macOS *degrades* past its optimum, which is the part
-> that justifies keeping a cap at all. See backlog V3.21 for the re-run design.
+> Re-run on a cooled drive in **descending** order, with 32 going first (the best
+> possible case for the thermal explanation) and 90 s idle before every rep:
+>
+> | Workers | Original (ascending, hot) | Re-run (descending, cooled) | Delta |
+> |---:|---:|---:|---:|
+> | 32 | 303.0 s | **301.8 s** (MAD 0.9%) | -0.4% |
+> | 16 | 291.5 s | **287.7 s** (MAD 3.2%) | -1.3% |
+>
+> Both reproduce, and the cooled 32 arm is *tighter* rather than faster. Thermal
+> throttling is ruled out; the degradation past 8 workers is real contention.
+>
+> One refinement the re-run does supply: at 287.7 s, 16 workers is only 1.1%
+> worse than 8 and that gap is within noise. The clear, reproducible degradation
+> is at 32 workers, 6.1% worse than 8. So the safe reading is that macOS is flat
+> from 8 to 16 and degrades by 32 — not that it turns over immediately past 8.
 
 **The cap's value is too conservative.** The optimum is 8, not 4, and the cap
 costs **10%** on this workload. Raising it from 4 to 8 keeps the protection

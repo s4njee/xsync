@@ -1036,7 +1036,16 @@ version of that question, arrived at from cold measurements on two machines.
 
 ### Story V3.21 — Re-run the macOS 16/32-worker arms controlling for enclosure heat
 
-- [ ] The macOS sweep ran worker counts in ascending order (1, 2, 4, 8, 16, 32)
+- [x] **Done 2026-08-29. Heat was not the cause.** Re-run descending on a cooled
+  drive with 32 first and 90 s idle per rep: 32 -> 301.8 s (was 303.0), 16 ->
+  287.7 s (was 291.5). Both reproduce within noise, so the degradation past 8
+  workers is real macOS contention and `MACOS_WORKER_CAP` is justified. Refinement:
+  16 workers is only 1.1% off 8 (within noise); the reproducible degradation is at
+  32, 6.1% worse than 8. macOS is flat 8-16 and degrades by 32.
+  Temperature could not be logged — macOS `smartctl` cannot pass SMART through a
+  USB bridge, so the design carried the argument instead.
+
+- [x] The macOS sweep ran worker counts in ascending order (1, 2, 4, 8, 16, 32)
   across ~79 minutes of continuous load. The 16 and 32 arms therefore ran last, on
   a USB enclosure that had been writing for over an hour and was hot to the touch.
   **Accumulated heat is perfectly correlated with worker count**, so the observed

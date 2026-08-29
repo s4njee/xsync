@@ -2319,7 +2319,12 @@ impl Server {
                 entries: Vec::new(),
             };
             let msg_id = self.next_id();
-            let bytes = encode_frame(msg_id, &scan_msg)?;
+            let bytes = encode_meta_frame(
+                msg_id,
+                &scan_msg,
+                self.compression == CompressionMode::Zstd,
+                self.compression_level,
+            )?;
             writer.write_all(&bytes)?;
             writer.flush()?;
 
@@ -2345,7 +2350,12 @@ impl Server {
                     entries: chunk,
                 };
                 let msg_id = self.next_id();
-                let bytes = encode_frame(msg_id, &scan_msg)?;
+                let bytes = encode_meta_frame(
+                    msg_id,
+                    &scan_msg,
+                    self.compression == CompressionMode::Zstd,
+                    self.compression_level,
+                )?;
                 writer.write_all(&bytes)?;
                 writer.flush()?;
 
@@ -3289,12 +3299,14 @@ fn send_small_files_batched<R: Read, W: Write, F: FnMut(LocalEvent)>(
             .collect();
 
         let batch_id = next_id();
-        let bytes = encode_frame(
+        let bytes = encode_meta_frame(
             batch_id,
             &Message::FileBatch {
                 batch_id: 1,
                 entries,
             },
+            compress,
+            level,
         )?;
         writer.write_all(&bytes)?;
         let mut outstanding = 1usize;
@@ -4666,12 +4678,14 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 })
                 .collect();
             let batch_id = alloc_id();
-            let bytes = encode_frame(
+            let bytes = encode_meta_frame(
                 batch_id,
                 &Message::FileBatch {
                     batch_id: 1,
                     entries,
                 },
+                negotiated_compression == CompressionMode::Zstd,
+                options.compress_level,
             )?;
             writer.write_all(&bytes)?;
             writer.flush()?;
@@ -5218,6 +5232,35 @@ pub fn sync_push_server<F: FnMut(LocalEvent)>(
 ///
 /// # Errors
 /// Returns [`ServerError`] on encode or I/O failure.
+/// Encode a frame, compressing the payload when the session negotiated zstd.
+///
+/// Mirrors [`encode_frame`] rather than `write_frame` so call sites keep their
+/// own write-and-flush structure; the only difference is that the payload may
+/// arrive compressed.
+///
+/// This exists for *metadata* frames. xsync compressed file payloads but never
+/// the protocol chatter, while rsync's `-z` compresses its file list too — and
+/// that chatter is dominated by paths, which share long prefixes and compress
+/// about 15x on a real corpus. congress-1m carries roughly 49 MB of path bytes
+/// that zstd-3 takes to about 3 MB.
+///
+/// No protocol change is needed: decompression keys off the frame header flags
+/// before any message-type dispatch, so any peer that can decompress at all
+/// decodes these, and the existing `CAP_ZSTD` negotiation still gates it.
+fn encode_meta_frame(
+    id: u64,
+    message: &Message,
+    compress: bool,
+    level: i32,
+) -> Result<Vec<u8>, ServerError> {
+    let mode = if compress {
+        CompressionMode::Zstd
+    } else {
+        CompressionMode::None
+    };
+    Ok(encode_frame_with_compression(id, message, mode, level)?)
+}
+
 fn write_frame<W: Write>(writer: &mut W, id: u64, msg: &Message) -> Result<(), ServerError> {
     let bytes = encode_frame(id, msg)?;
     writer.write_all(&bytes)?;
