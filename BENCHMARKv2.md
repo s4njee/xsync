@@ -13,6 +13,7 @@ sometimes correct earlier ones.
 | [Cross-NVMe on freya](#cross-nvme-local-transfer-on-freya-corpus-a--2026-08-28) | freya, local | First local NVMe-to-NVMe; warm caches |
 | [Cold cross-device NVMe](#cold-cross-device-nvme-congress-1m-on-freya--2026-08-29) | freya, local | congress-1m cold; ZFS vs ext4 reads; QLC variance |
 | [Core-count heuristic refuted](#the-core-count-heuristic-is-wrong-on-small-machines--orion-pi-5-2026-08-29) | orion (Pi 5) | Whether worker count should track logical cores |
+| [macOS worker cap](#macos-the-worker-cap-is-directionally-right-and-numerically-too-low--2026-08-29) | M1 Max, local | Whether `MACOS_WORKER_CAP = 4` still holds |
 
 **Two corrections carried in later sections**, noted here so they are not missed
 by anyone reading only the top: the `--streams` "contention" hypothesis in the
@@ -807,3 +808,82 @@ could lose on another platform. The device also matters: 16 concurrent writers
 suits NVMe and would likely thrash a spinning disk. The defensible reading is
 that worker count should be driven by the storage, with core count as at best a
 weak prior — see backlog V3.20.
+
+---
+
+## macOS: the worker cap is directionally right and numerically too low — 2026-08-29
+
+The last leg of the worker-count question. `MACOS_WORKER_CAP = 4` caps local
+workers on macOS regardless of core count, and it was set because extra workers
+measurably contended. This tests whether that still holds, on the same physical
+USB SSD used on freya and orion — now reformatted APFS and attached to an M1 Max.
+
+**Host** — MacBook, Apple M1 Max, 10 cores (8 performance + 2 efficiency), 64 GB
+RAM, macOS 26.6.1. Internal APFS 4 TB (4,384 MB/s write) -> USB APFS (913 MB/s
+write, drive-limited).
+
+Spotlight indexing was disabled on the target volume for these runs, and `purge`
+ran before every rep (64 GB of RAM against a 13 GB corpus otherwise caches
+everything).
+
+**Caveat, stated because it bounds what these numbers mean:** this is an active
+workstation, not a dedicated host. During the sweep the machine showed 20-31%
+user / 40-53% sys / 16-40% idle with WindowServer, a browser and an Electron app
+running. macOS also reports a wildly inflated load average (150+ at 40% idle), so
+that figure is not comparable to Linux. Run-to-run MAD stayed at 0.2-5%, so the
+background load is near constant and the **scaling shape is trustworthy**;
+**absolute cross-machine comparisons are not.**
+
+### internal APFS -> USB APFS, congress-1m (1,318,771 files / 13 GB), 2 reps
+
+| Workers | Median | MAD | vs 1 | vs 4 (the default) | Files/s |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 748.7 s | 0.2% | 1.00x | 0.42x | 1,761 |
+| 2 | 428.9 s | 1.6% | 1.75x | 0.74x | 3,074 |
+| 4 | 317.8 s | 2.1% | 2.36x | 1.00x | 4,150 |
+| **8** | **284.4 s** | 0.3% | **2.63x** | **1.12x** | **4,636** |
+| 16 | 291.5 s | 1.7% | 2.57x | 1.09x | 4,524 |
+| 32 | 303.0 s | 5.0% | 2.47x | 1.05x | 4,352 |
+
+### macOS really does behave differently
+
+**The cap's motivation is confirmed.** On both Linux hosts, worker counts past the
+optimum were *harmless* — freya was flat from 32 to 64, orion flat past 16. On
+macOS the curve turns over: 16 workers is 2.5% worse than 8, and 32 is 6.5%
+worse. Extra workers actively contend here, exactly as the cap assumed. That is a
+real OS difference, not noise; the 8-worker arm has 0.3% MAD.
+
+**The cap's value is too conservative.** The optimum is 8, not 4, and the cap
+costs **10%** on this workload. Raising it from 4 to 8 keeps the protection
+against the degradation seen at 16 and 32 while recovering that.
+
+### This refines — and partly contradicts — the conclusion drawn from the Pi
+
+After orion, this file concluded that "the optimum tracks how many requests the
+storage will service concurrently, not how many cores the host has". That is now
+too strong. **orion and this Mac wrote to the same physical SSD** and reached
+different optima:
+
+| Host | OS | Cores | Optimum | Past the optimum |
+|---|---|---:|---:|---|
+| freya | Linux | 32 | 32 | flat to 64 |
+| orion (Pi 5) | Linux | 4 | 16-32 | flat past 16 |
+| this Mac | macOS | 10 | 8 | degrades, -6.5% at 32 |
+
+Same device, different answer, so device queue depth alone does not explain it
+either. The honest reading is that the optimum is a joint property of OS,
+filesystem and device, and that **core count is a poor single predictor but so is
+any other single variable**. What survives from the orion finding is the negative
+claim — `available_parallelism()` is not a principled choice — not the positive
+one about storage concurrency.
+
+### macOS is slow at this workload, and it is mostly kernel time
+
+At each host's own optimum: freya 24,609 files/s, orion 6,107, this Mac 4,636.
+The Mac figure carries the background-load caveat above and is not a clean
+silicon comparison — but a 10-core M1 Max landing below a Raspberry Pi 5 is a
+large enough gap to be worth investigating rather than explaining away. During
+transfers the machine ran **40-53% sys time against 20-31% user**, which points at
+per-file syscall cost rather than computation, and matches the earlier
+syscall-attribution work on macOS that put `Sink::destination_path` at 52% of
+sampled stacks.

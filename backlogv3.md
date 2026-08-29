@@ -997,24 +997,35 @@ These are intentionally small enough to pull without first decomposing the whole
   macOS). Measured across an 8x range of core counts, the optimum did not move
   with cores. Evidence in `BENCHMARKv2.md`.
 
-| Host | Cores | Best worker count | Cost of the current default |
-|---|---:|---:|---:|
-| freya (7950X) | 32 | 32 | none — coincides |
-| orion (Pi 5) | 4 | 16-32 | **20% slower** |
+| Host | OS | Cores | Best worker count | Cost of the current default | Past the optimum |
+|---|---|---:|---:|---:|---|
+| freya (7950X) | Linux | 32 | 32 | none — coincides | flat to 64 |
+| orion (Pi 5) | Linux | 4 | 16-32 | **20% slower** | flat past 16 |
+| MacBook (M1 Max) | macOS | 10 | 8 | **10% slower** | degrades, -6.5% at 32 |
 
-Both plateau in the 16-32 range. On the Pi the run uses 21% of the USB write
-ceiling at the plateau with load average ~2, so it is waiting on per-file I/O
-latency, which is a property of the device and not of the CPU.
+**No single variable predicts the optimum.** orion and the MacBook wrote to the
+same physical SSD and disagree (16-32 vs 8), so it is not device queue depth
+alone; core count fits freya, roughly fits macOS, and badly misses orion. The
+surviving claim is the negative one: `available_parallelism()` is not principled.
+
+**macOS is qualitatively different and the existing cap was right to exist.** On
+both Linux hosts, worker counts past the optimum are harmless; on macOS the curve
+turns over and extra workers actively contend. `MACOS_WORKER_CAP` protects
+against something real. Its *value* is what is wrong — 8 is 10% faster than 4 and
+still safely below the degradation at 16.
 
 **AC**
 
-- The default is no longer a bare `available_parallelism()`. Options, cheapest
-  first: a floor (`max(cores, 16)`) for local transfers; a device-aware value
-  read from the queue depth of the destination's block device; or a short
-  ramp-up probe at the start of a large transfer.
-- The change is validated on all three platforms before it lands. macOS is the
-  live counter-example: `MACOS_WORKER_CAP = 4` exists because extra workers
-  contended there, and this change must not silently undo that finding.
+- `MACOS_WORKER_CAP` is raised from 4 to 8. This is the one change the data
+  supports outright: measured 10% faster, and 8 is still well below where macOS
+  starts degrading. Cheap, low-risk, and it does not disturb Linux.
+- The Linux default is no longer a bare `available_parallelism()`. Options,
+  cheapest first: a floor (`max(cores, 16)`) for local transfers; a device-aware
+  value read from the destination's queue depth; or a short ramp-up probe at the
+  start of a large transfer. Note that a probe is the only option that could
+  account for all three hosts, since no static formula fits them.
+- Any change is validated on all three platforms before it lands, and must not
+  reintroduce the past-optimum degradation macOS shows at 16 and 32 workers.
 - Rotational destinations are considered. 16 concurrent writers suits NVMe;
   `/sys/block/<dev>/queue/rotational` is one cheap signal.
 - Whatever lands, `default_local_workers` documents its reasoning the way
