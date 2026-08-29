@@ -14,6 +14,7 @@ sometimes correct earlier ones.
 | [Cold cross-device NVMe](#cold-cross-device-nvme-congress-1m-on-freya--2026-08-29) | freya, local | congress-1m cold; ZFS vs ext4 reads; QLC variance |
 | [Core-count heuristic refuted](#the-core-count-heuristic-is-wrong-on-small-machines--orion-pi-5-2026-08-29) | orion (Pi 5) | Whether worker count should track logical cores |
 | [macOS worker cap](#macos-the-worker-cap-is-directionally-right-and-numerically-too-low--2026-08-29) | M1 Max, local | Whether `MACOS_WORKER_CAP = 4` still holds |
+| [Windows, and three lying drives](#windows-and-three-drives-that-each-lied-differently--2026-08-29) | 7900X, local + network | First Windows numbers; robocopy comparison; SSD confounds |
 
 **Two corrections carried in later sections**, noted here so they are not missed
 by anyone reading only the top: the `--streams` "contention" hypothesis in the
@@ -909,3 +910,85 @@ transfers the machine ran **40-53% sys time against 20-31% user**, which points 
 per-file syscall cost rather than computation, and matches the earlier
 syscall-attribution work on macOS that put `Sink::destination_path` at 52% of
 sampled stacks.
+
+---
+
+## Windows, and three drives that each lied differently — 2026-08-29
+
+First measurements on Windows. The host dual-boots as `mars`, so the
+Windows-versus-Linux comparison is **same silicon**: Ryzen 9 7900X (12C/24T),
+31 GB RAM, Windows 11 Pro build 26200 on a Kingston SNV3S NVMe, Arch on a
+separate SPCC NVMe.
+
+**Conditions, stated because they bound everything below.** Warm cache — 31 GB of
+RAM against corpora of 0.85-27 GB, and Windows has no `drop_caches` or `purge`
+equivalent. Defender real-time protection **on**, which is the realistic default
+and was the top CPU consumer throughout (`MsMpEng`, 4.5x the next process). Same
+volume (C: -> C:), not cross-device.
+
+### congress-100k, 109,615 files / 850 MB
+
+| Tool | Median | Files/s | vs xsync best |
+|---|---:|---:|---:|
+| `robocopy /MT:16` | **27.47 s** | 3,990 | **1.74x faster** |
+| `xs --local-workers 16` | 47.78 s | 2,294 | 1.00x |
+| `xs --local-workers 24` | 50.83 s | 2,157 | 0.94x |
+| `xs --local-workers 8` | 57.28 s | 1,914 | 0.83x |
+| `xs --local-workers 4` | 59.83 s | 1,832 | 0.80x |
+| `xcopy` | 60.09 s | 1,824 | 0.79x |
+| `xs --local-workers 1` | 86.45 s | 1,268 | 0.55x |
+
+Two separate facts, and they do not cancel:
+
+- **Windows is slow at this workload regardless of tool.** robocopy's 27.5 s
+  against the same corpus at 2.2 s under Linux on *the same machine* is a 12x
+  platform gap that no amount of xsync tuning reaches.
+- **xsync is 1.74x behind robocopy on that platform.** That gap is ours.
+
+xsync sits between the two Microsoft tools, comfortably ahead of `xcopy`.
+
+> **Harness correction.** These medians were initially reported 1-10% pessimistic.
+> PowerShell's `[int](3/2)` is **2**, not 1, so a median computed by that index
+> returns the *maximum* of three samples. Recovered without re-running only
+> because raw values were printed beside every median — worth keeping that habit.
+
+### The Kingston is QLC with an ~8 GB SLC cache
+
+Sustained write, 4 GB steps:
+
+| Written | Rate |
+|---:|---:|
+| 4 GB | 1,785 MB/s |
+| 8 GB | 1,885 MB/s |
+| 12 GB | **274 MB/s** |
+| 16 GB | **136 MB/s** |
+
+**A 13.9x collapse past ~8 GB.** This is a property of the destination hardware,
+not a measurement artifact: any real copy larger than ~8 GB onto this drive hits
+it. It also explains the 62 MB/s observed while staging Manga over the network.
+
+### The Manga sweep on Windows is void, and the bracket caught it live
+
+Every Manga run writes 26.7 GiB — **3.3x past the cliff** — so the arms measure
+the drive's garbage collection, not the tool. The bracketed control proves it:
+identical configuration, opening arm 118.53 s, closing arm 74.92 s, **1.6x
+apart**, with the opening arm's own two reps spanning 86.70-150.35 s.
+
+Nothing in that sweep is comparable to anything else in it, so it is not
+reported. The redesign is a bounded ~6 GiB subset of large files, which keeps the
+large-file character while staying inside the SLC cache.
+
+### Three drives, three failure modes
+
+Every consumer SSD used in this project has misled a measurement in a different
+way:
+
+| Drive | Failure mode | How it surfaced |
+|---|---|---|
+| Inland USB (TLC) | sustained-write degradation over 641 GiB written | **after the fact** — 24 arms already run and discarded |
+| Kingston internal (QLC) | 8 GB SLC cliff, 13.9x drop | **during the run**, via the bracketed control |
+| Solidigm P41 Plus (QLC) | write speed depends on recent history | variance pattern across arms |
+
+The practical lesson: **on consumer SSDs the drive is usually the confound**. A
+bracketed control — the same arm first and last — costs one extra run and catches
+it before a session's data is wasted. It is now standard for these sweeps.
