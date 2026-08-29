@@ -655,6 +655,32 @@ real device latency and more workers hide more of it. The plateau was an artifac
 of measuring with warm caches, and the default of one worker per logical core is
 right for real transfers.
 
+### Does the core count actually set the optimum?
+
+freya has 32 logical cores and cold scaling was still improving at 32, so the
+obvious reading is "use `available_parallelism()`". But 32 was also the largest
+value tested, and core count is a CPU property while the mechanism — hiding
+per-file device latency — is a device property. Extending the sweep past the core
+count (`--local-workers` caps at 64), cold, internal ext4 -> USB, 3 reps:
+
+| Workers | Median | MAD |
+|---:|---:|---:|
+| 32 | 54.9 s | 0.7% |
+| 48 | 54.2 s | 1.7% |
+| 64 | 55.5 s | 2.3% |
+
+**Indistinguishable.** Scaling genuinely plateaus at ~32, and oversubscribing to
+2x the core count neither helps nor hurts. So one worker per logical core is a
+safe default here.
+
+What this cannot show is *why*. On this machine the plateau and the core count
+both sit at 32, so the experiment cannot separate "the optimum tracks core count"
+from "the optimum is ~32 on this storage and the core count coincides". Those
+predict very different things on other hardware: a 4-core host with the same NVMe
+would want ~4 workers under the first and ~32 under the second. Until a host with
+a very different core-to-storage ratio is measured, `default_local_workers` is
+justified empirically on this class of machine and not by mechanism.
+
 ### Reading from ZFS costs 45%
 
 Phase 1 and phase 2 share a destination, a corpus, a protocol and a worker count,
