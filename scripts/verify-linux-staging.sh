@@ -23,7 +23,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 zfs_host=${XSYNC_ZFS_HOST:-freya.local}
 ext23_host=${XSYNC_EXT23_HOST:-192.168.1.119}
 arm64_host=${XSYNC_ARM64_HOST:-gentoo-rpi5.local}
-remote_path=${XSYNC_REMOTE_PATH:-/tmp/xsync-stage/xs}
+remote_path=${XSYNC_REMOTE_PATH:-.local/bin/xs}
 
 printf 'Story 13.2 cross-builds\n'
 for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
@@ -56,7 +56,7 @@ check_host() {
     fi
     printf '  PASS %-16s %s (%s/%s)\n' "$label" "$host" "$arch" "$fs"
     if ((stage)); then
-        scripts/stage-linux.sh "$host" "$remote_path" "$architecture"
+        scripts/ensure-linux-agent.sh "$host" "$architecture" "$remote_path"
     fi
 }
 

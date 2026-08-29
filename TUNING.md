@@ -109,6 +109,12 @@ counts.
 
 `~/projects/cb7` — 204,577 files, 42 GB.
 
+> **Stale as of 2026-08-28.** The build tree has been cleaned since this was written.
+> cb7 now measures **59,311 files plus 3,310 symlinks, 5.49 GiB**: 82.6% of files
+> under 8 KB, but 68% of bytes in the 78 files over 8 MB. Numbers below that depend
+> on the 42 GB shape (the `target` subtree, the 44 `libreader_lib.*` copies) no
+> longer describe what is on disk. Current measurements are in `BENCHMARKv2.md`.
+
 | Property | Measured |
 |---|---|
 | Dominant subtree | `reader/src-tauri/target` at 39 GB |

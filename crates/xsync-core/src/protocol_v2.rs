@@ -267,6 +267,7 @@ pub enum V2Message {
         mtime_ns: i64,
         device: u64,
         file: u64,
+        content_size: u64,
         digest: [u8; 32],
     },
     /// Authorize data upload after the identity preflight.
@@ -678,6 +679,7 @@ pub fn encode(message: &V2Message) -> Result<Vec<u8>, V2CodecError> {
             mtime_ns,
             device,
             file,
+            content_size,
             digest,
         } => {
             writer.blob(path, MAX_PATH, "path")?;
@@ -685,6 +687,7 @@ pub fn encode(message: &V2Message) -> Result<Vec<u8>, V2CodecError> {
             writer.i64(*mtime_ns);
             writer.u64(*device);
             writer.u64(*file);
+            writer.u64(*content_size);
             writer.bytes(digest);
         }
         V2Message::PublishReady { related_id } => writer.u64(*related_id),
@@ -918,6 +921,7 @@ pub fn decode(message_type: u8, payload: &[u8]) -> Result<V2Message, V2CodecErro
             mtime_ns: reader.i64()?,
             device: reader.u64()?,
             file: reader.u64()?,
+            content_size: reader.u64()?,
             digest: reader.array()?,
         },
         33 => V2Message::PublishReady {
@@ -1414,6 +1418,7 @@ mod tests {
                 mtime_ns: 4,
                 device: 5,
                 file: 6,
+                content_size: 9,
                 digest: [7; 32],
             },
             V2Message::PublishReady { related_id: 8 },

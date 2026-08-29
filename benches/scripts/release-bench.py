@@ -126,11 +126,45 @@ def git_revision() -> str:
     return revision + ("-dirty" if dirty.stdout.strip() else "")
 
 
+def assert_binary_is_current(binary: Path) -> None:
+    """Refuse to benchmark a binary older than the sources it came from.
+
+    The workspace binary was renamed `xsync` -> `xs`, leaving a stale
+    `target/release/xsync` behind that still ran and still produced plausible
+    numbers. Benchmarking an orphaned artifact is silent and total corruption of
+    a result, so it is checked rather than trusted.
+    """
+    if not binary.exists():
+        raise SystemExit(
+            f"benchmark binary {binary} does not exist; build it first "
+            f"(cargo build --release -p xsync)"
+        )
+    binary_mtime = binary.stat().st_mtime
+    newest_source = 0.0
+    newest_path = None
+    for source in (REPO / "crates").rglob("*.rs"):
+        stamp = source.stat().st_mtime
+        if stamp > newest_source:
+            newest_source, newest_path = stamp, source
+    if newest_source > binary_mtime:
+        raise SystemExit(
+            f"benchmark binary {binary} is older than {newest_path}.\n"
+            f"It would measure stale code. Rebuild before benchmarking."
+        )
+
+
 def build_id(binary: Path) -> str:
-    digest = subprocess.run(
-        ["shasum", "-a", "256", str(binary)], text=True, capture_output=True
-    )
-    return digest.stdout.split()[0][:32] if digest.stdout else "unknown"
+    """Short content hash of the binary under test.
+
+    Computed in-process rather than by shelling out: `shasum` is a macOS/Perl
+    utility and does not exist on Linux, so the runner could not produce a
+    report when executed on a Linux host.
+    """
+    try:
+        digest = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
+    except OSError:
+        return "unknown"
+    return digest[:32]
 
 
 def tool_version(command: list[str], first_line: bool = True) -> str:
@@ -579,7 +613,7 @@ def build_methods(args: argparse.Namespace, route: str, workload: str,
 
     methods: dict[str, list[str]] = {}
     if route == "ssh":
-        # destination is already a "host:/path" argument for this route.
+        # For push, `destination` is a "host:/path"; for pull, `source` is.
         methods["rsync-a"] = rsync + [f"{source}/", f"{destination}/"]
         methods["xsync"] = xsync + ["--transport=xsync", "-e", str(wrapper),
                                     f"{source}/", f"{destination}/"]
@@ -692,7 +726,22 @@ def run_cell(args: argparse.Namespace, klass: str, workload: str, route: str,
             "real-corpus mutation workloads are currently local-route only; "
             "remote destination mutation is not enabled"
         )
-    if route == "ssh":
+    if route == "ssh" and args.pull_source and workload != "initial-copy":
+        raise CellFailure(
+            "--pull-source currently supports only initial-copy; destination "
+            "mutation states for a pulled corpus are not implemented"
+        )
+    if route == "ssh" and args.pull_source:
+        # Reversed direction: the remote is the source, the destination local.
+        # Verification therefore runs locally against the same pinned manifest,
+        # which is only valid because the remote copy is asserted identical to
+        # the corpus below.
+        remote_dest = None
+        remote_manifest = None
+        source = f"{args.ssh_host}:{args.pull_source}"
+        destination = destination_root / f"dest-{label}"
+        xsync_wrapper = write_ssh_wrapper(wrapper_dir, args.remote_bin_dir)
+    elif route == "ssh":
         remote_dest = f"{args.ssh_destination}/dest-{label}"
         destination = f"{args.ssh_host}:{remote_dest}"
         xsync_wrapper = write_ssh_wrapper(wrapper_dir, args.remote_bin_dir)
@@ -709,7 +758,13 @@ def run_cell(args: argparse.Namespace, klass: str, workload: str, route: str,
         destination = destination_root / f"dest-{label}"
 
     probe = build_methods(args, route, workload, source, destination, xsync_wrapper)
-    names = list(probe.keys())
+    skipped = {name.strip() for name in args.skip_methods.split(",") if name.strip()}
+    unknown = skipped - set(probe)
+    if unknown:
+        raise CellFailure(f"--skip-methods names no such method: {sorted(unknown)}")
+    names = [name for name in probe if name not in skipped]
+    if "rsync-a" not in names:
+        raise CellFailure("the rsync-a baseline cannot be skipped; it anchors every ratio")
 
     schedule_path = output_root / f"schedule-{label}.json"
     schedule_result = subprocess.run(
@@ -742,7 +797,15 @@ def run_cell(args: argparse.Namespace, klass: str, workload: str, route: str,
             else:
                 wrapper = rsync_wrapper if name.startswith("rsync") else xsync_wrapper
             commands = build_methods(args, route, workload, source, destination, wrapper)
-            if route == "ssh":
+            if route == "ssh" and args.pull_source:
+                # A pulled corpus has no local template to restore; initial-copy
+                # only needs an empty destination.
+                seed_started = time.monotonic()
+                if destination.exists():
+                    shutil.rmtree(destination)
+                destination.mkdir(parents=True, exist_ok=True)
+                seed_seconds = time.monotonic() - seed_started
+            elif route == "ssh":
                 seed_seconds = seed_destination_ssh(
                     run_root, args.ssh_host, remote_dest, workload
                 )
@@ -767,7 +830,13 @@ def run_cell(args: argparse.Namespace, klass: str, workload: str, route: str,
                 raise CellFailure(
                     f"{name} exited {measured['returncode']}: {measured['stderr'][-1500:]}"
                 )
-            if route == "ssh":
+            if route == "ssh" and args.pull_source:
+                verification_sample = None if repetition == 0 else args.verify_sample
+                oracle, verify_seconds = verify(
+                    args.bench, destination, manifest,
+                    verification_sample, args.verify_seed,
+                )
+            elif route == "ssh":
                 verification_sample = None if repetition == 0 else args.verify_sample
                 oracle, verify_seconds = verify_ssh(
                     args.ssh_host, remote_dest, remote_manifest, args.remote_bench,
@@ -813,7 +882,10 @@ def run_cell(args: argparse.Namespace, klass: str, workload: str, route: str,
                 "mutation_selection": mutation_selection,
             })
 
-    if route == "ssh":
+    if route == "ssh" and args.pull_source:
+        if isinstance(destination, Path) and destination.exists():
+            shutil.rmtree(destination)
+    elif route == "ssh":
         remote_run(args.ssh_host, f"rm -rf {shlex.quote(remote_dest)}", check=False)
     elif destination.exists():
         shutil.rmtree(destination)
@@ -860,6 +932,7 @@ def run_cell(args: argparse.Namespace, klass: str, workload: str, route: str,
                 f"class={klass} tier={args.tier} workload={workload} seed={args.seed}"
             ),
         },
+        "skipped_methods": sorted(skipped),
         "tools": [
             {"name": "xsync", "version": tool_version([str(args.xsync), "--version"]),
              "command": "xsync --progress-json SRC/ DEST/"},
@@ -955,9 +1028,20 @@ def parse_args() -> argparse.Namespace:
         default="initial-copy",
         help="workload for --corpus (mutation states affect only the destination)",
     )
-    parser.add_argument("--xsync", type=Path, default=REPO / "target/release/xsync")
+    parser.add_argument("--xsync", type=Path, default=REPO / "target/release/xs")
     parser.add_argument("--bench", type=Path, default=REPO / "target/release/xsync-bench")
     parser.add_argument("--rsync", default="rsync")
+    parser.add_argument(
+        "--skip-methods", default="",
+        help="comma-separated method names to exclude, e.g. xsync-rsync-transport. "
+             "Excluded methods are recorded in the report so the omission is visible.",
+    )
+    parser.add_argument(
+        "--pull-source",
+        help="ssh route: pull this path FROM --ssh-host into a local destination, "
+             "reversing the data direction. The remote path must hold content "
+             "identical to the selected corpus, which is verified before the run.",
+    )
     parser.add_argument("--ssh-host", help="user@host receiver for the ssh route")
     parser.add_argument("--ssh-destination", default="/tmp/xsync-release-bench",
                         help="remote directory that owns this run's destinations")
@@ -975,6 +1059,7 @@ def main() -> int:
     args = parse_args()
     if args.repetitions < 5:
         raise SystemExit("--repetitions must be at least 5 for a release gate")
+    assert_binary_is_current(args.xsync)
     args.out.mkdir(parents=True, exist_ok=True)
 
     registry = real_corpora()

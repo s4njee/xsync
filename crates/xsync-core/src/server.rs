@@ -35,9 +35,7 @@ use thiserror::Error;
 use crate::hash_cache::{HashCache, HashFingerprint};
 use crate::local::{LocalEvent, LocalSyncOptions, LocalSyncReport, TransferMethod};
 use crate::path::WirePath;
-use crate::planner::{
-    try_plan, try_plan_with_fingerprint, DestinationIndex, IndexConfig, PlannerError,
-};
+use crate::planner::{try_plan_with_fingerprint, DestinationIndex, IndexConfig, PlannerError};
 use crate::protocol::{
     common_capabilities, encode_frame, encode_frame_with_compression, negotiate_compression,
     negotiate_protocol_version, ByteRange, CompressionMode, EntryRecord, FrameDecoder, Message,
@@ -103,7 +101,10 @@ impl ServerError {
             Self::Io(_) | Self::Sink(_) | Self::SourceRead(_) | Self::Journal(_) => "io",
             Self::Scan(_) => "scan",
             Self::Planner(_) => "plan",
-            Self::InvalidPath(_) | Self::SymlinkEscape(_) | Self::DuplicatePath(_) => "path",
+            Self::InvalidPath(_)
+            | Self::SymlinkEscape(_)
+            | Self::DuplicatePath(_)
+            | Self::PathCollision(_) => "path",
             Self::RemoteError { .. } => "remote",
             Self::MissingRemoteXsync => "missing-remote-binary",
             Self::RemoteFlagRejected => "remote-flag-rejected",
@@ -130,6 +131,9 @@ pub enum ServerError {
     /// A planner error occurred.
     #[error("planner error: {0}")]
     Planner(#[from] PlannerError),
+    /// Two source paths would become one file on this destination.
+    #[error("{0}")]
+    PathCollision(String),
     /// A sink error occurred.
     #[error("sink error: {0}")]
     Sink(#[from] SinkError),
@@ -731,19 +735,16 @@ impl<R: Read, W: Write> BrowseSession<R, W> {
         fetched: FetchedFile,
     ) -> Result<V2Message, ServerError> {
         let bytes = fs::read(local_path).map_err(ServerError::Io)?;
-        if bytes.len() as u64 != fetched.size || *blake3::hash(&bytes).as_bytes() != fetched.digest
-        {
-            return Err(ServerError::UnexpectedMessage(
-                "local file no longer matches fetched identity".to_owned(),
-            ));
-        }
+        let content_size = bytes.len() as u64;
+        let content_digest = *blake3::hash(&bytes).as_bytes();
         let related_id = self.send(&V2Message::PublishRequest {
             path: remote_path,
             size: fetched.size,
             mtime_ns: fetched.mtime_ns,
             device: fetched.identity.device,
             file: fetched.identity.file,
-            digest: fetched.digest,
+            content_size,
+            digest: content_digest,
         })?;
         match self.receive()?.message {
             V2Message::PublishReady { related_id: id } if id == related_id => {
@@ -1327,7 +1328,7 @@ impl Server {
                     )
                 }
             }
-            Role::Source => self.run_source(&mut reader, &mut writer),
+            Role::Source => self.run_source(&mut reader, &mut writer, checksum),
             Role::Session => unreachable!("browse sessions return before sync dispatch"),
         }
     }
@@ -1470,6 +1471,7 @@ impl Server {
                     mtime_ns,
                     device,
                     file,
+                    content_size,
                     digest,
                 } => match self.browse_publish(
                     &path,
@@ -1478,6 +1480,7 @@ impl Server {
                     mtime_ns,
                     device,
                     file,
+                    content_size,
                     digest,
                     &incoming,
                     &mut pending,
@@ -1586,6 +1589,7 @@ impl Server {
         mtime_ns: i64,
         device: u64,
         file: u64,
+        content_size: u64,
         digest: [u8; 32],
         incoming: &mpsc::Receiver<Result<Option<V2Frame>, V2CodecError>>,
         pending: &mut VecDeque<V2Frame>,
@@ -1625,7 +1629,7 @@ impl Server {
 
         let mut bytes = Vec::new();
         let mut offset = 0_u64;
-        while offset < size {
+        while offset < content_size {
             let frame = if let Some(frame) = pending.pop_front() {
                 frame
             } else {
@@ -1644,7 +1648,7 @@ impl Server {
                     data,
                 } if id == related_id && chunk_offset == offset => {
                     offset = offset.saturating_add(data.len() as u64);
-                    if offset > size {
+                    if offset > content_size {
                         return Ok(publish_error_response(
                             related_id,
                             "publish exceeded advertised size",
@@ -1682,13 +1686,13 @@ impl Server {
         let entry = FileEntry {
             path: relative,
             kind: ScanEntryKind::File,
-            size,
+            size: content_size,
             mtime: nanos_to_system_time(mtime_ns),
             mode: permission_mode(&metadata),
             fingerprint: SourceFingerprint {
                 identity: FileIdentity { device, file },
                 kind: ScanEntryKind::File,
-                size,
+                size: content_size,
                 mtime: nanos_to_system_time(mtime_ns),
                 ctime: None,
             },
@@ -2866,6 +2870,7 @@ impl Server {
         &mut self,
         reader: &mut R,
         writer: &mut W,
+        checksum: bool,
     ) -> Result<(), ServerError> {
         // Source scan phase: scan source root and stream Scan frames to client.
         let mut entries = Vec::new();
@@ -2883,10 +2888,17 @@ impl Server {
                     fingerprint: [0u8; 32],
                 });
             }
+            let hash_cache = checksum
+                .then(|| HashCache::open(HashCache::default_path()).ok())
+                .flatten();
             let scan_result = scan(&self.root)?;
             for item in scan_result.entries() {
                 let entry = item?;
-                entries.push(entry_record_from_file_entry(&entry));
+                entries.push(if checksum {
+                    content_entry_record(&self.root, &entry, hash_cache.as_ref())?
+                } else {
+                    entry_record_from_file_entry(&entry)
+                });
             }
             scan_result.finish()?;
         }
@@ -3191,6 +3203,135 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
 pub const MAX_PIPELINED_FRAMES: usize = 256;
 
 /// Read acknowledgements until at most `limit` frames remain outstanding.
+/// Send small files as coalesced, pipelined batches.
+///
+/// Extracted so the single-stream and multi-stream paths cannot drift again.
+/// They already had: the multi-stream path sent every small file as its own
+/// one-entry `FileBatch` plus one `FileSegment`, each followed by a blocking
+/// ack — two synchronous round trips per file, which cost 12x on a 1.3 ms link
+/// (congress-1k: 4.42 s against single-stream's 0.35 s).
+///
+/// Files are coalesced up to `BATCH_TARGET_SIZE` / `MAX_BATCH_FILES`, and their
+/// segments are written without stopping for each acknowledgement.
+///
+/// # Errors
+///
+/// Returns a transport or remote error; individual file read failures are
+/// reported through `emit` and counted, not propagated.
+#[allow(clippy::too_many_arguments)]
+fn send_small_files_batched<R: Read, W: Write, F: FnMut(LocalEvent)>(
+    writer: &mut W,
+    reader: &mut R,
+    decoder: &mut FrameDecoder,
+    source_reader: &SourceReader,
+    small_files: &[FileEntry],
+    prefix: &str,
+    compress: bool,
+    level: i32,
+    next_id: &mut dyn FnMut() -> u64,
+    report: &mut LocalSyncReport,
+    emit: &mut F,
+) -> Result<(), ServerError> {
+    let mut cursor = 0usize;
+    while cursor < small_files.len() {
+        let mut loaded: Vec<(&FileEntry, Vec<u8>)> = Vec::new();
+        let mut batch_bytes = 0u64;
+        while cursor < small_files.len()
+            && loaded.len() < MAX_BATCH_FILES
+            && (loaded.is_empty()
+                || batch_bytes.saturating_add(small_files[cursor].size) <= BATCH_TARGET_SIZE)
+        {
+            let file = &small_files[cursor];
+            cursor += 1;
+            let mut file_to_read = file.clone();
+            if !prefix.is_empty() {
+                file_to_read.path = file
+                    .path
+                    .strip_prefix(format!("{prefix}/"))
+                    .unwrap_or_else(|| file.path.clone())
+                    .clone();
+            }
+            // Read before the file is announced, so a read failure never leaves
+            // the receiver waiting for a segment that never arrives.
+            match source_reader.read(&file_to_read) {
+                Ok(stable) => {
+                    batch_bytes = batch_bytes.saturating_add(file.size);
+                    loaded.push((file, stable.bytes));
+                }
+                Err(err) => {
+                    emit(LocalEvent::Failed {
+                        path: file.path.to_string(),
+                        message: err.to_string(),
+                    });
+                    report.failed_entries = report.failed_entries.saturating_add(1);
+                }
+            }
+        }
+        if loaded.is_empty() {
+            continue;
+        }
+
+        let transferred: Vec<(String, u64)> = loaded
+            .iter()
+            .map(|(file, _)| (file.path.to_string(), file.size))
+            .collect();
+        let entries = loaded
+            .iter()
+            .map(|(file, _)| {
+                let mut rec = entry_record_from_file_entry(file);
+                rec.path = file.path.as_bytes().to_vec();
+                rec
+            })
+            .collect();
+
+        let batch_id = next_id();
+        let bytes = encode_frame(
+            batch_id,
+            &Message::FileBatch {
+                batch_id: 1,
+                entries,
+            },
+        )?;
+        writer.write_all(&bytes)?;
+        let mut outstanding = 1usize;
+
+        for (index, (_, data)) in loaded.into_iter().enumerate() {
+            // The receiver derives the same identity from the batch frame's
+            // message ID and the entry's position within it.
+            let file_id = (batch_id << 16) | index as u64;
+            let seg_msg = Message::FileSegment {
+                file_id,
+                offset: 0,
+                data,
+            };
+            let msg_id = next_id();
+            let wire_bytes = write_data_frame(writer, msg_id, &seg_msg, compress, level)?;
+            report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
+            outstanding += 1;
+            if outstanding >= MAX_PIPELINED_FRAMES {
+                writer.flush()?;
+                drain_acks(decoder, reader, &mut outstanding, MAX_PIPELINED_FRAMES / 2)?;
+            }
+        }
+        writer.flush()?;
+        drain_acks(decoder, reader, &mut outstanding, 0)?;
+
+        for (path, size) in transferred {
+            report.transferred_files = report.transferred_files.saturating_add(1);
+            report.transferred_bytes = report.transferred_bytes.saturating_add(size);
+            report.physical_bytes = report.physical_bytes.saturating_add(size);
+            report.byte_copies = report.byte_copies.saturating_add(1);
+            emit(LocalEvent::Transferred {
+                path,
+                bytes: size,
+                physical_bytes: size,
+                method: TransferMethod::ByteCopy,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn drain_acks<R: Read>(
     decoder: &mut FrameDecoder,
     reader: &mut R,
@@ -3480,6 +3621,24 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         started: true,
     });
     let plan = try_plan_with_fingerprint(mapped_source, dest_index, options.checksum)?;
+    // The push source is local, so the same sparse inspection applies: a remote
+    // destination will be asked to hold the apparent size, not the allocated one.
+    let dropped;
+    {
+        let transferable: Vec<FileEntry> = plan
+            .files
+            .new
+            .iter()
+            .chain(&plan.files.changed)
+            .cloned()
+            .collect();
+        // Ownership is deliberately not probed on this route: the destination
+        // is another host, where uids mean something different, so comparing
+        // them would produce a warning that cannot be acted on.
+        let preflight = crate::sparse::inspect(&transferable, source_path, None);
+        crate::local::report_preflight(&preflight, false, &mut emit);
+        dropped = preflight.dropped;
+    }
     emit(LocalEvent::Phase {
         name: "plan",
         started: false,
@@ -3602,125 +3761,30 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         // Transfer files.
         let source_reader = SourceReader::new(&source_reader_root);
 
-        // Small files are coalesced and pipelined: one metadata frame describes
-        // many files, and their segments are written without stopping for each
-        // acknowledgement. This removes the two serialized round trips per file
-        // that previously dominated small-file transfers over a real link.
-        let small_files: Vec<&FileEntry> = plan
+        // Small files are coalesced and pipelined by the shared sender: one
+        // metadata frame describes many files, and their segments are written
+        // without stopping for each acknowledgement.
+        let small_files: Vec<FileEntry> = plan
             .files
             .new
             .iter()
             .chain(&plan.files.changed)
             .filter(|file| file.size <= SMALL_FILE_LIMIT)
+            .cloned()
             .collect();
-        let mut cursor = 0usize;
-        while cursor < small_files.len() {
-            let mut loaded: Vec<(&FileEntry, Vec<u8>)> = Vec::new();
-            let mut batch_bytes = 0u64;
-            while cursor < small_files.len()
-                && loaded.len() < MAX_BATCH_FILES
-                && (loaded.is_empty()
-                    || batch_bytes.saturating_add(small_files[cursor].size) <= BATCH_TARGET_SIZE)
-            {
-                let file = small_files[cursor];
-                cursor += 1;
-                let mut file_to_read = file.clone();
-                if !prefix.is_empty() {
-                    file_to_read.path = file
-                        .path
-                        .strip_prefix(format!("{prefix}/"))
-                        .unwrap_or_else(|| file.path.clone())
-                        .clone();
-                }
-                // Read before the file is announced, so a read failure never
-                // leaves the receiver waiting for a segment that never arrives.
-                match source_reader.read(&file_to_read) {
-                    Ok(stable) => {
-                        batch_bytes = batch_bytes.saturating_add(file.size);
-                        loaded.push((file, stable.bytes));
-                    }
-                    Err(err) => {
-                        emit(LocalEvent::Failed {
-                            path: file.path.to_string(),
-                            message: err.to_string(),
-                        });
-                        report.failed_entries = report.failed_entries.saturating_add(1);
-                    }
-                }
-            }
-            if loaded.is_empty() {
-                continue;
-            }
-
-            let transferred: Vec<(String, u64)> = loaded
-                .iter()
-                .map(|(file, _)| (file.path.to_string(), file.size))
-                .collect();
-            let entries = loaded
-                .iter()
-                .map(|(file, _)| {
-                    let mut rec = entry_record_from_file_entry(file);
-                    rec.path = file.path.as_bytes().to_vec();
-                    rec
-                })
-                .collect();
-
-            let batch_id = alloc_id();
-            let bytes = encode_frame(
-                batch_id,
-                &Message::FileBatch {
-                    batch_id: 1,
-                    entries,
-                },
-            )?;
-            writer.write_all(&bytes)?;
-            let mut outstanding = 1usize;
-
-            for (index, (_, data)) in loaded.into_iter().enumerate() {
-                // The receiver derives the same identity from the batch frame's
-                // message ID and the entry's position within it.
-                let file_id = (batch_id << 16) | index as u64;
-                let seg_msg = Message::FileSegment {
-                    file_id,
-                    offset: 0,
-                    data,
-                };
-                let msg_id = alloc_id();
-                let wire_bytes = write_data_frame(
-                    &mut writer,
-                    msg_id,
-                    &seg_msg,
-                    negotiated_compression == CompressionMode::Zstd,
-                    negotiated_level,
-                )?;
-                report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
-                outstanding += 1;
-                if outstanding >= MAX_PIPELINED_FRAMES {
-                    writer.flush()?;
-                    drain_acks(
-                        &mut decoder,
-                        &mut reader,
-                        &mut outstanding,
-                        MAX_PIPELINED_FRAMES / 2,
-                    )?;
-                }
-            }
-            writer.flush()?;
-            drain_acks(&mut decoder, &mut reader, &mut outstanding, 0)?;
-
-            for (path, size) in transferred {
-                report.transferred_files = report.transferred_files.saturating_add(1);
-                report.transferred_bytes = report.transferred_bytes.saturating_add(size);
-                report.physical_bytes = report.physical_bytes.saturating_add(size);
-                report.byte_copies = report.byte_copies.saturating_add(1);
-                emit(LocalEvent::Transferred {
-                    path,
-                    bytes: size,
-                    physical_bytes: size,
-                    method: TransferMethod::ByteCopy,
-                });
-            }
-        }
+        send_small_files_batched(
+            &mut writer,
+            &mut reader,
+            &mut decoder,
+            &source_reader,
+            &small_files,
+            &prefix,
+            negotiated_compression == CompressionMode::Zstd,
+            negotiated_level,
+            &mut alloc_id,
+            &mut report,
+            &mut emit,
+        )?;
 
         for file in plan.files.new.iter().chain(&plan.files.changed) {
             if file.size <= SMALL_FILE_LIMIT {
@@ -4114,6 +4178,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     report.checkpoint_bytes = checkpoint_bytes_total;
 
     emit(LocalEvent::Finished {
+        dropped_metadata: dropped,
         transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
@@ -4254,7 +4319,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         chunk_bytes: 16 * 1024 * 1024,
         window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
         delete: options.delete,
-        checksum: false,
+        checksum: true,
         paranoid: options.paranoid,
         dry_run: options.dry_run,
         exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
@@ -4344,14 +4409,25 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         memory_budget_bytes: 32 * 1024 * 1024,
         temp_root: std::env::temp_dir(),
     })?;
+    let destination_hash_cache = HashCache::open(HashCache::default_path()).ok();
+    let mut destination_entries = Vec::new();
     if dest_path.exists() {
         if let Ok(dest_scan) = scan(dest_path) {
             for item in dest_scan.entries() {
-                if let Ok(entry) = item {
+                if let Ok(mut entry) = item {
                     if !excluded_path(
                         &encode_exclude_patterns(&options.exclude_patterns),
                         &entry.path,
                     ) {
+                        if entry.kind == ScanEntryKind::File {
+                            let native = entry.path.to_native_path(dest_path);
+                            entry.fingerprint.identity = cached_content_identity(
+                                &native,
+                                &entry,
+                                destination_hash_cache.as_ref(),
+                            )?;
+                        }
+                        destination_entries.push(entry.clone());
                         dest_index.insert(entry)?;
                     }
                 }
@@ -4389,7 +4465,65 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         name: "plan",
         started: true,
     });
-    let plan = try_plan(mapped_source, dest_index)?;
+    // The pull destination is local, so the same probe the local engine uses
+    // applies: two remote paths can name one file here.
+    let (mapped_source, collision_failures) = crate::local::enforce_path_collisions(
+        mapped_source,
+        dest_path,
+        options.on_path_collision,
+        &mut emit,
+    )
+    .map_err(|error| ServerError::PathCollision(error.to_string()))?;
+    let mut plan = try_plan_with_fingerprint(mapped_source, dest_index, true)?;
+    // A content-identical file at another destination path is a rename, not a
+    // new transfer. Apply the local rename before the transfer phase and leave
+    // the old name out of the destination tree without reading remote bytes.
+    let mut destination_by_identity: HashMap<(u64, u64), WirePath> = HashMap::new();
+    for entry in destination_entries {
+        if entry.kind == ScanEntryKind::File {
+            destination_by_identity.insert(
+                (
+                    entry.fingerprint.identity.device,
+                    entry.fingerprint.identity.file,
+                ),
+                entry.path,
+            );
+        }
+    }
+    let mut renamed = Vec::new();
+    for entry in plan.files.new.clone() {
+        let identity = (
+            entry.fingerprint.identity.device,
+            entry.fingerprint.identity.file,
+        );
+        let Some(old_path) = destination_by_identity.get(&identity) else {
+            continue;
+        };
+        if old_path == &entry.path {
+            continue;
+        }
+        let old_native = old_path.to_native_path(dest_path);
+        let new_native = entry.path.to_native_path(dest_path);
+        if !old_native.exists() || new_native.exists() {
+            continue;
+        }
+        if let Some(parent) = new_native.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&old_native, &new_native)?;
+        renamed.push(entry.path.clone());
+    }
+    if !renamed.is_empty() {
+        plan.files
+            .new
+            .retain(|entry| !renamed.contains(&entry.path));
+        for path in renamed {
+            emit(LocalEvent::Skipped {
+                path: path.to_string(),
+                bytes: 0,
+            });
+        }
+    }
     emit(LocalEvent::Phase {
         name: "plan",
         started: false,
@@ -4398,6 +4532,8 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     let mut report = LocalSyncReport {
         local_workers: options.local_workers,
         streams: options.streams,
+        failed_entries: collision_failures,
+        partial_work: collision_failures > 0,
         ..LocalSyncReport::default()
     };
     report.skipped_files = plan.files.unchanged.len();
@@ -4934,6 +5070,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     report.checkpoint_bytes = checkpoint_bytes_total;
 
     emit(LocalEvent::Finished {
+        dropped_metadata: crate::sparse::DroppedMetadata::default(),
         transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
@@ -5415,6 +5552,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             let _ = handle.join();
         }
         emit(LocalEvent::Finished {
+            dropped_metadata: crate::sparse::DroppedMetadata::default(),
             transport: None,
             transferred_files: 0,
             transferred_bytes: 0,
@@ -5544,64 +5682,24 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     }
 
     // Control: write small/medium files.
-    for file in &small_files {
-        let file_to_read = if prefix.is_empty() {
-            file.clone()
-        } else {
-            let mut f = file.clone();
-            f.path = file
-                .path
-                .strip_prefix(format!("{prefix}/"))
-                .unwrap_or_else(|| file.path.clone())
-                .clone();
-            f
-        };
-        let stable = match source_reader.read(&file_to_read) {
-            Ok(s) => s,
-            Err(err) => {
-                emit(LocalEvent::Failed {
-                    path: file.path.to_string(),
-                    message: err.to_string(),
-                });
-                report.failed_entries = report.failed_entries.saturating_add(1);
-                continue;
-            }
-        };
-        let mut rec = entry_record_from_file_entry(file);
-        rec.path = file.path.as_bytes().to_vec();
-        let batch_id = calloc();
-        write_frame(
-            &mut cwriter,
-            batch_id,
-            &Message::FileBatch {
-                batch_id: 1,
-                entries: vec![rec],
-            },
-        )?;
-        expect_ack(&mut cdec, &mut creader)?;
-        let sfile_id = (batch_id << 16) | 0;
-        write_frame(
-            &mut cwriter,
-            calloc(),
-            &Message::FileSegment {
-                file_id: sfile_id,
-                offset: 0,
-                data: stable.bytes,
-            },
-        )?;
-        expect_ack(&mut cdec, &mut creader)?;
-
-        report.transferred_files = report.transferred_files.saturating_add(1);
-        report.transferred_bytes = report.transferred_bytes.saturating_add(file.size);
-        report.physical_bytes = report.physical_bytes.saturating_add(file.size);
-        report.byte_copies = report.byte_copies.saturating_add(1);
-        emit(LocalEvent::Transferred {
-            path: file.path.to_string(),
-            bytes: file.size,
-            physical_bytes: file.size,
-            method: TransferMethod::ByteCopy,
-        });
-    }
+    //
+    // These go through the same coalescing, pipelined sender the single-stream
+    // path uses. Sending them one at a time with a blocking ack after each
+    // frame was the entire `--streams` regression on small-file corpora; the
+    // data sessions below never carried them and still do not.
+    send_small_files_batched(
+        &mut cwriter,
+        &mut creader,
+        &mut cdec,
+        &source_reader,
+        &small_files,
+        &prefix,
+        false,
+        options.compress_level,
+        &mut calloc,
+        &mut report,
+        &mut emit,
+    )?;
 
     // ---- Partition large-file missing ranges across data sessions ----
     let chunk = 8 * 1024 * 1024u64;
@@ -5635,7 +5733,11 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         .collect();
 
     // ---- Spawn data threads ----
-    let source_path_buf = source_path.to_path_buf();
+    // The data threads resolve each entry's relative path against this root.
+    // Passing the raw `source_path` produced `<file>/<file>` for a single-file
+    // source, because that path is already the file rather than its directory —
+    // every `--streams N > 1` transfer of one file failed on it.
+    let source_path_buf = source_reader_root.clone();
     let data_threads = {
         let dest = dest_path.to_owned();
         let job_id_copy = job_id;
@@ -5884,6 +5986,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     }
 
     emit(LocalEvent::Finished {
+        dropped_metadata: crate::sparse::DroppedMetadata::default(),
         transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
@@ -7259,7 +7362,8 @@ mod tests {
         let metadata = fs::symlink_metadata(&path).unwrap();
         let mtime = metadata.modified().unwrap();
         let fingerprint = fingerprint_from_metadata(&metadata, ScanEntryKind::File, mtime).unwrap();
-        let digest = *blake3::hash(b"new").as_bytes();
+        let replacement = b"new content";
+        let digest = *blake3::hash(replacement).as_bytes();
         let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
         let handshake = Message::Handshake {
             role: Role::Session,
@@ -7281,6 +7385,7 @@ mod tests {
                     mtime_ns: system_time_to_nanos(mtime),
                     device: fingerprint.identity.device,
                     file: fingerprint.identity.file,
+                    content_size: replacement.len() as u64,
                     digest,
                 },
             )
@@ -7292,7 +7397,7 @@ mod tests {
                 &V2Message::PublishChunk {
                     related_id: 2,
                     offset: 0,
-                    data: b"new".to_vec(),
+                    data: replacement.to_vec(),
                 },
             )
             .unwrap(),
@@ -7301,7 +7406,7 @@ mod tests {
         Server::new(temp.path())
             .run(Cursor::new(input), &mut output)
             .unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::read(&path).unwrap(), replacement);
         let mut v1 = FrameDecoder::new();
         let mut cursor = Cursor::new(output);
         v1.read(&mut cursor).unwrap();

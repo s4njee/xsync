@@ -155,7 +155,7 @@ never enters the v1 sync state machine.
 | 29 | FetchRequest | path |
 | 30 | FetchStart | related request ID `u64`, size `u64`, mtime ns `i64`, device `u64`, file `u64`, BLAKE3 digest `[32]` |
 | 31 | FetchChunk | related request ID `u64`, offset `u64`, data |
-| 32 | PublishRequest | path, fetched size `u64`, fetched mtime ns `i64`, fetched device `u64`, fetched file `u64`, fetched digest `[32]` |
+| 32 | PublishRequest | path, fetched size `u64`, fetched mtime ns `i64`, fetched device `u64`, fetched file `u64`, replacement size `u64`, replacement digest `[32]` |
 | 33 | PublishReady | related request ID `u64` |
 | 34 | PublishChunk | related request ID `u64`, offset `u64`, data |
 | 35 | PublishResponse | related request ID `u64`, publish status `u8`, current identity, error message |
@@ -218,7 +218,8 @@ final response or a `BrowseError` with the cancellation code.
   MiB. The start metadata and digest describe the exact bytes in those chunks;
   a failed stable read is a request-scoped error and sends no data.
 - `PublishRequest` is accepted only when the target's current size, mtime, and
-  filesystem identity equal the fetched identity. A mismatch returns status
+  filesystem identity equal the fetched identity. Replacement size and digest are independent of
+  that identity, so an edit may change both file length and content. A mismatch returns status
   `changed` and the current identity, including an explicit absent identity.
   Status values are `0 ok`, `1 changed`, and `2 error`. After `PublishReady`,
   ordered chunks are verified by size and BLAKE3, staged through the sink's

@@ -383,6 +383,10 @@ should use, not a second magic number.
 - The server performs identity preflight and a second identity check before committing through the
   existing sink staging and atomic rename path. Existing remote content remains visible until the
   verified replacement is ready.
+- Corrected the type-32 layout on 2026-08-28 after the embedding client proved that the original
+  request reused fetched size/digest as the incoming payload contract, making every content- or
+  length-changing edit impossible. Fetched identity and replacement size/digest are now separate,
+  with a shared Rust/Swift conformance vector and a length-changing server acceptance test.
 - Added codec and end-to-end coverage for matching publication, current-identity reporting, digest
   validation, and atomic replacement.
 
@@ -433,6 +437,10 @@ should use, not a second magic number.
   after the atomic `mv`, is repeatable, and cleans interrupted temporary uploads. The remote needs
   only SSH, checksum, basic file utilities, and execute permission; no compiler, package manager, or
   root is required.
+- Added `scripts/ensure-linux-agent.sh`, used by the three-host verifier's `--stage` mode. It hashes
+  the required target binary and the installed agent, leaves an identical install untouched, and
+  automatically invokes the atomic verified staging path when the agent is missing or stale. This
+  catches same-version development builds whose wire revision differs, not merely version strings.
 - Added [`docs/linux-staging.md`](docs/linux-staging.md) with the three benchmark-host mapping,
   commands, prerequisites, and failure-safety contract.
 
@@ -451,6 +459,15 @@ should use, not a second magic number.
   SSH key. The three-host staging proof cannot be completed until credentials/network access to the
   ext2/3 and aarch64/ext4 hosts are restored. `scripts/verify-linux-staging.sh` records all host
   results and continues instead of stopping at the first blocker.
+
+**Verification 2026-08-28:**
+- `scripts/verify-linux-staging.sh` passed both GNU cross-builds and reached the required x86_64/ZFS
+  (`freya.local`) and x86_64/ext2/3 (`192.168.1.119`) hosts. The aarch64/ext4 host
+  (`gentoo-rpi5.local`) did not resolve, so the story remains partial.
+- `scripts/ensure-linux-agent.sh` then detected stale hashes on both reachable hosts after the
+  type-32 protocol correction, atomically installed SHA-256 `467fc7ee…e4de9`, and reported both
+  agents current on a second run. The ARM64 hostname still did not resolve and no alternate
+  reachable aarch64 LAN host was discoverable, leaving that single physical-host proof open.
 
 ### Story 13.3 — Connection model for a browsing client
 - [x] Revisit Story 4.3's connection-model decision for a client that holds a session open for hours
@@ -532,10 +549,13 @@ incompatible "v2"s a month apart — is not caught by any test either project wo
   xsync v2 server/codec tests and the real f2 Swift protocol suite first, then checks that f2 exposes
   the message cases needed for rename, mkdir, delete, fetch, and publish. Failures are labelled
   `[xsync]` or `[f2]`; an incomplete consumer is reported as a blocker rather than a false pass.
+- Reverified 2026-08-28 after f2 A12.7: the Swift client now exposes callable fetch and publish
+  operations as well as mutation, and the live Rust/Swift acceptance tests cover list, mutation,
+  fetch, CAS publish, disconnect, and conflict refusal. The surface-presence gate therefore no
+  longer reports `client:fetch client:publish`.
 
 **Blocker:**
-- The checked-out f2 client currently implements only v2 message types 14–21 (list/stat/cancel/
-  keepalive). It has no client cases for types 22–35, so a real f2 client cannot yet execute the
-  required mutate/fetch/publish steps against xsync. The command still runs both conformance suites
-  and exits with a named f2 blocker; continue with other stories and rerun after f2 lands those
-  operations.
+- The single command still stops after its conformance and client-surface gates; it tells the
+  operator to invoke f2's host-backed runner instead of invoking that runner itself. Story 14.3
+  remains partial until `joint-smoke.sh` performs the complete live sequence against a selected
+  benchmark host and labels any failure by side.

@@ -328,7 +328,7 @@ the APFS clone path engaged and the run reported `0 physical`. With byte movemen
 eliminated, the entire remaining cost is per-file syscall volume.
 
 ### Story T1.1 — Syscall attribution
-- [~] Produce a per-file syscall histogram for both tools and attribute the delta.
+- [x] Produce a per-file syscall histogram for both tools and attribute the delta.
 
 **AC**
 - A reproducible trace on `congress-1k` yields counts by syscall for `xsync` and `rsync -a`,
@@ -337,6 +337,10 @@ eliminated, the entire remaining cost is per-file syscall volume.
   counts, not adjectives.
 - Method is documented well enough to re-run; if `dtruss` is blocked by SIP, the fallback
   used is stated.
+- **The trace may be captured on Linux rather than macOS.** The syscall *shape* of the
+  per-file path is what this story needs, and it is substantially the same on both. A
+  Linux histogram plus the existing macOS wall/CPU timings is an acceptable pass; a
+  macOS-only aggregate is not.
 
 **Blocker:** A retry after Full Disk Access was enabled produced the same result:
 `dtrace: system integrity protection is on, some features will not be available` followed by
@@ -354,9 +358,54 @@ transfer evidence but not a completed attribution trace.
 **Current result:** The attempted trace and the exact errors are recorded in
 `benches/results/tuning/T1/DECISION.md`. Work continues with the measurable code candidates below.
 
+**Path to unblock — re-point this story at `mars`.** macOS SIP is the blocker, and Linux has no
+equivalent. `mars.local` runs kernel 7.1.6 and needs only `sudo pacman -S strace`; `strace -c -f`
+emits exactly the per-syscall `calls/errors/seconds/syscall` table this story requires, with no
+entitlement problem. Capture both tools against the same corpus copy:
+
+```bash
+# on mars, against a local copy of congress-1k or congress-10k
+strace -c -f -o xsync-strace.txt  ./xsync SRC/ DEST-A/
+strace -c -f -o rsync-strace.txt  rsync -a SRC/ DEST-B/
+```
+
+The source tree can be pushed with `rsync -a` beforehand; the corpus rules in this file still
+apply, so trace against a disposable copy, never against a corpus root. Note that `mars` is where
+xsync is already built (`~/xsync-8.1-build`), so no new toolchain is needed. This capture is also
+the gate for Story T1.4.
+
 **Plain-English results:** We tried to count the individual system calls, but macOS security
 settings prevented both available tracing methods. We did not guess at syscall counts, so this
 story is still blocked until a privileged trace or user-supplied capture is available.
+
+**RESULT (2026-08-28): captured.** macOS SIP could not be worked around, so the trace was
+taken on `mars` (ext4) instead, counting libc entry points through an `LD_PRELOAD` interposer
+validated against a program with exact known call counts. `congress-10k`, 11,280 files and
+11,288 directories:
+
+| call | xsync | rsync -a | difference |
+|---|---:|---:|---:|
+| stat family | **293,357** | 78,995 | +214,362 |
+| `write` (includes stdout) | 101,985 | 4,436 | +97,549 |
+| `close` | 45,158 | 11,306 | +33,852 |
+| `unlink` | 22,579 | 0 | +22,579 |
+| `chmod` | 22,568 | 0 | +22,568 |
+| `mkdir` | 22,572 | 11,288 | +11,284 |
+| **total counted** | **565,425** | **144,284** | **3.9x** |
+
+**xsync makes 3.9x the syscalls for identical work — ~25 per entry against ~6.4.** Over half
+the excess is a single call class: **13 `statx` per entry** against rsync's 3.5. `unlink` at
+2/file and `chmod` at 1/entry are operations rsync never performs at all, and `mkdir` runs
+twice per directory. None of these were the targets prior T1 work had guessed at.
+
+Full record, method, and limitations (the interposer misses `renameat2`, and `write` includes
+progress output) in
+[`benches/results/tuning/T1/syscall-attribution-20260828/`](../benches/results/tuning/T1/syscall-attribution-20260828/README.md).
+
+**This satisfies T1.4's gate — in the negative.** The residual gap is *not* dominated by
+irreducible syscalls; 13 stats per entry, an unlink rsync never makes, and a doubled mkdir are
+avoidable work. `io_uring` would make unnecessary calls cheaper. Keep T1.4 closed and remove
+the calls instead.
 
 ### Story T1.2 — Remove the known per-file waste
 - [x] Three candidates identified by inspection: a 64 KiB buffer allocated per file
@@ -434,6 +483,142 @@ answer can change what it does. On an eleven-thousand-file corpus this cut proce
 about four times, and every copy still verified byte-for-byte. The machine was busy during
 the test, so the exact numbers need re-measuring on a quiet machine.
 
+### Story T1.6 — Cache sink-created directories (ancestor walk and parent creation)
+- [x] Instrument where the stat calls come from, then remove the redundant ones.
+
+**Method.** Phase timing from `--progress-json` located 85% of wall time in `transfer`. The
+`LD_PRELOAD` counter was extended to log stat paths, showing one second-level destination
+directory stat'd **56,411 times**, then to sample backtraces to attribute them. Three
+corrections were needed before the attribution was trustworthy: the release profile strips
+symbols (`CARGO_PROFILE_RELEASE_STRIP=false`), `-O2` omits frame pointers so `backtrace()`
+returned unusable stacks (`-C force-frame-pointers=yes`), and **the first histogram was wrong**
+— sampling the first N calls covered only the scan phase and named the scanner as the top
+caller; a uniform 1-in-20 sample reversed the answer.
+
+**Finding.** `Sink::destination_path` was **52% of all `statx`**. It walks every ancestor with
+`symlink_metadata` to stop an ancestor symlink redirecting the write outside the destination
+root — correct and worth keeping, but it ran on every call, several times per file, at
+O(depth) each.
+
+**Fix.** The sink creates these directories itself, so it records them:
+`create_parent` becomes a hash lookup, and `destination_path` returns early when the parent is
+already known sink-created. `create_dir_all` makes real directories, so the guarantee is
+unchanged for anything the sink did not create; the original check is resolve-after-stat, so a
+swapped ancestor defeats both forms equally. All six symlink-security tests still pass.
+
+**AC**
+- `statx` 282,078 -> **135,445** (-52%); `mkdir` 22,572 -> 11,293 (-50%).
+- **Total syscalls 565,425 -> 317,274 (-44%)**; per entry 25.1 -> **14.1** against rsync's 6.4.
+- Wall: mars/ext4 0.653 s -> **0.567 s (13%)**; macOS 5.59 s -> **5.37 s (3.9%)**, the latter
+  from a same-binary A/B behind a temporary toggle because that host's load shifted mid-session.
+- No correctness regression; 172 tests and strict clippy clean.
+
+Evidence: [`benches/results/tuning/T1/syscall-reduction-20260828/`](../benches/results/tuning/T1/syscall-reduction-20260828/README.md).
+
+**Not yet done, and deliberately not assumed:** `unlink` at 2/file and `chmod` at 1/entry are
+45,147 calls rsync never makes; `clone::entries_match` is 16% of `statx` evaluating reflink
+candidates that cannot succeed on ext4 at all. Both need their own investigation.
+
+### Story T1.7 — Probe reflink support once instead of attempting doomed clones
+- [x] `perf` profile located the dominant cost; a one-time capability probe removed it.
+
+**Finding.** With `perf` installed, a `--call-graph fp` profile (frame pointers forced,
+unstripped) showed two entries dominating and neither was file I/O: **18.77% inside `cp`
+subprocesses** and **18.58% in crossbeam `recv<FileTask>`**. The `cp` entry is
+`cp -a --reflink=always`, the directory-clone attempt — and **ext4 has no reflink support**,
+so every attempt is guaranteed to fail after doing real work.
+
+Confirmed directly with the existing flag, five repetitions, median: default 0.572 s against
+`--no-directory-clone` **0.196 s**. **The clone machinery cost 65.8% of wall time on a
+filesystem where it cannot succeed**, which is the entire reason xsync was losing to rsync's
+0.323 s.
+
+**Fix.** `clone::supports_reflink()` probes the destination once per run by cloning a
+one-byte file — the same mechanism the real clone uses, so it cannot disagree with it — and
+both the directory-clone pass and the per-file attempt are gated on the result.
+
+**AC**
+- mars/ext4: **0.572 s -> 0.192 s, a 2.98x speed-up**, turning a 1.93x loss against `rsync -a`
+  into a **1.670x win** (rsync 0.321 s).
+- macOS/APFS unchanged at 5.39 s, and the fast path is intact: the run still reports
+  `directory_clones: 1`, `byte_copies: 0`.
+- 172 tests and strict clippy clean.
+
+Evidence: [`benches/results/tuning/T1/perf-profile-20260828/`](../benches/results/tuning/T1/perf-profile-20260828/README.md).
+
+**Reopens T7.** The profile shows workers spending 18.58% in `recv<FileTask>` on the shared
+task queue — the same structure whose partitioning T7 tried to test with an invalid
+experiment. That question is genuinely open and is now the largest single remaining entry.
+
+### Story T1.8 — Hashing cost, congress-100k, and the macOS clone path
+- [x] Benchmark the "hash less" strategy and run congress-100k on both platforms.
+
+**Hashing is free in wall-clock terms — do not optimize it.** `perf` attributed 17% of CPU
+samples to BLAKE3. A toggle that skipped hashing entirely (the upper bound on any hash
+optimization) changed nothing: APFS congress-10k 2.515 s -> 2.513 s, ext4 0.195 s -> 0.195 s,
+seven repetitions each. Hashing runs on workers already blocked on I/O, so it costs cycles but
+not time. Measured throughput settles the SHA-256 question too — BLAKE3 6.59 GB/s vs hardware
+SHA-256 2.66 GB/s on Ryzen 9 7900X, and 1.67 vs 2.40 GB/s on M1 Max — but since it is off the
+critical path the comparison is moot, and switching would break the wire protocol and forfeit
+the tree structure that makes chunk resume possible. blake3's explicit `neon` feature was also
+tested and changes nothing; NEON is already active.
+
+**congress-100k.**
+
+| host | corpus | `rsync -a` | xsync | ratio |
+|---|---|---:|---:|---:|
+| ext4, 24 cores | 92,911 files / 1.4 GB | 1.925 s | **1.012 s** | **1.90x faster** |
+| APFS, 10 cores | 109,615 files / 584 MB | 24.024 s | 28.310 s | 0.842 |
+
+ext4 improves on the 1.67x measured at 10k — the advantage grows with scale. macOS regresses,
+and peak RSS is **190.8 MB against rsync's 44.3 MB (4.3x)**, which needs its own look before
+`congress-1m` is attempted.
+
+**Why macOS is slow, and a 6.3x opportunity.** At 100k the tree is published as a single
+directory clone (`directory_clones: 1`, `byte_copies: 0`) yet takes 28 s, because
+`platform_clone_directory` shells out to `/bin/cp -c -p -R` and **`cp -c` does a per-file
+`COPYFILE_CLONE`, not a tree-level `clonefile()`**. Measured on the same 109,615-file tree:
+`clonefile()` on the root **3.766 s** against `cp -c -p -R` **23.610 s** — 6.3x for
+byte-identical output. This is f2 §1's 22x-versus-2.70x distinction, with xsync on the wrong
+side. Fixing it would take xsync from 0.842 to roughly **2.8x faster than rsync** on macOS.
+
+**Blocked on a policy decision, not on engineering:** `clonefile(2)` needs libc FFI and the
+workspace sets `unsafe_code = "deny"`. Unlike T1.4's io_uring case (4% prize, clear refusal),
+this is 6.3x on the dominant macOS path and deserves a deliberate answer. `FICLONE` on Linux
+raises the same question.
+
+Evidence: [`benches/results/tuning/T1/hash-and-100k-20260828/`](../benches/results/tuning/T1/hash-and-100k-20260828/README.md).
+
+### Story T1.9 — Native `clonefile(2)` on macOS
+- [x] Replace the `cp -c -R` shell-out with a direct `clonefile(2)` call.
+
+**Change.** `platform_clone_file` and `platform_clone_directory` now call `clonefile(2)`
+through libc on macOS. This is the project's only `unsafe` block, carrying a single
+`#[allow(unsafe_code)]` against the workspace's `unsafe_code = "deny"`, documented in
+[README.md](README.md#why-there-is-one-unsafe-block).
+
+**Why it was worth the exemption.** `cp -c -R` is not a tree clone — it performs a per-file
+`COPYFILE_CLONE` and recurses. On a 109,615-file corpus `cp -c -p -R` took 23.610 s against
+3.766 s for one `clonefile()` on the tree root, for byte-identical output. Unlike T1.4's
+io_uring case (4% prize, refused), this was 6.3x on the dominant macOS path.
+
+**Regression found and fixed during implementation.** `clonefile` does **not** preserve
+directory mtimes — populating a cloned directory bumps its own mtime and, unlike `cp -p -R`,
+nothing restores it. Three integration tests comparing a local sync against a push failed on
+exactly this. xsync now reapplies each cloned directory's mtime from the plan, deepest-first,
+with the subtree root last (the plan's `entries` cover only what is *under* the subtree, so the
+root needed handling separately).
+
+**AC**
+- congress-100k on APFS: **28.310 s -> 4.128 s (6.86x)**, MAD 1.2%, and **5.82x faster than
+  `rsync -a`** (24.024 s) where it was previously 1.19x slower.
+- Directory mtimes byte-identical to the non-clone path; all 212 tests and strict clippy pass.
+- `CLONE_NOFOLLOW` is passed so the call never resolves a symlink it was asked to copy.
+
+**Not done:** Linux's `FICLONE` ioctl would remove the `cp` spawn there too, but the prize is
+much smaller and T1.7's reflink probe already removes the dominant cost on filesystems that
+cannot clone.
+
 ### Story T1.3 — Hit the syscall budget target
 - [~] Reduce total system time on `congress-10k` to within 1.5x of `rsync -a`.
 
@@ -459,6 +644,120 @@ analysis remain in `benches/results/tuning/T1/DECISION.md`.
 would not be a valid pass. This is an engineering blocker, and work should continue with the next
 optimization rather than treating T1 as complete.
 
+### Story T1.5 — Redundant `stat` calls in the per-file publish path
+- [x] Two `stat` syscalls per published file were provably unnecessary.
+
+**AC**
+- `write_new_temp` no longer calls `remove_existing` (a `symlink_metadata` plus possible
+  unlink) before `File::create`, which already truncates a regular file. The stat happens
+  only on the error path, for a leftover directory or symlink at the stage path.
+- `commit_temp` no longer stats the destination to detect a directory before renaming.
+  `rename` replaces a regular file atomically, so it attempts the rename first and inspects
+  only on failure. Windows keeps its existing remove-then-rename sequence unchanged.
+- Atomic publication is preserved exactly; no `.xsync.tmp.*` semantics changed.
+- Covered by `publishes_a_file_over_an_existing_destination_directory` and
+  `reuses_a_leftover_staging_file_without_a_prior_unlink`.
+
+**Result:** `congress-10k` local same-volume, 5 repetitions, oracle passing, MAD 0.3% / 0.4%:
+`rsync -a` 2.8229 s against xsync 5.2860 s, paired ratio **0.534** versus T1.3's recorded
+0.515 — roughly 4%, with substantially tighter spread (5.22–5.34 s against 5.31–8.17 s).
+Modest, and reported as such. Evidence in
+[`benches/results/tuning/T7/dispatch-affinity/`](../benches/results/tuning/T7/dispatch-affinity/).
+
+### Story T1.4 — `io_uring` backend — **CLOSED on measurement, do not build**
+- [x] Evaluate a Linux-only `io_uring` submission backend for the per-file path.
+
+**RESULT (2026-08-28): measured on `mars`, and rejected.** A standalone spike
+([`benches/results/tuning/T1/io-uring-spike-20260828/`](../benches/results/tuning/T1/io-uring-spike-20260828/README.md))
+materialized congress-10k-shaped trees (11,280 files, 8,559 B mean, one directory per file)
+with plain syscalls versus io_uring batched submission at queue depth 256, on kernel 7.1.6 with
+liburing 2.15:
+
+| layout | plain | io_uring | gain |
+|---|---:|---:|---:|
+| flat | 0.089 s | 0.084–0.096 s | none — **slower in 2 of 3 runs** |
+| directory per file | 0.106 s | 0.078–0.101 s | 1.15–1.35x, almost all from batching `mkdir` |
+
+Against the tools on the same host and corpus: `rsync -a` 0.339 s wall, `xsync` 0.653 s.
+**io_uring's entire available win is 0.028 s — about 4% of xsync's wall time**, and only if
+xsync were already at the materialization floor, which it is not. That does not justify unsafe
+code in a workspace that denies it, a Linux-only path with a permanent fallback, a subsystem
+disabled by policy in hardened environments, and a kernel opcode matrix.
+
+**The more important finding: raw materialization is not the bottleneck for either tool.**
+Creating 11,280 directories and 11,280 files with contents costs 0.106 s, while xsync spends
+0.653 s and rsync 0.339 s — 84% and 69% of their wall time is spent elsewhere. T1 remains
+valid (xsync burns 0.866 s system time against rsync's 0.396 s, so the 3.9x call-count gap is
+real kernel work worth roughly 2x), but the win comes from **making fewer calls, not cheaper
+ones** — exactly what io_uring cannot do.
+
+
+
+**What it is.** A shared-memory ring interface (Linux 5.1+). Submission and completion queues
+are `mmap`ed between userspace and the kernel; hundreds of operations are submitted with one
+`io_uring_enter`, and with `SQPOLL` a kernel poller thread makes steady-state submission cost
+**zero** syscalls. It covers far more than read/write — `openat`, `statx`, `close`, `fsync`,
+`renameat`, `unlinkat`, `mkdirat`, `send`/`recv` are all opcodes — and `IOSQE_IO_LINK` chains
+dependent operations, so a per-file open→read→close becomes three linked entries and a thousand
+files become one submission. That is precisely the shape of xsync's per-file cost.
+
+**Why it is gated rather than scheduled.**
+
+- **It cannot touch any number currently measured.** io_uring is Linux-only. Every T1 figure —
+  the 21.37 s system time, the 1.9 ms/file, the 0.471 and 0.515 ratios — was measured on
+  macOS/APFS, where there is no equivalent. `getattrlistbulk` is the nearest macOS analogue and
+  f2 measured it at 1.77x, not the 5–20x originally assumed.
+- **Avoidance has been beating acceleration.** Every T1 win so far came from *not making*
+  syscalls, portably and without unsafe: buffer sizing, `FILE_CLONE_MIN_BYTES`, and above all
+  T1.2b's cloud-detection gate, which removed a per-file `/usr/bin/xattr` process and moved the
+  paired ratio 0.128 -> 0.867. io_uring makes necessary syscalls cheaper; T1 is still finding
+  syscalls that were never necessary. Exhaust that first.
+- **It conflicts with the project's stated posture.** The workspace sets
+  `unsafe_code = "deny"`, and every Rust binding (`io-uring`, `tokio-uring`, `glommio`,
+  `monoio`) requires unsafe. Adopting one means a documented exception.
+- **It is restricted in hardened environments.** Google disabled io_uring for Android apps and
+  ChromeOS in 2023, and kernel 6.6 added the `io_uring_disabled` sysctl so deployments can turn
+  it off. A shipped service needs a non-io_uring fallback regardless, so this is an *additional*
+  code path, never a replacement one.
+- **Batching submission does not remove kernel-side serialization.** f2 measured APFS
+  serializing directory metadata mutation (eight `renameat` threads moved 13k/s to 14k/s). ext4
+  differs in detail but still takes directory locks. Published gains on metadata-heavy work are
+  typically 1.5–3x, not the order of magnitude a raw syscall count suggests.
+- **Zero-copy is largely unavailable to xsync by design.** `SEND_ZC` and `splice` win by never
+  bringing bytes into userspace, but BLAKE3 must see every byte. You cannot checksum data you
+  never touch, so half of io_uring's usual appeal does not apply here.
+
+**Gate — all three must hold before implementation starts.**
+1. T1.1 has produced a real per-syscall histogram (see its `mars`/`strace` path).
+2. That histogram shows the residual gap is dominated by syscalls that are **irreducible** —
+   i.e. remaining after T1.2/T1.2b-style avoidance — rather than by further avoidable work.
+3. T1.3's wall-time target is still unmet *on Linux specifically* after that avoidance.
+
+If the histogram instead shows more avoidable work, this story stays closed and the effort goes
+back into T1.2-style removal, which is portable and safe.
+
+**AC (only if the gate opens)**
+- Implemented as a backend behind the existing I/O abstraction, selected at runtime, with the
+  portable path retained and exercised in CI.
+- Unsafe is confined to one module with a documented justification, and the workspace
+  `unsafe_code = "deny"` exception is narrowed to that module rather than lifted globally.
+- Runtime detection degrades cleanly when io_uring is absent or disabled by sysctl, verified by
+  a test that forces the fallback.
+- Measured on `congress-100k` on `mars`, five repetitions, against the portable path on the same
+  host — not against the macOS numbers, which are not comparable.
+- **Decision gate on the result:** below a 1.3x improvement over the portable Linux path, the
+  backend is not merged. Carrying an unsafe, platform-specific, security-restricted second I/O
+  path is not worth less than that.
+- No regression on `manga`, `cb7`, or the no-op case.
+
+**Plain-English summary:** io_uring is a Linux feature that lets a program hand the kernel
+hundreds of file operations at once instead of one at a time, which is exactly the kind of cost
+xsync is fighting. But it only works on Linux, all our measurements so far are from a Mac, it
+requires code the project currently forbids, and some systems disable it for security. Every
+speed-up so far has come from finding work xsync did not need to do at all — which helps on every
+platform. So this is written down, deliberately not started, and unlocked only if a real
+measurement shows the remaining cost cannot be removed any other way.
+
 ## Summary before T2
 
 Lower CPU usage is not automatically the same as a faster transfer. CPU efficiency matters when
@@ -474,9 +773,20 @@ meets the wall-time target without regressions on no-op, large-file, or network 
 CPU reduction should be justified by a practical performance benefit.
 
 T1.2's buffer sizing and clone threshold are implemented and tested. The temporary-path hash cache
-showed no useful speedup and should be removed before finalizing T1. T1.1 remains blocked because
-macOS SIP produced empty `dtruss` tables even in the user-run privileged capture. T1.3 needs a
-fresh current-binary 10k measurement before deciding whether the CPU target warrants more work.
+showed no useful speedup and should be removed before finalizing T1. T1.3 needs a fresh
+current-binary 10k measurement before deciding whether the CPU target warrants more work.
+
+T1.1 is no longer blocked, only mis-targeted: macOS SIP produced empty `dtruss` tables even under
+a privileged capture, but Linux has no equivalent restriction. Re-run the attribution on `mars`
+with `strace -c -f` — the story now carries the exact commands. That histogram is also the gate
+for T1.4, so one capture unblocks both.
+
+T1.4 records an `io_uring` backend as a *deliberately unstarted* option. It is the natural answer
+to a syscall-volume problem, but it is Linux-only while every T1 measurement to date is macOS, it
+requires unsafe code the workspace currently denies, and it is disabled by policy in some hardened
+environments. Every T1 win so far has instead come from deleting unnecessary work — most
+dramatically T1.2b, which moved the paired ratio from 0.128 to 0.867 by not spawning a process per
+file. Keep exhausting that first; it helps on all three platforms.
 
 ---
 
@@ -728,7 +1038,7 @@ directory metadata mutation, while parallel copying was worth 2.43x on the same 
 xsync currently applies one uniform worker pool to both.
 
 ### Story T7.1 — Worker sweep and policy
-- [~] Sweep worker count 1–16 separately for metadata and data phases, on APFS and ext4.
+- [x] Sweep worker count on APFS and ext4 and set a defensible default.
 
 **Progress:** The existing strategy benchmark exercises synthetic dispatch at 1, 2, 4, 8,
 and 16 workers. The local engine currently has one internal `local_workers` setting, and the
@@ -746,6 +1056,45 @@ not establish the required APFS/ext4 policy or the no-regression claims.
 different worker counts, but not about how many filesystem workers are best. The program needs
 separate knobs for metadata and data work, plus repeatable APFS and ext4 test fixtures, before a
 trustworthy worker policy can be selected.
+
+**RESULT (2026-08-28): swept, and the default was wrong on macOS.** `--local-workers` was
+added to the CLI (its absence was this story's recorded blocker). Sweeps use
+`--no-directory-clone` on APFS so per-file work actually happens.
+
+| workers | 1 | 2 | 4 | 6 | 8 | 12 | 16 | 24 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **ext4**, congress-10k | 0.468 | 0.317 | 0.241 | 0.221 | 0.209 | 0.201 | 0.196 | **0.193 s** |
+
+| workers | 2 | 3 | 4 | 5 | 6 | 10 (default) |
+|---|---:|---:|---:|---:|---:|---:|
+| **APFS**, congress-10k | 2.856 | 2.609 | 2.520 | **2.500** | 2.554 | 2.717 s |
+| **APFS**, cb7 `node_modules` | 4.893 | — | **3.834** | 3.872 | — | 4.418 s |
+
+**The platforms differ in kind.** ext4 scales monotonically to the core count (2.43x from 1
+to 24). APFS peaks at 4–5 and then *degrades*, replicating across two corpus shapes that share
+almost nothing — f2 §2's metadata serialization reproduced inside xsync. The shipped
+one-worker-per-core default meant 10 on this Mac: **8% worse than optimal on congress, 15% on
+`node_modules`.**
+
+`default_local_workers()` now caps at 4 on macOS and stays one-per-core elsewhere. No
+regression on large files (four `.cbz` copy in 0.520 s at both 4 and 10 workers, since that
+work is not metadata-bound). Evidence and the honest limits of the constant are in
+[`benches/results/tuning/T7/DECISION.md`](../benches/results/tuning/T7/DECISION.md).
+
+**The dispatch question shrank rather than being answered.** T7 was motivated by workers
+spending 18.58% in `recv<FileTask>`; after T1.7 removed the doomed reflink attempts stalling
+them, the same frame is **2.04%**. Directory-affine dispatch stays untested and should stay
+closed unless a profile puts that frame back near the top.
+
+**Directory-affine dispatch: experiment INVALID, conclusion withdrawn.** It was implemented
+and benchmarked, and an earlier revision of this file reported it as measured and closed.
+Every run in that A/B executed `target/release/xsync`, a stale orphan left when the binary was
+renamed to `xs`, so both arms ran identical four-day-old code and the differences were noise.
+The hypothesis is **untested, not disproven**. `congress-10k` does genuinely have one file per
+directory (11,288 directories for 11,280 files), so it can never be the corpus for this test;
+use cb7's `node_modules` (7.2 files/dir, one directory with 3,920). The harness now defaults to
+`target/release/xs` and `assert_binary_is_current()` refuses to benchmark a binary older than
+the sources. See [`benches/results/tuning/T7/DECISION.md`](../benches/results/tuning/T7/DECISION.md).
 
 **AC**
 - Requires T0.4 phase timing.

@@ -125,9 +125,18 @@ Windows MSVC. It also enforces `cargo fmt` and a 1.88 MSRV. The whole workspace 
 ### What is missing before this is a product
 
 No release artifacts (CI builds every target and uploads none), no code signing, no
-package manager presence, no man page, no shell completions, no daemon or scheduler, and
-a placeholder repository URL in `Cargo.toml`. Those are tracked in
+package manager presence, no man page, no daemon or scheduler, and a placeholder
+repository URL in `Cargo.toml`. Those are tracked in
 [`DEPLOYMENT.md`](DEPLOYMENT.md) and summarized in §14.
+
+Further correctness gaps are tracked in [`backlogv3.md`](backlogv3.md) — the remaining
+ones are sparse files (see §10) and the metadata classes xsync silently drops.
+
+**Fixed:** two source paths differing only in case, or in Unicode normalization, used to
+become one file on a case- or normalization-insensitive destination such as APFS or NTFS.
+A four-file Linux source pulled to macOS landed as two files with exit code 0. xsync now
+probes the destination and refuses; see
+[Destination path collisions](#destination-path-collisions).
 
 ---
 
@@ -250,6 +259,7 @@ ssh freya 'xs /srv/media/ mars:/srv/media/'
 
 ```
 xs [OPTIONS] <SRC> <DEST>
+xs [OPTIONS] <JOB>
 ```
 
 Either `SRC` or `DEST` may be `[user@]host:path`. `~` and `~/sub` expand on the remote
@@ -260,7 +270,12 @@ as `host:path`.
 |---|---|
 | `-n`, `--dry-run` | Plan everything, print one line per intended `create` / `update` / `delete`, write nothing. |
 | `--delete` | After every transfer and verification succeeds, remove destination entries the source no longer has. Deletes are held until the end on purpose — a failed transfer never triggers a delete. |
-| `--exclude <GLOB>` | Repeatable. Glob matched against the path *relative to the root*, using `globset` semantics, so `**` crosses directory boundaries. Excluded directories are pruned rather than walked. Using any exclude disables the directory-clone fast path. |
+| `--exclude <GLOB>` | Repeatable. Glob matched against the path *relative to the root*, using `globset` semantics, so `**` crosses directory boundaries. Excluded directories are pruned rather than walked. Using any filter disables the directory-clone fast path. |
+| `--include <GLOB>` | Repeatable. Transfer matching paths, overriding a *later* exclude. First match wins, in command-line order. No `--include '*/'` needed. Local transfers only — see §7. |
+| `--exclude-from <FILE>` | Read exclude patterns from FILE, one per line; `#` comments and blank lines ignored. Repeatable. |
+| `--include-from <FILE>` | Read include patterns from FILE. Repeatable. |
+| `--no-ignore-file` | Stop honouring per-directory `.xsyncignore` files, which are on by default. |
+| `--explain-filter` | Print the rule that decided each excluded path, with its file and line. Pair with `-n`. |
 | `--checksum` | Classify files by BLAKE3 content hash rather than by type + size + mtime. Digests are cached (see §7). |
 | `--paranoid` | After writing a file, re-read it from disk and verify its hash. Also forces byte-level verification on the clone fast paths, which otherwise verify only that the operation succeeded and the source did not change. |
 | `--streams <N>` | Number of parallel SSH data streams, 1–16. **Default 1.** |
@@ -271,6 +286,9 @@ as `host:path`.
 | `--progress-json` | Emit JSONL events on stdout instead of progress bars. Schema in [`docs/progress-json-v1.md`](docs/progress-json-v1.md). |
 | `-q`, `--quiet` | Suppress non-error output. Does **not** suppress the remote server's own stderr, which is drained and echoed locally. |
 | `-e`, `--rsh <CMD>` | Remote shell command. Default `ssh`. |
+| `--job <NAME>` | Run a saved job from the config file. Equivalent to passing the name as the only positional argument, but unambiguous when a path of the same name also exists. See §7. |
+| `--config <FILE>` | Read jobs from `FILE` instead of the default search path. A file named here must exist. |
+| `--list-jobs` | Print the jobs the config file defines, with their endpoints and flags, and exit. |
 | `--server` | Hidden. Run as the remote receiver, speaking the protocol on stdin/stdout. This is what `ssh host xs --server /path` invokes; not for interactive use. |
 | `--no-directory-clone` | Hidden, benchmarking only. Disables the directory-clone fast path. |
 | `--version`, `--help` | Standard. |
@@ -373,6 +391,58 @@ an ancestor may not.
 The same commit added a **source/destination overlap check**: `xs ~/a ~/a/b` is rejected
 rather than being allowed to copy a tree into itself.
 
+### Sparse files
+
+A sparse file reports a large apparent size while occupying far fewer blocks; the
+unwritten regions are holes. **xsync has no concept of a hole and will read and write
+every zero.** A Docker VM disk on the development machine reports 3,996 GB apparent
+against 140 GB allocated — a **28.6x** amplification that does not merely run slowly, it
+exhausts the destination and fails after hours.
+
+Sparse-aware transfer is planned; until it lands, xsync says so before starting work that
+may not fit. Every planned file at or above 1 MiB is checked against its allocation, and
+any occupying less than half its apparent size is reported by name with both figures and
+the amplification, followed by a total. `--dry-run` shows the same, so the real cost is
+visible before committing:
+
+```
+warning: disk.img: sparse source: 8.0 GiB will be read and written although it occupies
+only 16.0 KiB (524288.0x amplification). xsync does not yet transfer holes; the
+destination needs room for the larger figure.
+warning: 1 sparse file(s): 8.0 GiB will be written to carry 16.0 KiB of real data —
+8.0 GiB of it holes that xsync cannot yet skip.
+```
+
+These are warnings, not failures: a dense copy of a sparse file is wasteful and may not
+fit, but it is not incorrect, and refusing would block a user whose destination has room.
+Files below 1 MiB are never inspected, since a file smaller than a filesystem block
+cannot be meaningfully sparse. On Windows nothing is reported — allocation is exposed
+through `GetCompressedFileSize`, which the standard library does not wrap, and inventing
+a number would be worse than silence.
+
+### Destination path collisions
+
+Two paths that are distinct on the source can be the *same* path on the destination.
+APFS and NTFS are case-insensitive by default, and APFS additionally treats canonically
+equivalent Unicode forms — `café.txt` written as U+00E9, and as `e` + U+0301 — as one
+name. Publishing both keeps whichever wrote last, which is silent data loss.
+
+xsync **probes the destination** before planning, by creating two names that differ only
+in case and two that differ only in normalization, and observing whether each pair
+collides. The behaviour belongs to the volume rather than the operating system — a macOS
+volume can be formatted case-sensitive, and Linux can mount NTFS — so it is never
+inferred from the platform. When the destination does not exist yet, its nearest existing
+ancestor is probed instead, since the property comes from the volume.
+
+If two source paths would land on one destination name, the run is **refused before
+anything is written**, naming the collision and the reason. `--on-path-collision=skip`
+omits every path involved in a collision instead, reporting each as a failure and exiting
+with the partial-failure code. There is no mode that publishes one and discards the other
+silently.
+
+Non-UTF-8 names are compared byte-wise: they cannot be normalized, and a filesystem
+storing raw bytes distinguishes them.
+
 ### Atomic publication and resume
 
 For large files, the receiver records each verified byte range into a **durable resume
@@ -407,14 +477,20 @@ both copies point at the same physical blocks until one of them is written. xsyn
 whenever the source and destination are on the same filesystem and the destination subtree
 is entirely absent.
 
-- **macOS / APFS**: `/bin/cp -c -p` (`clonefile`).
+- **macOS / APFS**: a direct `clonefile(2)` call. This is the one place xsync uses
+  `unsafe` — see [Why there is one `unsafe` block](#why-there-is-one-unsafe-block) below.
 - **Linux**: `cp --reflink=always`, which works on btrfs and on XFS with reflink enabled,
   and fails cleanly on ext4 and ZFS so xsync falls back to a normal copy.
 
-Measured effect: cloning a 206 MB file locally is **5.0x faster** than `rsync -a`. Cloning
-an entire tree, per the experiments this design came from, was 22x faster than a byte copy
-where a per-file clone of the same bytes was only 2.7x — the difference being entirely
-per-file overhead.
+Before any of this is attempted, xsync **probes the destination once per run** by cloning a
+single one-byte file. On a filesystem without reflink support every clone attempt is doomed,
+and the attempts are not cheap: measured on ext4, the clone machinery cost **65.8% of total
+wall time** (0.572 s against 0.196 s with cloning disabled) for a corpus `rsync -a` copies in
+0.323 s. One probe removes that entire class of wasted work.
+
+Measured effect: cloning a 206 MB file locally is **5.0x faster** than `rsync -a`. On a
+109,615-file corpus on APFS, the tree clone publishes the whole thing in **4.128 s** against
+`rsync -a`'s 24.024 s — **5.8x faster**.
 
 Per-file cloning is only attempted **above 12 MiB** (`FILE_CLONE_MIN_BYTES`), because a
 five-repetition APFS measurement found the clone setup and validation cost more than a
@@ -425,6 +501,34 @@ at 16 MiB.
 a filter. `--paranoid` adds byte readback to a clone, which otherwise verifies only that
 the operation succeeded and the source did not change during it (a clone has no incoming
 byte stream to hash).
+
+#### Why there is one `unsafe` block
+
+The workspace sets `unsafe_code = "deny"`. `crates/xsync-core/src/clone.rs` carries the only
+exemption, a single `#[allow(unsafe_code)]` on the function that calls `clonefile(2)`.
+
+It is there because the safe alternative is **6.3x slower**. `/bin/cp -c -R` does not clone a
+tree; it performs a *per-file* `COPYFILE_CLONE` and recurses. On a 109,615-file corpus,
+`cp -c -p -R` took **23.610 s** while one `clonefile()` on the tree root took **3.766 s**, for
+byte-identical output. Shelling out also costs a process spawn per clone. End to end this took
+xsync's time on that corpus from 28.310 s to 4.128 s, turning a 1.19x loss against `rsync -a`
+into a 5.8x win.
+
+The block itself is three lines: two `CString`s and one FFI call whose arguments are two
+NUL-terminated paths and a flag. It shares no memory with the callee and retains nothing after
+it returns. `CLONE_NOFOLLOW` is passed so the call never resolves a symbolic link it was asked
+to copy, matching the rest of the engine.
+
+One behaviour differs from `cp -p -R` and is compensated for explicitly: **`clonefile` does not
+preserve directory modification times.** Populating a cloned directory updates its own mtime,
+and unlike `cp -p -R` nothing sets it back. xsync therefore reapplies every cloned directory's
+mtime from the plan, deepest-first and with the subtree root last, before publishing the stage.
+This was caught by the integration suite rather than by inspection — three tests comparing a
+local sync against a push failed on exactly this difference.
+
+The same question applies to Linux's `FICLONE` ioctl, which would remove the `cp` process spawn
+there too. It has not been done: the measured prize on Linux is much smaller, and the reflink
+probe above already removes the dominant cost on filesystems that cannot clone at all.
 
 ### Adaptive compression
 
@@ -480,18 +584,227 @@ every transfer and verification has succeeded, so a mirror is never pruned on th
 of a run that failed halfway through. `--dry-run --delete` prints the exact set of
 `delete <path>` lines it would perform.
 
-### `--exclude`
+### Filters: `--exclude`, `--include`, and friends
 
-Repeatable glob patterns matched against the relative path. `--exclude 'node_modules/**'`
-prunes those directories during the walk rather than walking them and discarding results.
-Note the deliberate limitation: these are `globset` globs, not rsync's include/exclude
-filter *rules*, which have their own precedence semantics, anchoring rules, and `+`/`-`
-modifiers. See §14 for the parity gap.
+Five flags, one model:
+
+| Flag | Effect |
+|---|---|
+| `--exclude <GLOB>` | Skip matching paths. Repeatable. |
+| `--include <GLOB>` | Transfer matching paths, overriding a *later* exclude. Repeatable. |
+| `--exclude-from <FILE>` | Read exclude patterns from a file, one per line. Repeatable. |
+| `--include-from <FILE>` | Read include patterns from a file. Repeatable. |
+| `--no-ignore-file` | Stop honouring per-directory `.xsyncignore` files. |
+| `--explain-filter` | Print the rule that decided each excluded path. |
+
+**The rule is: first match wins, in the order you wrote them.** Nothing matching means the
+path is transferred — rules subtract from "copy everything". The order is the order on the
+command line, *including across different flags*, and a `--exclude-from` file's rules expand
+exactly where its flag appeared.
+
+```bash
+xs --include 'docs/guide.md' --exclude '*.md' src/ dst/
+```
+
+keeps `docs/guide.md` and drops every other `.md`. Reverse the two flags and the exclude
+matches first, so the guide goes too. That is the whole model.
+
+#### Three things this deliberately does differently from rsync
+
+**1. No `--include '*/'` incantation.** In rsync this is the classic silent failure:
+
+```bash
+rsync -a --include 'docs/**' --exclude '*' src/ dst/   # transfers nothing
+```
+
+`docs` matches `*`, so rsync prunes it before the include rule is ever consulted, and the
+command copies nothing while reporting success. xsync walks a directory whenever an include
+rule *could* match something beneath it, computed from the rules themselves, so the obvious
+command does the obvious thing:
+
+```bash
+xs --include 'docs/**' --exclude '*' src/ dst/         # transfers docs/
+```
+
+The directory `docs` itself is still excluded — it just gets walked. Over-descending costs
+one `readdir`; under-descending loses files silently, so the trade is not close.
+
+**2. An explicit rule about a path beats an inherited one.** A path under an excluded
+directory is excluded — that is what makes pruning and per-path evaluation agree. But a rule
+naming the path itself wins over one that only named an ancestor. This is what makes
+"exclude the tree, keep one file in it" expressible at all.
+
+**3. Per-directory ignore files are *weaker* than the command line**, not stronger. See
+below.
+
+#### `.xsyncignore`
+
+A `.xsyncignore` file applies to the directory holding it and everything below, with
+patterns relative to that directory — the `.gitignore` model. Blank lines and `#` comments
+are ignored, `+ ` and `- ` prefixes override the default action, and `!pattern` means
+include (because enough people will reach for the gitignore spelling that treating it as a
+literal filename would be a trap).
+
+```
+# src/.xsyncignore
+target
+*.log
+!logs/keep.log
+```
+
+They are honoured by default and are **always weaker than command-line rules**, so a command
+line can override a tree's own opinion and never the other way round:
+
+```bash
+xs --include 'logs/**' src/ dst/    # transfers logs/ even though .xsyncignore drops *.log
+```
+
+This is the opposite of what falls out of delegating to an off-the-shelf ignore walker,
+which prunes during the walk and therefore beats every rule the user typed. Getting the
+direction right is the reason xsync reads these files itself.
+
+The `.xsyncignore` file is itself transferred, like `.gitignore` is committed: the
+destination should be a faithful copy of the source, including its opinions.
+
+#### `--explain-filter`
+
+Names the rule that removed each path, and where it was written — file and line for rules
+files and ignore files:
+
+```
+$ xs -n --explain-filter --exclude-from rules.txt src/ dst/
+filtered logs/build.log: excluded by '- *.log' (.xsyncignore:3)
+filtered docs/api/ref.md: excluded by '- *.md' (rules.txt:2)
+filtered target: excluded by '- target' (.xsyncignore:2)
+filtered target/debug/app: excluded by '- target' (.xsyncignore:2), which excluded the parent 'target'
+```
+
+It makes the walk visit what it would otherwise prune, so it costs more than a normal run —
+which is why it is a flag and not the default. Pair it with `-n` to inspect a filter before
+trusting it.
+
+#### The remote limitation, stated plainly
+
+The v1 wire carries a flat list of exclude patterns and nothing else. So:
+
+- `--exclude` and `--exclude-from` work for remote transfers. Rules-file patterns are folded
+  into the list that crosses the wire, so a rules file is not silently dropped.
+- **`--include` is refused for remote transfers.** An include rule's meaning is its position
+  relative to the excludes; sending the excludes alone would transfer a *larger* set than
+  asked for, silently. Failing is the only safe answer:
+
+  ```
+  xs: --include is not supported for remote transfers yet: the v1 wire carries only
+  exclude patterns, and sending those alone would transfer more than you asked for.
+  ```
+
+- **`.xsyncignore` files are not honoured when the source is remote**, because the far side
+  does the walking. This warns rather than fails: an unseen ignore file cannot make the
+  transfer wider than the explicit rules already allow.
+
+Carrying the full ruleset would need a capability bit and a server-side filter; the wire
+already reserves un-masked capability bits for exactly this kind of addition.
 
 ### `--dry-run`
 
 Prints one line per planned mutation and writes nothing. Because deletes are the
 irreversible operation, dry-running a `--delete` is the recommended habit.
+
+### Named jobs and the config file
+
+Nobody retypes an exclude list and a destination path daily. They write a shell alias — and
+from that moment the tool's own `--dry-run`, logging and error messages never see the real
+configuration. A **job** moves that configuration inside xsync, where it can be listed,
+dry-run, and reported on.
+
+```toml
+# ~/.config/xsync/config.toml
+
+[jobs.documents]
+src = "~/Documents/"
+dest = "mars.local:/backup/documents"
+description = "nightly documents backup"
+exclude = ["*.tmp", ".DS_Store"]
+checksum = true
+delete = true
+
+[jobs.photos]
+src = "~/Pictures/"
+dest = "/Volumes/Archive/Pictures"
+streams = 4
+```
+
+Three ways to run one:
+
+```bash
+xs documents
+```
+
+```bash
+xs --job documents
+```
+
+```bash
+xs --config ./project.toml --job documents
+```
+
+`xs --list-jobs` prints what is defined, with each job's endpoints and the flags it sets.
+`xs -n documents` dry-runs it, so a saved job can be inspected before it is trusted.
+
+**Search path**, in order. The first file that exists wins:
+
+1. `--config FILE` — an explicit path. If it does not exist, that is a fatal error, not a
+   fall-through: running a *different* configuration than the one named would be worse
+   than refusing.
+2. `$XSYNC_CONFIG` — a file named by the environment.
+3. `$XDG_CONFIG_HOME/xsync/config.toml`, or `~/.config/xsync/config.toml`.
+   On Windows, `%APPDATA%\xsync\config.toml`.
+
+XDG is used on macOS too, rather than `~/Library/Application Support`. A config file is
+something people edit by hand and copy between machines, and a path that is identical on
+the laptop and on the server is worth more here than platform purity.
+
+**Precedence is flag > job > built-in default**, decided by *what the user actually typed*
+rather than by whether a value differs from its default. That distinction matters:
+`--transport auto` is indistinguishable from an untouched default by value alone, and
+treating it as absent would let the job silently win an argument the user explicitly made.
+A `--exclude` on the command line *replaces* the job's list rather than adding to it, so a
+one-off run is never quietly broadened by patterns saved months ago.
+
+**One asymmetry, stated rather than hidden.** A boolean a job turns on cannot be turned off
+from the command line, because there is no `--no-delete`. A job with `delete = true` is a
+job that always deletes; if you want it optional, leave it out of the job and pass
+`--delete` when you mean it.
+
+**A malformed config is fatal at startup and never partially applied.** The whole file is
+parsed and every job validated before a single value reaches the run, so a config whose
+*second* job is broken will not run the first. Unknown keys are errors:
+
+```
+xs: invalid config 'config.toml': TOML parse error at line 4, column 1
+  |
+4 | excludes = ["*.tmp"]
+  | ^^^^^^^^
+unknown field `excludes`, expected one of `src`, `dest`, `description`, `exclude`, ...
+```
+
+That plural is the realistic typo, and quietly ignoring it would mean a backup that copies
+files the user believed were excluded. Endpoints are parsed and paired at load time too, so
+a remote-to-remote job is refused when the config is read rather than when it is run.
+
+**Ambiguity is refused, not guessed.** If `xs backup` could mean either the saved job
+`backup` or the directory `./backup` that also exists, xsync stops and says so:
+
+```
+xs: 'backup' is both a saved job and an existing path; use '--job backup' to run the
+job, or './backup' to name the path
+```
+
+Choosing for you could copy the wrong tree.
+
+A leading `~/` in `src` or `dest` is expanded against `$HOME`. Only a leading `~/`, and
+never in a remote spec: in `mars:~/data` the tilde belongs to the remote shell, and
+expanding it locally would send the wrong path.
 
 ### `--progress-json`
 
@@ -782,6 +1095,47 @@ Hardlinks, ownership (uid/gid), ACLs, extended attributes, macOS resource forks,
 device/special files. Only mtimes, Unix permission bits, empty directories and symlinks
 survive.
 
+xsync says so before it starts, rather than leaving you to discover it. The preflight pass
+counts, over the files actually being transferred:
+
+- **Hardlinked files** — entries whose inode has more than one name. When two names for the
+  same inode are both in the transfer, the destination gets two independent copies, and the
+  extra bytes that costs are reported. A single name for a linked inode costs no extra
+  space; only the link relationship is lost, and that is reported separately.
+- **Extended attributes** — resource forks, Finder info, quarantine flags, Spotlight
+  metadata. `com.apple.provenance` is deliberately not counted: recent macOS stamps it on
+  essentially every file it creates, so counting it would fire the warning on every run and
+  turn it into noise.
+- **Foreign ownership** — entries owned by a different user or group than the one xsync is
+  running as, whose copies will belong to the running user. The comparison is made against
+  a file xsync actually creates in the destination, so it answers "who will own the copies"
+  rather than inferring it.
+
+The totals appear in the run summary and as `dropped_hardlinked_files`,
+`dropped_hardlink_extra_bytes`, `dropped_xattr_entries` and `foreign_owner_entries` in the
+`finished` JSON event. When nothing is being dropped, nothing is printed.
+
+Two limits are worth stating plainly:
+
+- **ACLs are not detected.** Counting them needs `libacl` on Linux and the `acl(3)` family
+  on macOS, neither of which is a dependency today. A tree with non-trivial ACLs and no
+  other dropped metadata reports nothing. This is a gap, not a guarantee.
+- **`--dry-run` does not check ownership**, because answering that question requires
+  creating a file in the destination and a dry run must not write there. It says so when it
+  reports anything else. Hardlink and xattr counts are identical between a dry run and the
+  real run.
+- **Push to a remote host does not check ownership either**: uids on the far side mean
+  something different, so the comparison would produce a warning nobody could act on.
+
+The cost is one `listxattr` and one `stat` per transferred file. Measured on congress-100k
+(109,615 files, local APFS, paired reps, same binary behind a temporary toggle): no
+measurable difference at 10k files; **+11.7%** at 100k, of which roughly half is the `stat`
+and half the `listxattr`. The `stat` is a duplicate of one the scanner already makes, but
+plan entries reach the preflight reconstructed from the index encoding, which carries
+identity, size and times but not ownership or link count — and that encoding is shared with
+the frozen v1 wire format. Carrying those three fields through it would remove about half
+the cost and is the obvious follow-up.
+
 ### Sparse files are catastrophic
 
 xsync has no concept of a hole. A sparse file is read, hashed, transferred and written at
@@ -790,6 +1144,12 @@ write amplification — and cannot complete on any destination volume available 
 **Exclude VM images, thin-provisioned disks and `.img` files** until this is fixed. Note
 that the information needed to fix it is nearly free: that image's complete 17,145-extent
 map enumerates in 1.02 seconds.
+
+xsync will at least **tell you** before it starts: every planned file at or above 1 MiB is
+checked against its allocation, and any that is substantially sparse is named with both
+sizes and its amplification, in the run and in `--dry-run`. See
+[Sparse files](#sparse-files) in §6. The transfer is still dense; only the surprise has
+been removed.
 
 ### Windows works as a client, not as a server
 

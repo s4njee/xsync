@@ -41,12 +41,17 @@ fi
 missing=()
 for symbol in renameRequest createDirectoryRequest deleteRequest fetchRequest publishRequest; do
     if ! rg -q "case $symbol" "$f2_root/Sources/F2Protocol"; then
-        missing+=("$symbol")
+        missing+=("codec:$symbol")
+    fi
+done
+for operation in rename createDirectory delete fetch publish; do
+    if ! rg -q "public func $operation\\(" "$f2_root/Sources/F2Protocol/BrowseSession.swift"; then
+        missing+=("client:$operation")
     fi
 done
 if ((${#missing[@]})); then
     printf 'BLOCKED [f2] full joint smoke is not runnable: f2 is missing v2 operations: %s\n' "${missing[*]}" >&2
-    printf 'The current f2 client proves shared types 14-21, but does not yet provide the real-client steps fetch, publish, mutate, and disconnect.\n' >&2
+    printf 'The f2 codec may define a type without exposing the real-client operation needed by this smoke test.\n' >&2
     exit 3
 fi
 

@@ -673,6 +673,7 @@ fn expect_done<R: Read>(
 
 fn emit_finished<F: FnMut(LocalEvent)>(report: &LocalSyncReport, emit: &mut F) {
     emit(LocalEvent::Finished {
+        dropped_metadata: crate::sparse::DroppedMetadata::default(),
         transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
@@ -867,49 +868,162 @@ fn scan_source(source: &Path, trailing_slash: bool) -> Result<Vec<WireEntry>, Rs
     Ok(entries)
 }
 
+/// Order entries exactly the way GNU rsync's `f_name_cmp` does.
+///
+/// The receiver re-sorts the file list it is handed, so an ordering that
+/// merely looks reasonable is not enough: any divergence renumbers the shared
+/// index space and the receiver ends up asking for the wrong entry. Names
+/// compare as `dirname`, `/`, then `basename`; a directory compares as though
+/// its name carried a trailing `/`; and entries that share a parent directory
+/// put non-directories ahead of directories.
 fn rsync_name_cmp(left: &WireEntry, right: &WireEntry) -> std::cmp::Ordering {
-    fn parent(path: &[u8]) -> &[u8] {
-        path.iter()
-            .rposition(|byte| *byte == b'/')
-            .map_or(&[], |index| &path[..index])
+    let (left_parent, left_name) = split_wire_name(&left.path);
+    let (right_parent, right_name) = split_wire_name(&right.path);
+    // rsync interns directory names and takes a shortcut when two entries
+    // share one, which is what makes the file-before-directory rule apply
+    // within a directory but not across directories.
+    let shared_parent = left_parent == right_parent;
+    let mut left = NameCursor::new(
+        left_parent,
+        left_name,
+        left.kind == WireKind::Directory,
+        shared_parent,
+    );
+    let mut right = NameCursor::new(
+        right_parent,
+        right_name,
+        right.kind == WireKind::Directory,
+        shared_parent,
+    );
+    loop {
+        if left.remaining.is_empty() && left.state != NameState::Done {
+            left.advance();
+            continue;
+        }
+        if right.remaining.is_empty() && right.state != NameState::Done {
+            right.advance();
+            continue;
+        }
+        if left.kind != right.kind {
+            return if left.kind == NameKind::Path {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
+        let left_byte = left.remaining.first().copied().unwrap_or(0);
+        let right_byte = right.remaining.first().copied().unwrap_or(0);
+        if left_byte != right_byte {
+            return left_byte.cmp(&right_byte);
+        }
+        if left_byte == 0 {
+            return std::cmp::Ordering::Equal;
+        }
+        left.remaining = &left.remaining[1..];
+        right.remaining = &right.remaining[1..];
+    }
+}
+
+/// Split a wire path into its parent directory and its final component.
+fn split_wire_name(path: &[u8]) -> (Option<&[u8]>, &[u8]) {
+    path.iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or((None, path), |index| {
+            (Some(&path[..index]), &path[index + 1..])
+        })
+}
+
+/// Which of rsync's two name classes the cursor is currently emitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameKind {
+    Path,
+    Item,
+}
+
+/// Position of a name cursor within `dirname` `/` `basename` `/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameState {
+    Dir,
+    Slash,
+    Base,
+    Trailing,
+    Done,
+}
+
+/// Streams one entry's name the way rsync's comparison walks it.
+#[derive(Debug)]
+struct NameCursor<'a> {
+    basename: &'a [u8],
+    directory: bool,
+    remaining: &'a [u8],
+    state: NameState,
+    kind: NameKind,
+}
+
+impl<'a> NameCursor<'a> {
+    fn new(
+        parent: Option<&'a [u8]>,
+        basename: &'a [u8],
+        directory: bool,
+        shared_parent: bool,
+    ) -> Self {
+        let mut cursor = Self {
+            basename,
+            directory,
+            remaining: b"",
+            state: NameState::Base,
+            kind: NameKind::Item,
+        };
+        match parent {
+            Some(parent) if !shared_parent => {
+                cursor.kind = NameKind::Path;
+                cursor.state = NameState::Dir;
+                cursor.remaining = parent;
+            }
+            _ => cursor.enter_basename(),
+        }
+        cursor
     }
 
-    if left.path == b"." || right.path == b"." {
-        return match (left.path == b".", right.path == b".") {
-            (true, true) | (false, false) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
+    fn enter_basename(&mut self) {
+        self.kind = if self.directory {
+            NameKind::Path
+        } else {
+            NameKind::Item
         };
+        self.remaining = self.basename;
+        if self.kind == NameKind::Path && self.basename == b"." {
+            // The transfer root sorts ahead of everything it contains.
+            self.kind = NameKind::Item;
+            self.state = NameState::Trailing;
+            self.remaining = b"";
+        } else {
+            self.state = NameState::Base;
+        }
     }
-    let order = parent(&left.path).cmp(parent(&right.path));
-    if order != std::cmp::Ordering::Equal {
-        return order;
+
+    fn advance(&mut self) {
+        match self.state {
+            NameState::Dir => {
+                self.state = NameState::Slash;
+                self.remaining = b"/";
+            }
+            NameState::Slash => self.enter_basename(),
+            NameState::Base => {
+                self.state = NameState::Trailing;
+                if self.kind == NameKind::Path {
+                    self.remaining = b"/";
+                } else {
+                    self.remaining = b"";
+                }
+            }
+            NameState::Trailing | NameState::Done => {
+                self.state = NameState::Done;
+                self.kind = NameKind::Item;
+                self.remaining = b"";
+            }
+        }
     }
-    let left_directory = left.kind == WireKind::Directory;
-    let right_directory = right.kind == WireKind::Directory;
-    let order = left_directory.cmp(&right_directory);
-    if order != std::cmp::Ordering::Equal {
-        return order;
-    }
-    if left_directory && right_directory {
-        // Directory names are compared as paths, so their descendants remain
-        // immediately after the directory entry.
-        return left.path.cmp(&right.path);
-    }
-    let left_name = left.path.rsplit(|byte| *byte == b'/').next().unwrap_or(&[]);
-    let right_name = right
-        .path
-        .rsplit(|byte| *byte == b'/')
-        .next()
-        .unwrap_or(&[]);
-    let order = left_name.cmp(right_name);
-    if order != std::cmp::Ordering::Equal {
-        return order;
-    }
-    if left.path == right.path {
-        return std::cmp::Ordering::Equal;
-    }
-    left.path.cmp(&right.path)
 }
 
 fn scan_directory(
@@ -1679,5 +1793,114 @@ mod tests {
         fs::write(root.path().join(name), b"x").unwrap();
         let entries = scan_source(root.path(), true).unwrap();
         assert!(entries.iter().any(|entry| entry.path == [b'f', 0xff]));
+    }
+
+    /// The order below is what GNU rsync 3.4.4 itself produces for this tree
+    /// (`rsync -rlptW --no-inc-recursive --protocol=32 -n --out-format=%n`).
+    /// The receiver re-sorts whatever file list it is sent, so a sender that
+    /// orders entries differently hands the receiver a different index space:
+    /// the receiver then asks for data at an index the sender believes is a
+    /// directory, and the transfer dies with "receiver requested data for
+    /// non-file index". The deep tree matters -- shallow corpora happen to
+    /// sort the same way under a naive comparator.
+    #[test]
+    fn deep_tree_file_list_matches_gnu_rsync_ordering() {
+        let root = tempfile::tempdir().unwrap();
+        for directory in [
+            "bills/hr/1",
+            "bills/hr/2",
+            "bills/hr-extra",
+            "bills/hjres/1",
+            "bills/s/1",
+            "committees",
+            "votes/2023",
+        ] {
+            fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        for file in [
+            "README.md",
+            "zzz-top.txt",
+            "bills/index.json",
+            "bills/hr/index.json",
+            "bills/hr/1/data.json",
+            "bills/hr/1/text.txt",
+            "bills/hr/2/data.json",
+            "bills/hr-extra/note.txt",
+            "bills/hjres/1/data.json",
+            "bills/s/1/data.json",
+            "committees/list.json",
+            "votes/2023/v1.json",
+        ] {
+            fs::write(root.path().join(file), b"x").unwrap();
+        }
+
+        let entries = scan_source(root.path(), true).unwrap();
+        let ordered: Vec<String> = entries
+            .iter()
+            .map(|entry| display_wire_path(&entry.path))
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                // The transfer root leads the list.
+                ".",
+                // Every non-directory in a directory precedes its
+                // subdirectories, however the names themselves compare.
+                "README.md",
+                "zzz-top.txt",
+                "bills",
+                "bills/index.json",
+                "bills/hjres",
+                "bills/hjres/1",
+                "bills/hjres/1/data.json",
+                // A directory compares as though its name ended in '/', so
+                // "hr-extra" sorts ahead of "hr" ('-' is below '/').
+                "bills/hr-extra",
+                "bills/hr-extra/note.txt",
+                "bills/hr",
+                "bills/hr/index.json",
+                "bills/hr/1",
+                "bills/hr/1/data.json",
+                "bills/hr/1/text.txt",
+                "bills/hr/2",
+                "bills/hr/2/data.json",
+                "bills/s",
+                "bills/s/1",
+                "bills/s/1/data.json",
+                "committees",
+                "committees/list.json",
+                "votes",
+                "votes/2023",
+                "votes/2023/v1.json",
+            ]
+        );
+    }
+
+    /// A directory entry is never a data-transfer candidate, so the indexes the
+    /// receiver may legitimately request are exactly the regular-file indexes.
+    #[test]
+    fn file_list_indexes_of_regular_files_are_stable_under_the_wire_ordering() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("a/b/c")).unwrap();
+        fs::create_dir_all(root.path().join("a/b-sibling")).unwrap();
+        fs::write(root.path().join("a/b/c/deep.txt"), b"deep").unwrap();
+        fs::write(root.path().join("a/b-sibling/near.txt"), b"near").unwrap();
+        fs::write(root.path().join("top.txt"), b"top").unwrap();
+
+        let entries = scan_source(root.path(), true).unwrap();
+        let files: Vec<(usize, String)> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.kind == WireKind::File)
+            .map(|(index, entry)| (index, display_wire_path(&entry.path)))
+            .collect();
+        assert_eq!(
+            files,
+            vec![
+                (1, "top.txt".to_owned()),
+                (4, "a/b-sibling/near.txt".to_owned()),
+                (7, "a/b/c/deep.txt".to_owned()),
+            ]
+        );
     }
 }

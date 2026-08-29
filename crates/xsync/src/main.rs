@@ -7,8 +7,10 @@ use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgMatches, CommandFactory as _, FromArgMatches as _, Parser, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+mod config;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 enum TransportArg {
@@ -36,6 +38,24 @@ impl From<BootstrapArg> for xsync_core::bootstrap::BootstrapPolicy {
             BootstrapArg::Off => Self::Disabled,
             BootstrapArg::Once => Self::Ephemeral,
             BootstrapArg::Persist => Self::Persist,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+enum PathCollisionArg {
+    /// Refuse the transfer and name the colliding paths.
+    #[default]
+    Fail,
+    /// Skip every colliding path, reporting each as a failure.
+    Skip,
+}
+
+impl From<PathCollisionArg> for xsync_core::local::PathCollisionPolicy {
+    fn from(value: PathCollisionArg) -> Self {
+        match value {
+            PathCollisionArg::Fail => Self::Fail,
+            PathCollisionArg::Skip => Self::Skip,
         }
     }
 }
@@ -100,6 +120,25 @@ static VERSION_LONG: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 )]
 #[allow(clippy::struct_excessive_bools)] // a CLI with many boolean flags is expected
 struct Cli {
+    /// Read named jobs from FILE instead of the default search path.
+    ///
+    /// A file named here must exist: falling back to the default when an
+    /// explicitly named config is missing would run a different configuration
+    /// than the one asked for.
+    #[arg(long, value_name = "FILE")]
+    config: Option<std::path::PathBuf>,
+
+    /// Run the named job from the config file.
+    ///
+    /// Equivalent to passing the job's name as the only positional argument,
+    /// but unambiguous when a directory of the same name also exists.
+    #[arg(long, value_name = "NAME")]
+    job: Option<String>,
+
+    /// List the jobs defined in the config file and exit.
+    #[arg(long)]
+    list_jobs: bool,
+
     /// Run as the remote xsync server, speaking the protocol over stdin/stdout.
     ///
     /// This is how `ssh host xsync --server` drives a remote sync; it is not
@@ -115,6 +154,20 @@ struct Cli {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=16))]
     streams: Option<u8>,
 
+    /// What to do when two source paths name one file on the destination.
+    ///
+    /// Case-insensitive and Unicode-normalization-insensitive destinations such
+    /// as APFS and NTFS treat `Readme.md`/`readme.md`, and the NFC and NFD forms
+    /// of one name, as the same file. Publishing both keeps only one.
+    #[arg(long, value_enum, value_name = "POLICY", default_value_t = PathCollisionArg::Fail)]
+    on_path_collision: PathCollisionArg,
+
+    /// Number of local file workers, 1..=64 (default: one per logical core).
+    ///
+    /// Independent of `--streams`, which controls remote transport sessions.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=64))]
+    local_workers: Option<u16>,
+
     /// Disable the local directory-clone fast path (benchmarking only).
     #[arg(long, hide = true)]
     no_directory_clone: bool,
@@ -126,6 +179,41 @@ struct Cli {
     /// Exclude files matching the GLOB pattern (repeatable; matched against the relative path).
     #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
+
+    /// Include files matching the GLOB pattern, overriding a later exclude.
+    ///
+    /// Rules are evaluated in the order written on the command line and the
+    /// first that matches decides. Unlike rsync, there is no need to add
+    /// `--include '*/'`: a directory is walked automatically whenever an
+    /// include rule could match something inside it.
+    #[arg(long, value_name = "GLOB")]
+    include: Vec<String>,
+
+    /// Read exclude patterns from FILE, one per line (repeatable).
+    ///
+    /// Blank lines and `#` comments are ignored. A line may start with `+ ` or
+    /// `- ` to override the file's default action.
+    #[arg(long, value_name = "FILE")]
+    exclude_from: Vec<std::path::PathBuf>,
+
+    /// Read include patterns from FILE, one per line (repeatable).
+    #[arg(long, value_name = "FILE")]
+    include_from: Vec<std::path::PathBuf>,
+
+    /// Ignore per-directory `.xsyncignore` files.
+    ///
+    /// They are honoured by default. Their rules are always weaker than
+    /// command-line rules, so a command line can override a tree's own opinion
+    /// and never the other way round.
+    #[arg(long)]
+    no_ignore_file: bool,
+
+    /// Print the rule that decided each excluded path.
+    ///
+    /// Most useful with `--dry-run`, where the whole plan can be inspected
+    /// before anything is written.
+    #[arg(long)]
+    explain_filter: bool,
 
     /// Dry run: show what would be done without writing anything.
     #[arg(short = 'n', long)]
@@ -197,17 +285,43 @@ struct Cli {
     #[arg(short = 'e', long, value_name = "CMD")]
     rsh: Option<String>,
 
-    /// Source path. Either side may be `[user@]host:path`.
-    #[arg(value_name = "SRC", required_unless_present_any = ["server", "completions", "man"])]
+    /// Source path, or the name of a saved job. Either side may be `[user@]host:path`.
+    #[arg(
+        value_name = "SRC",
+        required_unless_present_any = ["server", "completions", "man", "job", "list_jobs"]
+    )]
     src: Option<String>,
 
     /// Destination path. Either side may be `[user@]host:path`.
-    #[arg(value_name = "DEST", required_unless_present_any = ["server", "completions", "man"])]
+    ///
+    /// Not required when SRC names a saved job, which supplies both endpoints.
+    #[arg(value_name = "DEST")]
     dest: Option<String>,
 }
 
 fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
+    // Parse through `ArgMatches` rather than `Cli::parse()` so the merge below
+    // can tell a flag the user typed from one that merely holds its default.
+    // Without that distinction "CLI overrides config" is undecidable for every
+    // flag that has a default, which is most of them.
+    let matches = match Cli::command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(error) => {
+            let _ = error.print();
+            return if error.use_stderr() {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            };
+        }
+    };
+    let mut cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = error.print();
+            return ExitCode::from(2);
+        }
+    };
 
     // Configure the failure log before any work, so a failure during setup is
     // captured too. A log that cannot be opened is reported and fatal: a caller
@@ -245,7 +359,16 @@ fn main() -> std::process::ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match run(&cli) {
+    match resolve_job(&mut cli, &matches) {
+        Ok(JobOutcome::Proceed) => {}
+        Ok(JobOutcome::Listed) => return ExitCode::SUCCESS,
+        Err(error) => {
+            report_fatal(&cli, &error);
+            return ExitCode::FAILURE;
+        }
+    }
+
+    match run(&cli, &matches) {
         Ok(RunOutcome::Complete) => ExitCode::SUCCESS,
         Ok(RunOutcome::Partial) => ExitCode::from(xsync_core::local::PARTIAL_FAILURE_EXIT_CODE),
         Err(error) => {
@@ -328,6 +451,12 @@ enum CliError {
     Rsync(#[from] xsync_core::rsync::RsyncError),
     #[error("{0}")]
     Transport(String),
+    #[error(transparent)]
+    Config(#[from] config::ConfigError),
+    #[error(transparent)]
+    Filter(#[from] xsync_core::filter::FilterError),
+    #[error("{0}")]
+    Usage(String),
 }
 
 impl CliError {
@@ -343,13 +472,319 @@ impl CliError {
             Self::Server(error) => error.kind(),
             Self::Rsync(_) => "rsync",
             Self::Transport(_) => "transport",
+            Self::Config(_) => "config",
+            Self::Filter(_) => "filter",
+            Self::Usage(_) => "usage",
         }
     }
 }
 
+/// What job resolution decided should happen next.
+#[derive(Debug)]
+enum JobOutcome {
+    /// Carry on with the transfer described by the (possibly merged) `Cli`.
+    Proceed,
+    /// `--list-jobs` printed its listing; there is nothing left to do.
+    Listed,
+}
+
+/// Resolve `--job`/`--list-jobs`/a bare job name and merge the job into `cli`.
+///
+/// Config is only read when it could matter. A plain `xs SRC DEST` never opens
+/// a file, so a broken config cannot break a run that does not use it.
+fn resolve_job(cli: &mut Cli, matches: &ArgMatches) -> Result<JobOutcome, CliError> {
+    if cli.server {
+        return Ok(JobOutcome::Proceed);
+    }
+
+    if cli.list_jobs {
+        list_jobs(cli.config.as_deref())?;
+        return Ok(JobOutcome::Listed);
+    }
+
+    // Three ways to name a job, in decreasing explicitness.
+    let name = if let Some(name) = cli.job.clone() {
+        name
+    } else if cli.dest.is_none() {
+        // A single positional. It is a job name only if a config defines it,
+        // and only if nothing on disk answers to the same name.
+        let Some(candidate) = cli.src.clone() else {
+            return Ok(JobOutcome::Proceed);
+        };
+        let Some(loaded) = config::load(cli.config.as_deref())? else {
+            return Err(CliError::Usage(format!(
+                "expected SRC and DEST, but only '{candidate}' was given, and there is no \
+                 config file defining it as a job (looked at {})",
+                config::search_path()
+                    .iter()
+                    .map(|path| format!("'{}'", path.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        };
+        if !loaded.config.jobs.contains_key(&candidate) {
+            return Err(CliError::Usage(format!(
+                "expected SRC and DEST, but only '{candidate}' was given, and '{}' defines no \
+                 job by that name{}",
+                loaded.path.display(),
+                if loaded.config.jobs.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " (known jobs: {})",
+                        loaded
+                            .config
+                            .jobs
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            )));
+        }
+        if std::path::Path::new(&candidate).exists() {
+            // Choosing for the user here could copy the wrong tree.
+            return Err(config::ConfigError::AmbiguousJob { name: candidate }.into());
+        }
+        candidate
+    } else {
+        return Ok(JobOutcome::Proceed);
+    };
+
+    let Some(loaded) = config::load(cli.config.as_deref())? else {
+        return Err(config::ConfigError::NoConfig {
+            searched: config::search_path(),
+        }
+        .into());
+    };
+    let job = loaded.config.job(&name)?.clone();
+    merge_job(cli, matches, &job);
+    Ok(JobOutcome::Proceed)
+}
+
+/// Apply `job` to `cli`, leaving every value the user typed alone.
+///
+/// Precedence is flag > job > built-in default. Note the one asymmetry, which
+/// is documented rather than hidden: a boolean the job turns on cannot be
+/// turned off from the command line, because there is no `--no-delete`. A job
+/// that sets `delete` is a job that always deletes.
+fn merge_job(cli: &mut Cli, matches: &ArgMatches, job: &config::Job) {
+    let typed = |id: &str| {
+        matches!(
+            matches.value_source(id),
+            Some(clap::parser::ValueSource::CommandLine)
+        )
+    };
+
+    cli.src = Some(config::expand_home(&job.src));
+    cli.dest = Some(config::expand_home(&job.dest));
+
+    if !typed("exclude") && !job.exclude.is_empty() {
+        cli.exclude.clone_from(&job.exclude);
+    }
+    if !typed("delete") {
+        cli.delete = job.delete.unwrap_or(cli.delete);
+    }
+    if !typed("checksum") {
+        cli.checksum = job.checksum.unwrap_or(cli.checksum);
+    }
+    if !typed("paranoid") {
+        cli.paranoid = job.paranoid.unwrap_or(cli.paranoid);
+    }
+    if !typed("no_compress") {
+        cli.no_compress = job.no_compress.unwrap_or(cli.no_compress);
+    }
+    if !typed("quiet") {
+        cli.quiet = job.quiet.unwrap_or(cli.quiet);
+    }
+    if !typed("compress_level") && job.compress_level.is_some() {
+        cli.compress_level = job.compress_level;
+    }
+    if !typed("streams") && job.streams.is_some() {
+        cli.streams = job.streams;
+    }
+    if !typed("local_workers") && job.local_workers.is_some() {
+        cli.local_workers = job.local_workers;
+    }
+    if !typed("rsh") && job.rsh.is_some() {
+        cli.rsh.clone_from(&job.rsh);
+    }
+    if !typed("log_json") && job.log_json.is_some() {
+        cli.log_json.clone_from(&job.log_json);
+    }
+    // The enum fields are validated at load time, so an unparseable value here
+    // is impossible rather than silently ignored.
+    if !typed("transport") {
+        if let Some(value) = job.transport.as_deref() {
+            cli.transport = match value {
+                "xsync" => TransportArg::Xsync,
+                "rsync" => TransportArg::Rsync,
+                _ => TransportArg::Auto,
+            };
+        }
+    }
+    if !typed("cloud_files") {
+        if let Some(value) = job.cloud_files.as_deref() {
+            cli.cloud_files = match value {
+                "skip" => CloudFilesArg::Skip,
+                "error" => CloudFilesArg::Error,
+                _ => CloudFilesArg::Download,
+            };
+        }
+    }
+    if !typed("bootstrap") {
+        if let Some(value) = job.bootstrap.as_deref() {
+            cli.bootstrap = match value {
+                "once" => BootstrapArg::Once,
+                "persist" => BootstrapArg::Persist,
+                _ => BootstrapArg::Off,
+            };
+        }
+    }
+    if !typed("on_path_collision") {
+        if let Some(value) = job.on_path_collision.as_deref() {
+            cli.on_path_collision = match value {
+                "skip" => PathCollisionArg::Skip,
+                _ => PathCollisionArg::Fail,
+            };
+        }
+    }
+}
+
+/// Print every defined job with its endpoints.
+fn list_jobs(explicit: Option<&std::path::Path>) -> Result<(), CliError> {
+    let Some(loaded) = config::load(explicit)? else {
+        return Err(config::ConfigError::NoConfig {
+            searched: config::search_path(),
+        }
+        .into());
+    };
+    if loaded.config.jobs.is_empty() {
+        println!("{}: no jobs defined", loaded.path.display());
+        return Ok(());
+    }
+    println!("{}:", loaded.path.display());
+    for (name, job) in &loaded.config.jobs {
+        println!("  {name}");
+        println!("    {} -> {}", job.src, job.dest);
+        if let Some(description) = &job.description {
+            println!("    {description}");
+        }
+        let mut flags = Vec::new();
+        if job.delete == Some(true) {
+            flags.push("delete".to_owned());
+        }
+        if job.checksum == Some(true) {
+            flags.push("checksum".to_owned());
+        }
+        if job.paranoid == Some(true) {
+            flags.push("paranoid".to_owned());
+        }
+        if !job.exclude.is_empty() {
+            flags.push(format!("{} exclude pattern(s)", job.exclude.len()));
+        }
+        if !flags.is_empty() {
+            println!("    {}", flags.join(", "));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse, or warn about, the parts of a filter a remote peer cannot honour.
+///
+/// The v1 wire carries a flat list of exclude patterns and nothing else. That
+/// is enough for `--exclude` and `--exclude-from`, and not enough for include
+/// rules, whose whole meaning is their position relative to the excludes.
+/// Sending the excludes alone would transfer a *different, larger* set of files
+/// than the user asked for, silently — so it is refused instead.
+fn reconcile_remote_filter(
+    filter: &xsync_core::filter::FilterSet,
+    source_is_remote: bool,
+    quiet: bool,
+) -> Result<(), CliError> {
+    if filter.has_includes() {
+        return Err(CliError::Usage(
+            "--include is not supported for remote transfers yet: the v1 wire carries only \
+             exclude patterns, and sending those alone would transfer more than you asked \
+             for. Use --exclude/--exclude-from, or run xsync on the remote host so both \
+             ends of the filter are local."
+                .to_owned(),
+        ));
+    }
+    if source_is_remote && filter.honours_ignore_files() && !quiet {
+        // Not fatal: unlike an include rule, an unseen ignore file cannot make
+        // the transfer wider than the explicit rules already allow. But the
+        // user asked for behaviour they are not getting, so say so.
+        eprintln!(
+            "xs: note: per-directory .xsyncignore files are not honoured when the source is \
+             remote; only --exclude/--exclude-from rules apply"
+        );
+    }
+    Ok(())
+}
+
+/// Assemble the filter in the order the rules were written.
+///
+/// clap groups repeated occurrences by flag, so `--include a --exclude b` and
+/// `--exclude b --include a` arrive identically. First-match-wins is meaningless
+/// under that, so the original order is recovered from `ArgMatches::indices_of`
+/// and the four sources are merged back into one sequence.
+///
+/// `--include-from`/`--exclude-from` files expand in place, so a file's rules sit
+/// exactly where the flag appeared relative to the others.
+fn build_filter<'a>(
+    cli: &'a Cli,
+    matches: &ArgMatches,
+) -> Result<xsync_core::filter::FilterSet, CliError> {
+    use xsync_core::filter::{rules_from_file, Action, Origin, Rule};
+
+    // (command-line index, how to turn it into rules)
+    enum Source<'a> {
+        Pattern(Action, &'a str),
+        File(Action, &'a std::path::Path),
+    }
+
+    let mut sources: Vec<(usize, Source<'a>)> = Vec::new();
+    for (id, action, values) in [
+        ("include", Action::Include, &cli.include),
+        ("exclude", Action::Exclude, &cli.exclude),
+    ] {
+        if let Some(indices) = matches.indices_of(id) {
+            for (index, value) in indices.zip(values) {
+                sources.push((index, Source::Pattern(action, value.as_str())));
+            }
+        }
+    }
+    for (id, action, values) in [
+        ("include_from", Action::Include, &cli.include_from),
+        ("exclude_from", Action::Exclude, &cli.exclude_from),
+    ] {
+        if let Some(indices) = matches.indices_of(id) {
+            for (index, value) in indices.zip(values) {
+                sources.push((index, Source::File(action, value.as_path())));
+            }
+        }
+    }
+
+    sources.sort_by_key(|(index, _)| *index);
+
+    let mut rules: Vec<Rule> = Vec::new();
+    for (_, source) in sources {
+        match source {
+            Source::Pattern(action, pattern) => {
+                rules.push(Rule::new(action, pattern, Origin::CommandLine)?);
+            }
+            Source::File(action, path) => rules.extend(rules_from_file(path, action)?),
+        }
+    }
+
+    Ok(xsync_core::filter::FilterSet::from_rules(rules).with_ignore_files(!cli.no_ignore_file))
+}
+
 /// Run the CLI command.
 #[allow(clippy::too_many_lines)]
-fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
+fn run(cli: &Cli, matches: &ArgMatches) -> Result<RunOutcome, CliError> {
     if cli.server {
         let root = cli
             .src
@@ -364,9 +799,32 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
     let dest = xsync_core::path::parse(cli.dest.as_deref().expect("DEST is required"))?;
     xsync_core::path::validate_pair(&src, &dest)?;
 
-    let options = xsync_core::local::LocalSyncOptions {
+    // A filter must reach whichever end does the walking, or it silently means
+    // something different than what was asked for.
+    let mut filter = build_filter(cli, matches)?;
+    let remote = src.is_remote() || dest.is_remote();
+    if remote {
+        reconcile_remote_filter(&filter, src.is_remote(), cli.quiet)?;
+        if src.is_remote() {
+            // The remote source is walked by the far side, which never sees the
+            // tree's own ignore files.
+            filter = filter.with_ignore_files(false);
+        }
+    }
+    // Only the exclude patterns cross the v1 wire, so `--exclude-from` rules
+    // have to be folded into that list; leaving it as the raw `--exclude`
+    // values would drop a rules file on every remote transfer without a word.
+    let wire_excludes: Vec<String> = filter
+        .rules()
+        .iter()
+        .filter(|rule| rule.action == xsync_core::filter::Action::Exclude)
+        .map(|rule| rule.pattern.clone())
+        .collect();
+
+    let mut options = xsync_core::local::LocalSyncOptions {
         streams: usize::from(cli.streams.unwrap_or(xsync_core::DEFAULT_REMOTE_STREAMS)),
         directory_clones: !cli.no_directory_clone,
+        on_path_collision: cli.on_path_collision.into(),
         dry_run: cli.dry_run,
         delete: cli.delete,
         checksum: cli.checksum,
@@ -377,11 +835,16 @@ fn run(cli: &Cli) -> Result<RunOutcome, CliError> {
             CloudFilesArg::Error => xsync_core::local::CloudFilesPolicy::Error,
         },
         paranoid: cli.paranoid,
-        exclude_patterns: cli.exclude.clone(),
+        exclude_patterns: wire_excludes,
+        filter: Some(filter),
+        explain_filter: cli.explain_filter,
         compress: !cli.no_compress,
         compress_level: cli.compress_level.unwrap_or(3),
         ..xsync_core::local::LocalSyncOptions::default()
     };
+    if let Some(workers) = cli.local_workers {
+        options.local_workers = usize::from(workers);
+    }
     let progress_json = cli.progress_json;
     let quiet = cli.quiet;
     let mut progress = ProgressRenderer::new();
@@ -1128,8 +1591,15 @@ fn render_event(
         xsync_core::local::LocalEvent::Action { path, action } => {
             println!("{action} {path}");
         }
+        xsync_core::local::LocalEvent::FilterDecision { path, reason, .. } => {
+            println!("filtered {path}: {reason}");
+        }
         xsync_core::local::LocalEvent::Warning { path, message } => {
-            println!("warning: {path}: {message}");
+            if path.is_empty() {
+                println!("warning: {message}");
+            } else {
+                println!("warning: {path}: {message}");
+            }
         }
         xsync_core::local::LocalEvent::Failed { path, message } => {
             println!("failed: {path}: {message}");
@@ -1169,6 +1639,7 @@ fn event_type(event: &xsync_core::local::LocalEvent) -> &'static str {
         LocalEvent::Negotiated { .. } => "negotiated",
         LocalEvent::ProtocolNegotiated { .. } => "protocol-negotiated",
         LocalEvent::Planned { .. } => "planned",
+        LocalEvent::FilterDecision { .. } => "filter-decision",
         LocalEvent::CloudPlaceholders { .. } => "cloud_placeholders",
         LocalEvent::Transferred { .. } => "transferred",
         LocalEvent::Progress { .. } => "progress",
@@ -1198,6 +1669,16 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "event": "phase",
             "name": name,
             "started": started,
+        }),
+        LocalEvent::FilterDecision {
+            path,
+            included,
+            reason,
+        } => serde_json::json!({
+            "event": "filter-decision",
+            "path": path,
+            "included": included,
+            "reason": reason,
         }),
         LocalEvent::Metrics {
             queue_high_water,
@@ -1304,6 +1785,7 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "path": path,
         }),
         LocalEvent::Finished {
+            dropped_metadata,
             transport,
             transferred_files,
             transferred_bytes,
@@ -1356,6 +1838,10 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "checksum_algorithm": transport.as_ref().and_then(|selection| selection.checksum_algorithm),
             "compression_algorithm": transport.as_ref().and_then(|selection| selection.compression_algorithm),
             "selection_reason": transport.as_ref().map(|selection| selection.reason.as_str()),
+            "dropped_hardlinked_files": dropped_metadata.hardlinked,
+            "dropped_hardlink_extra_bytes": dropped_metadata.hardlink_extra_bytes,
+            "dropped_xattr_entries": dropped_metadata.with_xattrs,
+            "foreign_owner_entries": dropped_metadata.foreign_owner,
         }),
     }
 }
@@ -1363,7 +1849,7 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::{error::ErrorKind, CommandFactory as _};
+    use clap::error::ErrorKind;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(args)
@@ -1411,6 +1897,235 @@ mod tests {
         assert!(!cli.server);
     }
 
+    /// Parse into both the matches and the struct, the way `main` does.
+    fn parse_with_matches(args: &[&str]) -> (Cli, clap::ArgMatches) {
+        let matches = Cli::command().try_get_matches_from(args).unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        (cli, matches)
+    }
+
+    fn job_fixture() -> config::Job {
+        config::Job {
+            src: "/from/".to_owned(),
+            dest: "/to".to_owned(),
+            exclude: vec!["*.tmp".to_owned()],
+            delete: Some(true),
+            checksum: Some(true),
+            compress_level: Some(9),
+            streams: Some(4),
+            transport: Some("rsync".to_owned()),
+            ..config::Job::default()
+        }
+    }
+
+    #[test]
+    fn a_job_supplies_values_the_command_line_left_alone() {
+        let (mut cli, matches) = parse_with_matches(&["xs", "--job", "j"]);
+        merge_job(&mut cli, &matches, &job_fixture());
+
+        assert_eq!(cli.src.as_deref(), Some("/from/"));
+        assert_eq!(cli.dest.as_deref(), Some("/to"));
+        assert_eq!(cli.exclude, vec!["*.tmp".to_owned()]);
+        assert!(cli.delete);
+        assert!(cli.checksum);
+        assert_eq!(cli.compress_level, Some(9));
+        assert_eq!(cli.streams, Some(4));
+        assert_eq!(cli.transport, TransportArg::Rsync);
+    }
+
+    #[test]
+    fn an_explicit_flag_beats_the_job() {
+        let (mut cli, matches) = parse_with_matches(&[
+            "xs",
+            "--job",
+            "j",
+            "--exclude",
+            "*.log",
+            "--compress-level",
+            "1",
+            "--streams",
+            "2",
+            "--transport",
+            "xsync",
+        ]);
+        merge_job(&mut cli, &matches, &job_fixture());
+
+        assert_eq!(
+            cli.exclude,
+            vec!["*.log".to_owned()],
+            "flag replaces, never merges"
+        );
+        assert_eq!(cli.compress_level, Some(1));
+        assert_eq!(cli.streams, Some(2));
+        assert_eq!(cli.transport, TransportArg::Xsync);
+    }
+
+    #[test]
+    fn a_flag_typed_at_its_default_value_still_beats_the_job() {
+        // The reason resolution goes through `ArgMatches`: `--transport auto`
+        // is indistinguishable from an untouched default by value alone, and
+        // treating it as absent would let the job silently win an argument the
+        // user explicitly made.
+        let (mut cli, matches) = parse_with_matches(&["xs", "--job", "j", "--transport", "auto"]);
+        merge_job(&mut cli, &matches, &job_fixture());
+        assert_eq!(cli.transport, TransportArg::Auto);
+    }
+
+    #[test]
+    fn a_job_that_says_nothing_leaves_the_defaults_alone() {
+        let (mut cli, matches) = parse_with_matches(&["xs", "--job", "j"]);
+        let job = config::Job {
+            src: "/from/".to_owned(),
+            dest: "/to".to_owned(),
+            ..config::Job::default()
+        };
+        merge_job(&mut cli, &matches, &job);
+
+        assert!(!cli.delete);
+        assert!(!cli.checksum);
+        assert_eq!(cli.compress_level, None);
+        assert_eq!(cli.streams, None);
+        assert_eq!(cli.transport, TransportArg::Auto);
+        assert!(cli.exclude.is_empty());
+    }
+
+    #[test]
+    fn dry_run_survives_a_job() {
+        // The AC's whole point: a saved job must be inspectable before it runs.
+        let (mut cli, matches) = parse_with_matches(&["xs", "-n", "--job", "j"]);
+        merge_job(&mut cli, &matches, &job_fixture());
+        assert!(cli.dry_run);
+        assert_eq!(cli.src.as_deref(), Some("/from/"));
+    }
+
+    #[test]
+    fn a_lone_positional_that_is_not_a_job_names_the_jobs_that_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[jobs.photos]\nsrc = \"/a/\"\ndest = \"/b\"\n").unwrap();
+
+        let (mut cli, matches) = parse_with_matches(&["xs", "no-such-job"]);
+        cli.config = Some(path);
+        let error = resolve_job(&mut cli, &matches).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("no-such-job"), "{message}");
+        assert!(
+            message.contains("photos"),
+            "names what does exist: {message}"
+        );
+        assert_eq!(error.kind(), "usage");
+    }
+
+    #[test]
+    fn an_explicitly_named_config_that_is_missing_is_fatal() {
+        // Falling back to the default search path here would run a different
+        // configuration than the one the user asked for.
+        let (mut cli, matches) = parse_with_matches(&["xs", "--job", "j"]);
+        cli.config = Some(std::path::PathBuf::from(
+            "/nonexistent/xsync-test-config.toml",
+        ));
+        let error = resolve_job(&mut cli, &matches).unwrap_err();
+        assert_eq!(error.kind(), "config");
+        assert!(
+            error.to_string().contains("xsync-test-config.toml"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn filter_rules_keep_the_order_they_were_typed_in() {
+        use xsync_core::filter::Action;
+
+        // clap groups repeated occurrences by flag, so without index recovery
+        // these two command lines would produce identical filters — and
+        // first-match-wins would mean nothing.
+        let (cli, matches) =
+            parse_with_matches(&["xs", "--include", "a", "--exclude", "b", "s", "d"]);
+        let rules = build_filter(&cli, &matches).unwrap();
+        let order: Vec<_> = rules
+            .rules()
+            .iter()
+            .map(|rule| (rule.action, rule.pattern.as_str()))
+            .collect();
+        assert_eq!(order, vec![(Action::Include, "a"), (Action::Exclude, "b")]);
+
+        let (cli, matches) =
+            parse_with_matches(&["xs", "--exclude", "b", "--include", "a", "s", "d"]);
+        let rules = build_filter(&cli, &matches).unwrap();
+        let order: Vec<_> = rules
+            .rules()
+            .iter()
+            .map(|rule| (rule.action, rule.pattern.as_str()))
+            .collect();
+        assert_eq!(order, vec![(Action::Exclude, "b"), (Action::Include, "a")]);
+    }
+
+    #[test]
+    fn a_rules_file_expands_where_its_flag_appeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rules.txt");
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        let path = path.to_str().unwrap();
+
+        let (cli, matches) = parse_with_matches(&[
+            "xs",
+            "--include",
+            "first",
+            "--exclude-from",
+            path,
+            "--include",
+            "last",
+            "s",
+            "d",
+        ]);
+        let patterns: Vec<_> = build_filter(&cli, &matches)
+            .unwrap()
+            .rules()
+            .iter()
+            .map(|rule| rule.pattern.clone())
+            .collect();
+        assert_eq!(patterns, vec!["first", "one", "two", "last"]);
+    }
+
+    #[test]
+    fn ignore_files_are_honoured_unless_turned_off() {
+        let (cli, matches) = parse_with_matches(&["xs", "s", "d"]);
+        assert!(build_filter(&cli, &matches).unwrap().honours_ignore_files());
+
+        let (cli, matches) = parse_with_matches(&["xs", "--no-ignore-file", "s", "d"]);
+        assert!(!build_filter(&cli, &matches).unwrap().honours_ignore_files());
+    }
+
+    #[test]
+    fn a_remote_transfer_refuses_include_rules_rather_than_approximating_them() {
+        // Sending the excludes alone would transfer a larger set than asked for,
+        // silently. Failing is the only safe answer until the wire can carry the
+        // whole ruleset.
+        let filter =
+            xsync_core::filter::FilterSet::from_rules(vec![xsync_core::filter::Rule::new(
+                xsync_core::filter::Action::Include,
+                "keep/**",
+                xsync_core::filter::Origin::CommandLine,
+            )
+            .unwrap()]);
+        let error = reconcile_remote_filter(&filter, false, true).unwrap_err();
+        assert_eq!(error.kind(), "usage");
+        assert!(error.to_string().contains("--include"), "{error}");
+    }
+
+    #[test]
+    fn a_remote_transfer_accepts_an_exclude_only_filter() {
+        let filter = xsync_core::filter::from_exclude_patterns(&["*.tmp".to_owned()]).unwrap();
+        assert!(reconcile_remote_filter(&filter, true, true).is_ok());
+    }
+
+    #[test]
+    fn an_invalid_pattern_fails_before_any_transfer() {
+        let (cli, matches) = parse_with_matches(&["xs", "--exclude", "a[", "s", "d"]);
+        let error = build_filter(&cli, &matches).unwrap_err();
+        assert_eq!(error.kind(), "filter");
+    }
+
     #[test]
     fn parse_failure_is_not_a_panic() {
         // Unknown flag.
@@ -1418,11 +2133,14 @@ mod tests {
             parse(&["xs", "--bogus", "a", "b"]).unwrap_err().kind(),
             ErrorKind::UnknownArgument
         );
-        // Missing SRC/DEST.
+        // Missing SRC and DEST both.
         assert_eq!(
-            parse(&["xs", "only-a"]).unwrap_err().kind(),
+            parse(&["xs"]).unwrap_err().kind(),
             ErrorKind::MissingRequiredArgument
         );
+        // A single positional is no longer a parse error: it may name a saved
+        // job. It is rejected later, by resolution, with a message that says so.
+        assert!(parse(&["xs", "only-a"]).is_ok());
         // --streams out of range.
         assert_eq!(
             parse(&["xs", "--streams", "99", "a", "b"])

@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::clone::{self, CloneKind};
 use crate::cloud;
@@ -45,6 +44,17 @@ pub enum TransferMethod {
     FileClone,
     /// Bytes were read and written through the verified streaming path.
     ByteCopy,
+}
+
+/// What to do when two distinct source paths name one destination file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathCollisionPolicy {
+    /// Refuse the transfer and name the collisions. The default, because
+    /// publishing both and keeping whichever wrote last is silent data loss.
+    Fail,
+    /// Omit every path involved in a collision, and report them as warnings.
+    /// Nothing is published under a name that another source path also claims.
+    Skip,
 }
 
 /// Policy for files whose contents may be resident in a cloud provider.
@@ -185,8 +195,20 @@ pub enum LocalEvent {
         /// Destination-relative path.
         path: String,
     },
+    /// A filter rule decided the fate of one path, reported under
+    /// `--explain-filter`.
+    FilterDecision {
+        /// Source-relative path.
+        path: String,
+        /// Whether the path is transferred.
+        included: bool,
+        /// One line naming the rule and where it was written.
+        reason: String,
+    },
     /// The local pipeline has finished.
     Finished {
+        /// Source metadata that this run did not carry to the destination.
+        dropped_metadata: crate::sparse::DroppedMetadata,
         /// Selected backend and its capability contract.
         transport: Option<TransportSelection>,
         /// Number of files published.
@@ -257,6 +279,20 @@ pub struct LocalSyncOptions {
     /// Relative-path glob patterns that disable directory cloning and exclude
     /// matching source/destination entries.
     pub exclude_patterns: Vec<String>,
+    /// Ordered include/exclude rules, superseding `exclude_patterns` when set.
+    ///
+    /// Kept alongside the flat list rather than replacing it: `exclude_patterns`
+    /// is what crosses the v1 wire, and every caller that only needs excludes
+    /// keeps working untouched.
+    pub filter: Option<crate::filter::FilterSet>,
+    /// Report the rule that decided each excluded path.
+    ///
+    /// Turning this on makes the scan walk what it would otherwise prune, so
+    /// that a path removed by a rule can still be named. Off, the walk is
+    /// pruned as before and costs nothing.
+    pub explain_filter: bool,
+    /// What to do when two source paths map to one destination name.
+    pub on_path_collision: PathCollisionPolicy,
     /// Enable adaptive zstd compression for data payloads.
     pub compress: bool,
     /// Requested zstd level, constrained to 1..=22 by the CLI.
@@ -277,7 +313,10 @@ impl Default for LocalSyncOptions {
             paranoid: false,
             checksum: false,
             cloud_files: CloudFilesPolicy::Download,
+            on_path_collision: PathCollisionPolicy::Fail,
             exclude_patterns: Vec::new(),
+            filter: None,
+            explain_filter: false,
             compress: true,
             compress_level: 3,
             bootstrap: crate::bootstrap::BootstrapPolicy::Disabled,
@@ -349,6 +388,20 @@ pub enum LocalSyncError {
         /// Underlying filesystem error.
         #[source]
         source: io::Error,
+    },
+    /// Two source paths would become one file on this destination.
+    #[error(
+        "{count} source paths collide on a destination that treats them as the same name \
+         ({reason}); publishing them would silently keep only one. First collision: \
+         {first}. Use --on-path-collision=skip to omit every colliding path instead."
+    )]
+    PathCollision {
+        /// Number of distinct destination names with more than one source path.
+        count: usize,
+        /// Which destination property causes the collision.
+        reason: &'static str,
+        /// A representative collision, as `a <-> b`.
+        first: String,
     },
     /// The source root is not a supported filesystem object.
     #[error("unsupported source root '{path}' ({kind:?})")]
@@ -483,6 +536,7 @@ where
         checksum_cache_hits,
         checksum_cache_misses,
         cloud_skipped,
+        collision_failures,
     } = prepared;
 
     let mut report = LocalSyncReport {
@@ -490,7 +544,8 @@ where
         streams: options.streams,
         checksum_cache_hits,
         checksum_cache_misses,
-        partial_work: !cloud_skipped.is_empty(),
+        failed_entries: collision_failures,
+        partial_work: !cloud_skipped.is_empty() || collision_failures > 0,
         ..LocalSyncReport::default()
     };
     report.skipped_files = plan.files.unchanged.len();
@@ -507,6 +562,33 @@ where
             bytes: entry.size,
         });
     }
+    // xsync has no concept of a hole, so a sparse source is read and written at
+    // its apparent size. Say so before starting work that may not fit.
+    let transferable: Vec<FileEntry> = plan
+        .files
+        .new
+        .iter()
+        .chain(&plan.files.changed)
+        .cloned()
+        .collect();
+    // The ownership question is "who will own the copies", and the only way to
+    // answer it without guessing is to create a file where they will go. A dry
+    // run must not write to the destination, so it leaves ownership unchecked
+    // rather than answering from a scratch directory on some other volume —
+    // that reported every file as foreign-owned purely because the temp dir had
+    // a different group.
+    let owner = if options.dry_run {
+        None
+    } else {
+        crate::sparse::Owner::probe(destination_sink.root())
+    };
+    let preflight = crate::sparse::inspect_with_workers(
+        &transferable,
+        &source_reader_root,
+        owner,
+        options.local_workers,
+    );
+    report_preflight(&preflight, owner.is_some(), &mut emit);
     if options.dry_run {
         emit_plan_actions(&plan, &mut emit);
     }
@@ -524,7 +606,10 @@ where
             name: "transfer",
             started: true,
         });
-        if options.directory_clones && options.cloud_files == CloudFilesPolicy::Download {
+        // Probe the destination once. Without reflink support every clone
+        // attempt is doomed, and the attempts themselves dominate the run.
+        let reflink = options.directory_clones && clone::supports_reflink(destination_sink.root());
+        if reflink && options.cloud_files == CloudFilesPolicy::Download {
             apply_directory_clones(
                 &source_reader_root,
                 &destination_sink,
@@ -549,7 +634,7 @@ where
             &source_reader_root,
             &plan.files,
             &source_by_destination,
-            options,
+            &TransferSettings { options, reflink },
             &mut report,
             &mut emit,
         )?;
@@ -587,6 +672,7 @@ where
     }
 
     emit(LocalEvent::Finished {
+        dropped_metadata: preflight.dropped.clone(),
         transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
@@ -723,7 +809,7 @@ fn try_directory_fast_path(
     options: &LocalSyncOptions,
     emit: &mut impl FnMut(LocalEvent),
 ) -> Result<Option<LocalSyncReport>, LocalSyncError> {
-    if options.delete || !options.exclude_patterns.is_empty() {
+    if options.delete || options.filters_anything() {
         return Ok(None);
     }
     let source_metadata =
@@ -748,7 +834,10 @@ fn try_directory_fast_path(
         name: "scan",
         started: true,
     });
-    let (entries, queue_high_water) = collect_scan(source, &[])?;
+    let (entries, queue_high_water) = collect_scan(
+        source,
+        &std::sync::Arc::new(crate::filter::FilterSet::new()),
+    )?;
     emit(LocalEvent::Metrics {
         queue_high_water,
         compression_algorithm: None,
@@ -837,6 +926,9 @@ fn try_directory_fast_path(
         started: false,
     });
     emit(LocalEvent::Finished {
+        // The clone fast path preserves xattrs, ownership and ACLs, so it
+        // drops nothing worth reporting.
+        dropped_metadata: crate::sparse::DroppedMetadata::default(),
         transport: None,
         transferred_files: report.transferred_files,
         transferred_bytes: report.transferred_bytes,
@@ -871,43 +963,36 @@ struct PreparedTransfer {
     checksum_cache_hits: usize,
     checksum_cache_misses: usize,
     cloud_skipped: Vec<FileEntry>,
+    /// Source paths omitted because they collide on this destination.
+    collision_failures: usize,
 }
 
-struct ExcludeMatcher {
-    set: GlobSet,
-}
-
-impl ExcludeMatcher {
-    fn new(patterns: &[String]) -> Result<Self, LocalSyncError> {
-        let mut builder = GlobSetBuilder::new();
-        for pattern in patterns {
-            let glob = Glob::new(pattern).map_err(|error| LocalSyncError::InvalidExclude {
-                pattern: pattern.clone(),
-                message: error.to_string(),
-            })?;
-            builder.add(glob);
+impl LocalSyncOptions {
+    /// The filter this run applies, whether given directly or as a flat list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LocalSyncError::InvalidExclude`] when a pattern is not a valid
+    /// glob.
+    pub fn effective_filter(&self) -> Result<crate::filter::FilterSet, LocalSyncError> {
+        if let Some(filter) = &self.filter {
+            return Ok(filter.clone());
         }
-        builder
-            .build()
-            .map(|set| Self { set })
-            .map_err(|error| LocalSyncError::InvalidExclude {
+        crate::filter::from_exclude_patterns(&self.exclude_patterns).map_err(|error| {
+            LocalSyncError::InvalidExclude {
                 pattern: "<combined>".to_owned(),
                 message: error.to_string(),
-            })
+            }
+        })
     }
 
-    fn matches(&self, path: &str) -> bool {
-        if self.set.is_match(path) {
-            return true;
-        }
-        let mut prefix = path;
-        while let Some((ancestor, _)) = prefix.rsplit_once('/') {
-            if self.set.is_match(ancestor) {
-                return true;
-            }
-            prefix = ancestor;
-        }
-        false
+    /// Whether this run filters anything at all.
+    #[must_use]
+    pub fn filters_anything(&self) -> bool {
+        self.filter
+            .as_ref()
+            .is_some_and(|filter| !filter.is_empty())
+            || !self.exclude_patterns.is_empty()
     }
 }
 
@@ -920,7 +1005,7 @@ fn prepare_transfer(
     options: &LocalSyncOptions,
     emit: &mut impl FnMut(LocalEvent),
 ) -> Result<PreparedTransfer, LocalSyncError> {
-    let excludes = ExcludeMatcher::new(&options.exclude_patterns)?;
+    let filter = std::sync::Arc::new(options.effective_filter()?);
     let source_metadata =
         fs::symlink_metadata(source).map_err(|source_error| LocalSyncError::SourceRoot {
             path: source.to_path_buf(),
@@ -946,11 +1031,29 @@ fn prepare_transfer(
         started: true,
     });
     let source_reader_root = source_reader_root(source, source_kind);
-    let (source_entries, source_queue_high_water) =
-        collect_scan(source, &options.exclude_patterns)?;
+    // Explaining a decision requires having seen the path, and a pruned walk
+    // never sees what it pruned. The unfiltered walk is therefore only taken
+    // when the answer is being asked for.
+    let scan_filter = if options.explain_filter {
+        std::sync::Arc::new(filter.observing_only())
+    } else {
+        std::sync::Arc::clone(&filter)
+    };
+    let (source_entries, source_queue_high_water) = collect_scan(source, &scan_filter)?;
     let mut source_entries: Vec<_> = source_entries
         .into_iter()
-        .filter(|entry| !excludes.matches(&entry.path.to_string()))
+        .filter(|entry| {
+            let path = entry.path.to_string();
+            let decision = filter.decide(&path);
+            if options.explain_filter && !decision.is_included() {
+                emit(LocalEvent::FilterDecision {
+                    path,
+                    included: false,
+                    reason: decision.explain(),
+                });
+            }
+            decision.is_included()
+        })
         .collect();
     let mut cloud_skipped = Vec::new();
     let mut cloud_files = 0;
@@ -1012,7 +1115,7 @@ fn prepare_transfer(
     }
     let destination_sink = Sink::new(&layout.destination_root)?;
     let (destination_entries, destination_queue_high_water) =
-        collect_scan(destination_sink.root(), &options.exclude_patterns)?;
+        collect_scan(destination_sink.root(), &filter)?;
     emit(LocalEvent::Metrics {
         queue_high_water: source_queue_high_water.max(destination_queue_high_water),
         compression_algorithm: None,
@@ -1023,7 +1126,7 @@ fn prepare_transfer(
             .direct_destination_name
             .as_ref()
             .is_none_or(|name| entry.path == *name)
-            && !excludes.matches(&entry.path.to_string())
+            && filter.decide(&entry.path.to_string()).is_included()
     });
     let mut destination_index = DestinationIndex::with_config(IndexConfig::default())?;
     for entry in destination_entries {
@@ -1051,7 +1154,17 @@ fn prepare_transfer(
             Ok::<FileEntry, LocalSyncError>(planned)
         })
         .collect();
-    let mut plan = try_plan(planned_source?, destination_index)?;
+    let planned_source = planned_source?;
+    // Detect, before anything is written, two source paths that this destination
+    // cannot tell apart. Publishing both keeps whichever wrote last.
+    let (planned_source, dropped) = enforce_path_collisions(
+        planned_source,
+        destination_sink.root(),
+        options.on_path_collision,
+        emit,
+    )?;
+    let collision_failures = dropped;
+    let mut plan = try_plan(planned_source, destination_index)?;
     let (checksum_cache_hits, checksum_cache_misses) = if options.checksum {
         apply_checksum_classification(
             &mut plan,
@@ -1080,6 +1193,7 @@ fn prepare_transfer(
         checksum_cache_hits,
         checksum_cache_misses,
         cloud_skipped,
+        collision_failures,
     })
 }
 
@@ -1103,9 +1217,31 @@ fn validate_options(options: &LocalSyncOptions) -> Result<(), LocalSyncError> {
     Ok(())
 }
 
+/// Default local file-worker count.
+///
+/// One worker per logical core is right on Linux, where a sweep on ext4 scales
+/// monotonically from 0.468 s at one worker to 0.193 s at 24 (2.43x), with no
+/// degradation at the top end.
+///
+/// macOS is different in kind, not degree: the filesystem serializes directory
+/// metadata mutation, so past a handful of workers the threads queue on a lock
+/// instead of progressing. Measured on APFS across two corpus shapes, the
+/// optimum is 4 and every count above it is worse — congress-10k (one file per
+/// directory) 2.520 s at 4 against 2.717 s at the 10-core default, and cb7's
+/// `node_modules` (7.2 files per directory) 3.834 s at 4 against 4.418 s. The
+/// core-count default therefore costs 8-15% on this platform.
 fn default_local_workers() -> usize {
-    thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    let cores = thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    if cfg!(target_os = "macos") {
+        cores.min(MACOS_WORKER_CAP)
+    } else {
+        cores
+    }
 }
+
+/// Worker ceiling on macOS, where additional workers contend rather than help.
+/// `--local-workers` overrides it for measurement or for unusual workloads.
+const MACOS_WORKER_CAP: usize = 4;
 
 struct Layout {
     destination_root: PathBuf,
@@ -1193,12 +1329,12 @@ struct SourcePathMap {
 
 fn collect_scan(
     root: &Path,
-    exclude_patterns: &[String],
+    filter: &std::sync::Arc<crate::filter::FilterSet>,
 ) -> Result<(Vec<FileEntry>, usize), LocalSyncError> {
-    let scan = if exclude_patterns.is_empty() {
+    let scan = if filter.is_empty() {
         scan(root)?
     } else {
-        crate::scanner::scan_with_excludes(root, exclude_patterns)?
+        crate::scanner::scan_with_filter(root, std::sync::Arc::clone(filter))?
     };
     let mut entries = Vec::new();
     let mut first_error = None;
@@ -1328,6 +1464,114 @@ fn entry_kind(metadata: &fs::Metadata) -> EntryKind {
     }
 }
 
+/// Probe a destination, detect colliding destination paths, and apply policy.
+///
+/// Returns the entries that may safely be published and how many were dropped.
+/// Used by every path that plans a transfer: local, and the pull client whose
+/// destination is also local.
+///
+/// # Errors
+/// Returns [`LocalSyncError::PathCollision`] under [`PathCollisionPolicy::Fail`].
+pub(crate) fn enforce_path_collisions(
+    entries: Vec<FileEntry>,
+    destination_root: &Path,
+    policy: PathCollisionPolicy,
+    emit: &mut impl FnMut(LocalEvent),
+) -> Result<(Vec<FileEntry>, usize), LocalSyncError> {
+    let semantics = crate::pathsem::PathSemantics::probe(destination_root);
+    let collisions = find_path_collisions(&entries, semantics);
+    if collisions.is_empty() {
+        return Ok((entries, 0));
+    }
+    report_collisions(&collisions, semantics, policy, emit)?;
+    let dropped: HashSet<WirePath> = collisions
+        .iter()
+        .flat_map(|group| group.iter().cloned())
+        .collect();
+    let count = dropped.len();
+    let kept = entries
+        .into_iter()
+        .filter(|entry| !dropped.contains(&entry.path))
+        .collect();
+    Ok((kept, count))
+}
+
+/// Group planned destination paths that this destination would treat as one name.
+///
+/// Returns one group per colliding name, each holding the distinct source paths
+/// that claim it. An empty result means every path is unambiguous here.
+pub(crate) fn find_path_collisions(
+    entries: &[FileEntry],
+    semantics: crate::pathsem::PathSemantics,
+) -> Vec<Vec<WirePath>> {
+    if !semantics.can_collide() {
+        return Vec::new();
+    }
+    let mut by_key: BTreeMap<Vec<u8>, Vec<WirePath>> = BTreeMap::new();
+    for entry in entries {
+        by_key
+            .entry(semantics.collision_key(&entry.path))
+            .or_default()
+            .push(entry.path.clone());
+    }
+    by_key
+        .into_values()
+        .filter(|group| {
+            // A key shared by one path is not a collision; a key shared by two
+            // *identical* paths cannot happen, but guard against it anyway.
+            let mut distinct: Vec<&WirePath> = group.iter().collect();
+            distinct.sort();
+            distinct.dedup();
+            distinct.len() > 1
+        })
+        .collect()
+}
+
+/// Fail or warn about collisions according to policy.
+pub(crate) fn report_collisions(
+    collisions: &[Vec<WirePath>],
+    semantics: crate::pathsem::PathSemantics,
+    policy: PathCollisionPolicy,
+    emit: &mut impl FnMut(LocalEvent),
+) -> Result<(), LocalSyncError> {
+    let reason = match (
+        semantics.case_insensitive,
+        semantics.normalization_insensitive,
+    ) {
+        (true, true) => "case- and Unicode-normalization-insensitive",
+        (true, false) => "case-insensitive",
+        (false, true) => "Unicode-normalization-insensitive",
+        (false, false) => "insensitive",
+    };
+    let first = collisions.first().map_or_else(String::new, |group| {
+        group
+            .iter()
+            .map(WirePath::to_string)
+            .collect::<Vec<_>>()
+            .join(" <-> ")
+    });
+    match policy {
+        PathCollisionPolicy::Fail => Err(LocalSyncError::PathCollision {
+            count: collisions.len(),
+            reason,
+            first,
+        }),
+        PathCollisionPolicy::Skip => {
+            for group in collisions {
+                for path in group {
+                    emit(LocalEvent::Failed {
+                        path: path.to_string(),
+                        message: format!(
+                            "skipped: collides with another source path on a {reason} destination"
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 fn transfer_totals(entries: &EntryPlan) -> (usize, u64) {
     let bytes = entries
         .new
@@ -1416,6 +1660,120 @@ fn cache_hash(
     }
     let bytes = fs::read(path).ok()?;
     Some(blake3::hash(&bytes))
+}
+
+/// Warn about sparse sources, naming each file and both of its sizes.
+///
+/// Reported as warnings rather than failures: a dense copy of a sparse file is
+/// wasteful and may not fit, but it is not incorrect, and refusing outright
+/// would block a user who knows their destination has room.
+pub(crate) fn report_preflight(
+    preflight: &crate::sparse::Preflight,
+    ownership_checked: bool,
+    emit: &mut impl FnMut(LocalEvent),
+) {
+    let dropped = !preflight.dropped.is_empty();
+    report_dropped_metadata(&preflight.dropped, emit);
+    if dropped && !ownership_checked {
+        report_unchecked_ownership(emit);
+    }
+    report_sparse_files(&preflight.sparse, emit);
+}
+
+/// Say what will not survive the transfer. Silent when nothing is dropped.
+fn report_dropped_metadata(
+    dropped: &crate::sparse::DroppedMetadata,
+    emit: &mut impl FnMut(LocalEvent),
+) {
+    if dropped.is_empty() {
+        return;
+    }
+    let mut parts = Vec::new();
+    if dropped.hardlinked > 0 {
+        parts.push(format!(
+            "{} hardlinked file(s) become independent copies, adding {}",
+            dropped.hardlinked,
+            human_bytes(dropped.hardlink_extra_bytes)
+        ));
+    }
+    if dropped.with_xattrs > 0 {
+        parts.push(format!(
+            "{} entr(ies) carry extended attributes (resource forks, Finder info, \
+             quarantine flags) that will not be copied",
+            dropped.with_xattrs
+        ));
+    }
+    if dropped.foreign_owner > 0 {
+        parts.push(format!(
+            "{} entr(ies) are owned by another user or group; the copies will belong \
+             to the user running xsync",
+            dropped.foreign_owner
+        ));
+    }
+    emit(LocalEvent::Warning {
+        path: String::new(),
+        message: format!("metadata that will not be preserved: {}.", parts.join("; ")),
+    });
+}
+
+/// Say, once, that a dry run could not answer the ownership question.
+///
+/// Only shown alongside another finding: on a tree where nothing at all is
+/// dropped, the caveat would be the only output and would read as a problem.
+fn report_unchecked_ownership(emit: &mut impl FnMut(LocalEvent)) {
+    emit(LocalEvent::Warning {
+        path: String::new(),
+        message: "ownership was not checked: a dry run does not write to the destination, \
+                  so files owned by another user will only be reported on the real run"
+            .to_owned(),
+    });
+}
+
+fn report_sparse_files(report: &crate::sparse::SparseReport, emit: &mut impl FnMut(LocalEvent)) {
+    if report.is_empty() {
+        return;
+    }
+    for file in &report.files {
+        emit(LocalEvent::Warning {
+            path: file.path.to_string(),
+            message: format!(
+                "sparse source: {} will be read and written although it occupies only {} \
+                 ({:.1}x amplification). xsync does not yet transfer holes; the destination \
+                 needs room for the larger figure.",
+                human_bytes(file.apparent_bytes),
+                human_bytes(file.allocated_bytes),
+                file.amplification(),
+            ),
+        });
+    }
+    emit(LocalEvent::Warning {
+        path: String::new(),
+        message: format!(
+            "{} sparse file(s): {} will be written to carry {} of real data — \
+             {} of it holes that xsync cannot yet skip.",
+            report.files.len(),
+            human_bytes(report.sparse_apparent_bytes()),
+            human_bytes(report.sparse_allocated_bytes()),
+            human_bytes(report.wasted_bytes()),
+        ),
+    });
+}
+
+/// Render a byte count for a human reading a warning.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    #[allow(clippy::cast_precision_loss)]
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 pub(crate) fn emit_plan_actions(plan: &Plan, emit: &mut impl FnMut(LocalEvent)) {
@@ -1512,15 +1870,24 @@ struct FileOutcome {
     result: Result<FileTransfer, String>,
 }
 
+/// User options paired with the capabilities probed at run time.
+struct TransferSettings<'a> {
+    options: &'a LocalSyncOptions,
+    /// Whether the destination filesystem was found to support reflink.
+    reflink: bool,
+}
+
 fn transfer_files(
     sink: &Sink,
     source_reader_root: &Path,
     files: &EntryPlan,
     paths: &SourcePathMap,
-    options: &LocalSyncOptions,
+    settings: &TransferSettings<'_>,
     report: &mut LocalSyncReport,
     emit: &mut impl FnMut(LocalEvent),
 ) -> Result<(), LocalSyncError> {
+    let options = settings.options;
+    let reflink = settings.reflink;
     let tasks: Vec<_> = files
         .new
         .iter()
@@ -1546,6 +1913,7 @@ fn transfer_files(
             sink.clone(),
             SourceReader::new(source_reader_root),
             options.paranoid,
+            reflink,
         ));
     }
     drop(outcome_sender);
@@ -1603,13 +1971,14 @@ fn spawn_file_worker(
     sink: Sink,
     source_reader: SourceReader,
     paranoid: bool,
+    reflink: bool,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("xsync-local-worker".to_owned())
         .spawn(move || {
             for task in tasks {
                 let path = task.destination.path.clone();
-                let result = transfer_one_file(&sink, &source_reader, task, paranoid);
+                let result = transfer_one_file(&sink, &source_reader, task, paranoid, reflink);
                 if outcomes
                     .send(FileOutcome {
                         path: path.to_string(),
@@ -1629,11 +1998,12 @@ fn transfer_one_file(
     source_reader: &SourceReader,
     task: FileTask,
     paranoid: bool,
+    reflink: bool,
 ) -> Result<FileTransfer, String> {
     let destination_path = sink
         .path_for(&task.destination.path)
         .map_err(|error| error.to_string())?;
-    if task.source.size >= FILE_CLONE_MIN_BYTES {
+    if reflink && task.source.size >= FILE_CLONE_MIN_BYTES {
         match clone::try_clone_file(&task.source_path, &destination_path, &task.source, paranoid) {
             Ok(Some(outcome)) => {
                 if outcome.kind == CloneKind::File {
@@ -1827,6 +2197,8 @@ mod tests {
 
     fn options() -> LocalSyncOptions {
         LocalSyncOptions {
+            filter: None,
+            explain_filter: false,
             local_workers: 2,
             streams: 7,
             queue_capacity: 1,
@@ -1836,6 +2208,7 @@ mod tests {
             paranoid: false,
             checksum: false,
             cloud_files: CloudFilesPolicy::Download,
+            on_path_collision: PathCollisionPolicy::Fail,
             exclude_patterns: Vec::new(),
             compress: true,
             compress_level: 3,
@@ -1907,6 +2280,108 @@ mod tests {
         // — but it is an inventory, which is the distinction being asserted.
         assert_eq!(files, 0);
         assert_eq!(bytes, 0);
+    }
+
+    fn collision_entry(path: &str) -> FileEntry {
+        FileEntry {
+            path: WirePath::from_wire(path.as_bytes().to_vec()).unwrap(),
+            kind: EntryKind::File,
+            size: 1,
+            mtime: std::time::UNIX_EPOCH,
+            mode: 0o644,
+            fingerprint: crate::scanner::SourceFingerprint::synthetic(
+                EntryKind::File,
+                1,
+                std::time::UNIX_EPOCH,
+            ),
+        }
+    }
+
+    /// The end-to-end integration test can only construct this case when the
+    /// source volume distinguishes names the destination folds — two different
+    /// filesystems. These exercise the detection directly, so the logic stays
+    /// covered on every host.
+    #[test]
+    fn collisions_are_detected_per_destination_behaviour() {
+        use crate::pathsem::PathSemantics;
+
+        let entries = vec![
+            collision_entry("Readme.md"),
+            collision_entry("readme.md"),
+            collision_entry("caf\u{e9}.txt"),
+            collision_entry("cafe\u{301}.txt"),
+            collision_entry("unique.txt"),
+        ];
+
+        // A destination that distinguishes everything sees no collision.
+        assert!(find_path_collisions(&entries, PathSemantics::sensitive()).is_empty());
+
+        // Case-insensitive: only the Readme pair collides.
+        let case_only = PathSemantics {
+            case_insensitive: true,
+            normalization_insensitive: false,
+        };
+        let groups = find_path_collisions(&entries, case_only);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+
+        // Normalization-insensitive: only the café pair collides.
+        let normalization_only = PathSemantics {
+            case_insensitive: false,
+            normalization_insensitive: true,
+        };
+        assert_eq!(find_path_collisions(&entries, normalization_only).len(), 1);
+
+        // APFS-style: both pairs, and `unique.txt` is never implicated.
+        let apfs = PathSemantics {
+            case_insensitive: true,
+            normalization_insensitive: true,
+        };
+        let groups = find_path_collisions(&entries, apfs);
+        assert_eq!(groups.len(), 2);
+        let unique = WirePath::from_wire(b"unique.txt".to_vec()).unwrap();
+        assert!(groups.iter().flatten().all(|path| *path != unique));
+    }
+
+    #[test]
+    fn fail_policy_refuses_and_skip_policy_drops_every_colliding_path() {
+        let temp = tempdir().unwrap();
+        let entries = vec![
+            collision_entry("Readme.md"),
+            collision_entry("readme.md"),
+            collision_entry("keep.txt"),
+        ];
+        if !crate::pathsem::PathSemantics::probe(temp.path()).can_collide() {
+            return;
+        }
+
+        let refused = enforce_path_collisions(
+            entries.clone(),
+            temp.path(),
+            PathCollisionPolicy::Fail,
+            &mut |_| {},
+        );
+        assert!(matches!(
+            refused,
+            Err(LocalSyncError::PathCollision { count: 1, .. })
+        ));
+
+        let mut failures = 0;
+        let (kept, dropped) = enforce_path_collisions(
+            entries,
+            temp.path(),
+            PathCollisionPolicy::Skip,
+            &mut |event| {
+                if matches!(event, LocalEvent::Failed { .. }) {
+                    failures += 1;
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(dropped, 2, "both colliding paths are dropped, not one");
+        assert_eq!(failures, 2, "each dropped path is reported");
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path.to_string(), "keep.txt");
     }
 
     #[test]

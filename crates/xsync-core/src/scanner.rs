@@ -14,8 +14,9 @@ use std::time::SystemTime;
 use std::time::{Duration, UNIX_EPOCH};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::{WalkBuilder, WalkState};
+
+use crate::filter::{FilterSet, SharedFilter};
 
 use crate::path::WirePath;
 
@@ -211,15 +212,19 @@ pub fn scan(root: impl AsRef<Path>) -> Result<Scan, ScanError> {
 /// Returns an error when a pattern is invalid, the root cannot be inspected, or
 /// the coordinator thread cannot be started.
 pub fn scan_with_excludes(root: impl AsRef<Path>, patterns: &[String]) -> Result<Scan, ScanError> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        let glob = Glob::new(pattern).map_err(|error| ScanError::Walk(error.to_string()))?;
-        builder.add(glob);
-    }
-    let matcher = builder
-        .build()
+    let filter = crate::filter::from_exclude_patterns(patterns)
         .map_err(|error| ScanError::Walk(error.to_string()))?;
-    scan_with_capacity_and_matcher(root, DEFAULT_CHANNEL_CAPACITY, Some(matcher))
+    scan_with_filter(root, Arc::new(filter))
+}
+
+/// Start a parallel scan governed by an ordered include/exclude filter.
+///
+/// # Errors
+///
+/// Returns an error when the root cannot be inspected or the coordinator thread
+/// cannot be started.
+pub fn scan_with_filter(root: impl AsRef<Path>, filter: SharedFilter) -> Result<Scan, ScanError> {
+    scan_with_capacity_and_filter(root, DEFAULT_CHANNEL_CAPACITY, Some(filter))
 }
 
 /// Start a parallel scan with an explicit bounded-channel capacity.
@@ -232,13 +237,13 @@ pub fn scan_with_capacity(
     root: impl AsRef<Path>,
     channel_capacity: usize,
 ) -> Result<Scan, ScanError> {
-    scan_with_capacity_and_matcher(root, channel_capacity, None)
+    scan_with_capacity_and_filter(root, channel_capacity, None)
 }
 
-fn scan_with_capacity_and_matcher(
+fn scan_with_capacity_and_filter(
     root: impl AsRef<Path>,
     channel_capacity: usize,
-    matcher: Option<GlobSet>,
+    filter: Option<SharedFilter>,
 ) -> Result<Scan, ScanError> {
     if channel_capacity == 0 {
         return Err(ScanError::ZeroChannelCapacity);
@@ -253,16 +258,44 @@ fn scan_with_capacity_and_matcher(
 
     let mut builder = WalkBuilder::new(&root);
     builder.standard_filters(false).follow_links(false);
-    if let Some(matcher) = matcher {
-        let matcher_root = root.clone();
+    let emitted_filter = filter.clone();
+    if let Some(filter) = filter {
+        // The root's own ignore file has no `filter_entry` call of its own,
+        // because depth 0 is accepted unconditionally.
+        if let Some(layer) = filter.ignore_layer() {
+            layer
+                .load(&root, "")
+                .map_err(|error| ScanError::Walk(error.to_string()))?;
+        }
+        let filter_root = root.clone();
         builder.filter_entry(move |entry| {
             if entry.depth() == 0 {
                 return true;
             }
-            let Ok(relative) = entry.path().strip_prefix(&matcher_root) else {
+            let Ok(relative) = entry.path().strip_prefix(&filter_root) else {
                 return true;
             };
-            !excluded_relative_path(&matcher, relative)
+            let relative = relative.to_string_lossy();
+            let is_directory = entry.file_type().is_some_and(|kind| kind.is_dir());
+            if is_directory {
+                // Load this directory's rules before anything inside it is
+                // judged. The walker calls `filter_entry` on a directory before
+                // yielding any of its children, which is what makes the
+                // lower-precedence tier well-defined under a parallel walk.
+                if let Some(layer) = filter.ignore_layer() {
+                    // A malformed ignore file must not silently stop applying;
+                    // it is surfaced as a walk error through the entry stream.
+                    if layer.load(entry.path(), relative.as_ref()).is_err() {
+                        return true;
+                    }
+                }
+                // An excluded directory is still walked when an include rule
+                // could match beneath it; the directory itself is dropped later
+                // by the per-entry decision.
+                filter.should_descend(relative.as_ref())
+            } else {
+                filter.decide(relative.as_ref()).is_included()
+            }
         });
     }
     let walker = builder.build_parallel();
@@ -275,7 +308,14 @@ fn scan_with_capacity_and_matcher(
             let root = root.clone();
             let queue_high_water = Arc::clone(&queue_high_water);
             move || {
-                run_walker(walker, &root, root_is_directory, &sender, &queue_high_water);
+                run_walker(
+                    walker,
+                    &root,
+                    root_is_directory,
+                    emitted_filter.as_deref(),
+                    &sender,
+                    &queue_high_water,
+                );
             }
         })
         .map_err(ScanError::Start)?;
@@ -288,25 +328,11 @@ fn scan_with_capacity_and_matcher(
     })
 }
 
-fn excluded_relative_path(matcher: &GlobSet, relative: &Path) -> bool {
-    let display = relative.to_string_lossy();
-    if matcher.is_match(display.as_ref()) {
-        return true;
-    }
-    let mut prefix = display.as_ref();
-    while let Some((ancestor, _)) = prefix.rsplit_once('/') {
-        if matcher.is_match(ancestor) {
-            return true;
-        }
-        prefix = ancestor;
-    }
-    false
-}
-
 fn run_walker(
     walker: ignore::WalkParallel,
     root: &Path,
     root_is_directory: bool,
+    filter: Option<&FilterSet>,
     sender: &Sender<ScanResult>,
     queue_high_water: &AtomicUsize,
 ) {
@@ -316,7 +342,24 @@ fn run_walker(
         Box::new(move |result| {
             let result = match result {
                 Ok(entry) if entry.depth() == 0 && root_is_directory => return WalkState::Continue,
-                Ok(entry) => make_entry(&root, root_is_directory, &entry),
+                Ok(entry) => {
+                    // The walker descends directories that an include rule
+                    // might need, so the entry itself is decided again here.
+                    // Pruning alone would emit those directories, and a
+                    // directory the user excluded must not be created at the
+                    // destination just because something under it survived.
+                    if let Some(filter) = filter {
+                        if let Ok(relative) = entry.path().strip_prefix(&root) {
+                            let relative = relative.to_string_lossy();
+                            if !relative.is_empty()
+                                && !filter.decide(relative.as_ref()).is_included()
+                            {
+                                return WalkState::Continue;
+                            }
+                        }
+                    }
+                    make_entry(&root, root_is_directory, &entry)
+                }
                 Err(error) => Err(ScanError::Walk(error.to_string())),
             };
 

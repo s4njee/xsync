@@ -203,6 +203,95 @@ fn test_native_rsync_fallback_needs_no_local_rsync_executable() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("transport: rsync"));
 }
 
+/// A deeply nested tree with directories interleaved among files in the file
+/// list. The synthetic corpora the rsync transport was previously exercised
+/// against are shallow, and a shallow tree hides an ordering divergence: the
+/// receiver re-sorts the file list it is sent, so a sender whose order differs
+/// from GNU rsync's own gives the two sides different index spaces. The
+/// receiver then requests data for an index the sender holds a directory at,
+/// and the transfer aborts. This drives the real reference receiver, so it
+/// fails on any such divergence rather than on an assertion about ordering.
+#[test]
+fn test_rsync_deep_nested_tree_matches_reference_receiver() {
+    let src = tempdir().unwrap();
+    // "hr-extra" sorts ahead of "hr" because a directory compares as though
+    // its name ended in '/', and "index.json" precedes its sibling
+    // directories because non-directories lead within a directory.
+    for directory in [
+        "bills/hr/1",
+        "bills/hr/2",
+        "bills/hr-extra",
+        "bills/hjres/1",
+        "bills/s/1",
+        "bills/sres/9",
+        "committees/house",
+        "votes/2023/1",
+    ] {
+        fs::create_dir_all(src.path().join(directory)).unwrap();
+    }
+    for file in [
+        "README.md",
+        "zzz-top.txt",
+        "bills/index.json",
+        "bills/hr/index.json",
+        "bills/hr/1/data.json",
+        "bills/hr/1/text.txt",
+        "bills/hr/2/data.json",
+        "bills/hr-extra/note.txt",
+        "bills/hjres/1/data.json",
+        "bills/s/1/data.json",
+        "bills/sres/9/data.json",
+        "committees/list.json",
+        "committees/house/roster.json",
+        "votes/2023/1/tally.json",
+    ] {
+        fs::write(src.path().join(file), file.as_bytes()).unwrap();
+    }
+
+    let expected = tempdir().unwrap();
+    let actual = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), false) else {
+        return;
+    };
+
+    assert!(Command::new(reference_rsync().unwrap())
+        .arg("-rlptW")
+        .arg("--protocol=32")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", expected.path().display()))
+        .status()
+        .unwrap()
+        .success());
+
+    let output = Command::new(xsync_bin())
+        .arg("--transport")
+        .arg("rsync")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", actual.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "deep nested tree failed over the rsync transport: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut expected_entries = build_manifest(expected.path()).unwrap().entries;
+    let mut actual_entries = build_manifest(actual.path()).unwrap().entries;
+    for (expected, actual) in expected_entries.iter_mut().zip(&mut actual_entries) {
+        if expected.kind != xsync_bench::manifest::ManifestKind::File {
+            expected.mtime.nanoseconds = 0;
+            actual.mtime.nanoseconds = 0;
+        }
+    }
+    assert_eq!(expected_entries, actual_entries);
+}
+
 #[test]
 fn test_auto_falls_back_only_when_remote_xsync_is_missing() {
     let src = tempdir().unwrap();
@@ -1339,4 +1428,72 @@ fn test_version_matches_the_manifest_exactly() {
     let text = String::from_utf8_lossy(&output.stdout);
     let reported = text.split_whitespace().nth(1).unwrap_or_default();
     assert_eq!(reported, env!("CARGO_PKG_VERSION"));
+}
+
+/// Two source names that a case- or normalization-insensitive destination cannot
+/// tell apart must never be published silently. Before this check existed, a
+/// four-file source landed as two files with exit code 0, one of them holding
+/// another file's contents.
+///
+/// Skipped on a destination that distinguishes both, since there is nothing to
+/// collide — that is the correct outcome on ext4, not a failure.
+#[test]
+fn colliding_destination_paths_are_refused_not_silently_merged() {
+    let src = tempdir().unwrap();
+    let dst = tempdir().unwrap();
+
+    let semantics = xsync_core::pathsem::PathSemantics::probe(dst.path());
+    if !semantics.can_collide() {
+        return;
+    }
+
+    fs::write(src.path().join("Readme.md"), b"upper").unwrap();
+    fs::write(src.path().join("readme.md"), b"lower").unwrap();
+    // "café.txt" as NFC (U+00E9) and as NFD (e + U+0301).
+    fs::write(src.path().join("caf\u{e9}.txt"), b"nfc").unwrap();
+    fs::write(src.path().join("cafe\u{301}.txt"), b"nfd").unwrap();
+    let source_count = fs::read_dir(src.path()).unwrap().count();
+    if source_count < 4 {
+        // The source volume folds these names too, so the case cannot be built.
+        return;
+    }
+
+    // Default policy refuses, writes nothing, and exits non-zero.
+    let refused = Command::new(xsync_bin())
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("{}", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "a collision must fail the run, got success"
+    );
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("collide"),
+        "error should name the problem: {message}"
+    );
+    assert_eq!(
+        fs::read_dir(dst.path()).unwrap().count(),
+        0,
+        "nothing may be published when the run is refused"
+    );
+
+    // Skip policy publishes nothing colliding and reports partial failure.
+    let skipped = Command::new(xsync_bin())
+        .arg("--on-path-collision=skip")
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("{}", dst.path().display()))
+        .output()
+        .unwrap();
+    assert_eq!(
+        skipped.status.code(),
+        Some(i32::from(xsync_core::local::PARTIAL_FAILURE_EXIT_CODE)),
+        "skipping collisions is a partial failure"
+    );
+    assert_eq!(
+        fs::read_dir(dst.path()).unwrap().count(),
+        0,
+        "every colliding path is skipped, so nothing is published"
+    );
 }

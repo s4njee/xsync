@@ -66,8 +66,15 @@ frame as failure.
   a signed 64-bit value.
 - File-list names are byte strings with protocol-specific inherited-name and
   length flags. They are not UTF-8 strings.
-- File-list entries are sorted lexicographically by relative path before index
-  references are used.
+- File-list entries are ordered exactly the way GNU rsync's own `f_name_cmp`
+  orders them, because the receiver re-sorts the list it is handed and both
+  sides then index into that order. The rules are: the transfer root leads the
+  list; a name compares as its parent directory, then `/`, then its final
+  component; a directory compares as though its name carried a trailing `/`
+  (so `hr-extra` precedes `hr`); and within one parent directory every
+  non-directory precedes every directory. Plain lexicographic ordering by
+  relative path is *not* equivalent and desynchronizes the index space on
+  deeply nested trees.
 - Most server-to-client bytes use the four-byte multiplex envelope. Tag `7`
   carries normal protocol data; other tags carry out-of-band messages. Tag `1`
   is a sender-side error and is fatal. The initial version/seed exchange is not
