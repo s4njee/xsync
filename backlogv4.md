@@ -315,6 +315,38 @@ Unix ownership, and V3.3 conflated the two. Replaced with an explicit
 
 ---
 
+### 4.12 — Measure the Windows Defender tax on file-copy throughput
+
+- [ ] **Medium priority.** Real-time protection scans every written file. On a
+  109,615-file corpus that is a per-file cost paid on top of everything xsync
+  does, and it is the leading hypothesis for why Mac -> Windows staged at
+  **1,025 files/s** against 6,351 files/s for the same corpus Mac -> Linux.
+
+**This is not a recommendation to disable it.** Nobody realistically turns
+Defender off, so the default configuration is the honest one to benchmark and
+report. The value of measuring the delta is explanatory: it separates "xsync is
+slow on Windows" from "Windows file creation is expensive under real-time
+scanning", and gives the writeup a number to point at instead of a hypothesis.
+
+**AC**
+- Same corpus, same host, two arms: stock Defender, and with a temporary
+  `Set-MpPreference -ExclusionPath` covering only the benchmark source and
+  destination. The exclusion is a **security setting change and needs the
+  operator's explicit consent** — it is not something the benchmark harness
+  should do on its own.
+- The exclusion is removed afterwards, and the writeup states it was temporary.
+- Results are reported as "Windows as configured" (the headline) and "Windows
+  with the benchmark paths excluded" (the explanatory figure). The first is the
+  number users will experience.
+- If the gap is large, it belongs in the README's platform notes, since it
+  affects how xsync's Windows numbers should be read against Linux and macOS.
+
+**Related, found while setting this up:** the machine's existing Defender
+exclusions point at `C:\Users\sanje\...` — the pre-local-account profile path.
+They no longer match `C:\Users\sanjee\...`, so cargo builds and everything else
+in the current profile are being scanned. Worth fixing on the box independently
+of this story.
+
 ## Phase 5 — Very low priority
 
 Recorded so they are not lost, explicitly *not* scheduled.
