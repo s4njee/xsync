@@ -7,7 +7,7 @@ sometimes correct earlier ones.
 
 | Study | Machines | What it answers |
 |---|---|---|
-| [Baseline: congress/118 → mars](#dataset) | mac → mars, 1 GbE | xsync vs rsync/tar/scp over a network |
+| [Baseline: congress/118 → mars](#baseline-congress118--marslocal) | mac → mars, 1 GbE | xsync vs rsync/tar/scp over a network |
 | [`--streams` on large files](#--streams-on-large-files-corpus-b-manga--2026-08-28) | mac → mars | Where parallel streams pay, and where they do not |
 | [Fix and re-measurement on cb7](#fix-and-re-measurement-corpus-c-cb7--2026-08-28) | mac → mars | The small-file `--streams` regression, fixed (2.70x) |
 | [Cross-NVMe on freya](#cross-nvme-local-transfer-on-freya-corpus-a--2026-08-28) | freya, local | First local NVMe-to-NVMe; warm caches |
