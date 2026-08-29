@@ -1024,6 +1024,64 @@ its 3,310 links was recreated — 62,621 entries landed, matching 59,311 files p
 symlink creation on Windows requires elevation, which is a deployment caveat
 rather than an xsync limitation.
 
+### Cross-device on Windows, and the Inland SATA answered
+
+The Inland SATA SSD (954 GB) was formatted NTFS as `X:`, giving Windows a
+cross-device pair for the first time: Kingston NVMe (`C:`) to Inland SATA (`X:`).
+
+**The Inland has no SLC cliff.** Sustained write in 4 GB steps across 24 GB:
+
+| Written | 4 GB | 8 GB | 12 GB | 16 GB | 20 GB | 24 GB |
+|---|---:|---:|---:|---:|---:|---:|
+| MB/s | 342 | 390 | 398 | 401 | 400 | 401 |
+
+It *rises* slightly over the first 8 GB — filesystem warm-up rather than cache —
+then holds flat at ~400 MB/s. Unlike the Kingston, nothing degrades. 400 MB/s sits
+below SATA III's ~550 MB/s ceiling, which is ordinary for a budget SATA drive, and
+the interface caps it long before any NAND behaviour becomes visible.
+
+**The bracketed control confirms no drift this session**: opening arm 50.28 s,
+closing arm 50.24 s — 0.08% apart.
+
+### congress-100k, same-device versus cross-device
+
+congress has no symlinks, so this is a like-for-like comparison.
+
+| Tool | Same device (C:→C:) | Cross device (C:→X:) | Improvement |
+|---|---:|---:|---:|
+| `xs --local-workers 16` | 47.78 s | 47.94 s | **1.00x** |
+| `robocopy /MT:16` | 27.47 s | 16.16 s | **1.70x** |
+
+**robocopy nearly halves its time when reads and writes are on separate devices.
+xsync does not move at all.** Its advantage widens from 1.74x to **2.97x**.
+
+That is the most actionable result on this platform. Separating the devices
+removes read/write contention, and robocopy converts that directly into
+throughput. xsync gaining nothing says its bottleneck is not disk contention —
+it is per-file work that both devices were waiting on anyway, which matches the
+40-53% system time observed during these runs and the earlier syscall attribution
+putting `Sink::destination_path` at 52% of sampled stacks.
+
+### The cb7 cross-device figures are not comparable
+
+`robocopy` completed cb7 in 15.44 s against xsync's 39.82 s, which looks like a
+2.58x gap. It is not one. Verified afterwards by re-running it and counting the
+output:
+
+| | files | symlinks | size |
+|---|---:|---:|---:|
+| source | 59,311 | 3,310 | 5.5 GiB |
+| xsync | 59,311 | **3,310** | 5.49 GiB |
+| robocopy `/XJ` | 59,311 | **0** | 5.49 GiB |
+
+robocopy copied every regular file and **silently skipped all 3,310 symlinks**.
+It was doing less work, so the times cannot be compared. Without `/XJ` it does not
+skip them — it hangs on them instead, under the default `/R:1000000 /W:30`.
+
+There is no robocopy flag combination in this test that both handles the symlinks
+and completes, so cb7 has no valid robocopy baseline. congress remains the fair
+comparison.
+
 ### Three drives, three failure modes
 
 Every consumer SSD used in this project has misled a measurement in a different
