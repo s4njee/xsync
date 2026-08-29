@@ -1000,6 +1000,22 @@ The median is unaffected, but a 2.5x outlier on an otherwise tight arm is the
 signature this file keeps running into, and is why medians rather than means are
 used throughout.
 
+### robocopy hangs on symlinks; xsync does not
+
+The cb7 `robocopy` arm never completed. The destination was verified correct —
+62,621 entries, 5.49 GB, matching the source — so the copy itself had finished;
+robocopy was then stuck retrying. **Its defaults are `/R:1000000 /W:30`**: one
+million retries, thirty seconds apart, on any file it cannot handle. With 3,310
+symlinks in the tree and no `/SL`, that is effectively an infinite hang, and it
+had burned 138 CPU-seconds before being killed.
+
+This did not appear on congress-100k because that corpus contains no symlinks.
+
+The comparison is worth stating plainly: on the same corpus, **xsync recreated all
+3,310 symlinks and finished in 43.55 s**, while robocopy copied the data and then
+hung. Any robocopy figure in this file therefore assumes `/R:0 /W:0` and a corpus
+it can fully handle — a caveat that applies to the tool, not to the measurement.
+
 ### All 3,310 symlinks survived NTFS
 
 cb7 is the first corpus to exercise symlinks at scale on Windows, and every one of
