@@ -301,7 +301,31 @@ Unix ownership, and V3.3 conflated the two. Replaced with an explicit
 
 ### 4.10 — Windows benchmarks, three corpora
 
-- [ ] congress, cb7 and Manga, matching the macOS and Linux protocol.
+- [~] congress, cb7 and Manga, matching the macOS and Linux protocol.
+  congress-100k in progress.
+
+> **The Windows box and `mars` are the same physical machine, dual-booting.** The
+> 1.9 TB partition on the SPCC NVMe (disk 1) is an Arch install; Windows lives on
+> the Kingston NVMe. **Never format or mount disk 1** — it is a live system with
+> the owner's data. The RAW Inland SATA SSD (disk 0) is the one earmarked for a
+> second volume, and the owner is formatting it themselves.
+>
+> This makes the Windows-versus-Linux comparison far stronger than it looked:
+> same Ryzen 9 7900X, same RAM, same board, same network. The earlier
+> `Mac -> mars` figures and today's `Mac -> Windows` figures differ by operating
+> system rather than by hardware.
+>
+> | | Same corpus, congress-100k, from the same Mac |
+> |---|---|
+> | `Mac -> mars` (Arch Linux) | 17.3 s, ~6,336 files/s |
+> | `Mac -> Windows` | 106.9 s, 1,025 files/s |
+>
+> **6.2x, on identical silicon.** One caveat to carry into the writeup: the two
+> operating systems live on *different NVMe drives* (Kingston for Windows, SPCC
+> for Arch), so the storage is not controlled even though the machine is. Whether
+> that accounts for any of the gap is untested; Defender being the top CPU
+> consumer during the Windows run (`MsMpEng`, 4.5x the next process) points
+> elsewhere.
 
 **AC**
 - Cold-cache measurement. Windows has no `drop_caches`/`purge` equivalent, so
