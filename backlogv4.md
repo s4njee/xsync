@@ -405,6 +405,51 @@ looked like a third bug. Remote binaries need updating alongside the client when
 the wire changes — worth a check in the benchmark harness rather than a surprise
 mid-run.
 
+### 4.14 — Choose the stream count from the corpus, not from the user
+
+- [ ] `--streams` defaults to 1 and is otherwise whatever the user typed. The
+  measurements say the right value is a property of the *corpus*, and xsync
+  already knows it by the time it could act.
+
+**Why this is structural, not just empirical.** The multi-stream path partitions
+on `MAX_DATA_SEGMENT` (8 MB): files at or below it are written by the **control
+session**, and only larger files are striped across data threads. Streams can
+therefore only ever accelerate large-file bytes. Every measurement agrees:
+
+| Corpus | Bytes in files >8 MB | Measured effect of streams |
+|---|---:|---|
+| congress-100k | 0% | harmful — Linux neutral after the batching fix, Windows 1.44-1.53x slower |
+| cb7 | 68% | untested as a streams question; its 2.70x was the batching fix |
+| Manga | 99% | helps, ~1.2x, peaking at 4 |
+
+**Gate on bytes, not file count.** cb7 is 82.6% small files by count but 68% large
+by bytes. A count-based rule would disable streams on exactly the corpus most
+likely to benefit.
+
+**AC**
+
+- The default stream count is derived after planning, when the size distribution
+  is already known, from the share of transferred **bytes** in files above
+  `MAX_DATA_SEGMENT`. Below a threshold, 1 stream. Above it, a small number.
+- **An explicit `--streams N` always wins.** The heuristic sets a default, never
+  overrides an instruction.
+- **The fixed cost is charged honestly.** Each stream is an extra SSH connection:
+  measured at ~1.3 s for 4-8 streams on Linux and higher on Windows, established
+  in a sequential `spawn_server_child` loop. Streams should only be chosen when
+  the expected gain exceeds that, which for a ~1.2x gain means a transfer of at
+  least tens of seconds. A small large-file corpus should still use 1.
+- **Cap by platform.** Windows made streams *harmful* even on small files, and its
+  per-connection cost is higher. The cap there should be lower than on Linux, or
+  1 until measured otherwise — the same shape of platform-specific limit as
+  `MACOS_WORKER_CAP`, and for the same evidence-led reason.
+- The chosen value is visible: reported in the run summary and the `finished`
+  event, so a surprising choice can be diagnosed rather than guessed at.
+
+**Evidence gap to close first.** The large-file benefit is measured on Linux
+only. A Manga-over-network run to Windows is queued; if streams turn out to be
+harmful there even on large files, the platform cap becomes the dominant term and
+the byte-share rule applies only to Unix targets.
+
 ### 4.11 — Detect hardlinks and alternate data streams on Windows
 
 - [ ] **Very low priority.** These are undetected on NTFS but no longer
