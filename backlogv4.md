@@ -37,6 +37,30 @@ write ceiling** — against 4% for congress on the same machine and drive. That
 contrast is the point: it bounds how much of the congress result was per-file
 overhead rather than device limits.
 
+> **First attempt discarded 2026-08-29 — the drive, not the tool.** A 5-arm sweep
+> plus 3 baselines at 3 reps wrote **641 GiB to a 256 GB drive in one session**,
+> 2.5x its capacity. Sustained write fell from 913 MB/s (cool, empty) to 615 MB/s
+> measured afterwards, and every arm from 4 workers on sat on a ~176-180 MB/s
+> floor. The within-arm drift is unambiguous: workers 1 went 79.3 -> 87.8 -> 100.0 s
+> across its three reps (+26%), workers 2 went 47.6 -> 53.4 -> 99.3 s (+109%).
+> Worker count and accumulated wear were confounded, and the baselines — which ran
+> last, on the most degraded drive — are void with them.
+>
+> This is the same confound that was raised against the congress sweep and cleared
+> there; congress writes 13 GB per run and its cooled re-run reproduced to within
+> 1.3%. Manga writes 26.7 GB, and 24 runs of it exceeds what this drive sustains.
+
+**Redesign required.** The corpus is too large to sweep repeatedly on a 256 GB
+drive:
+
+- Use a **bounded subset** — roughly 4-6 GiB of large files keeps the large-file
+  character while cutting per-run writes 5x. APFS `cp -c` clones make staging free.
+- **Randomise or reverse arm order**, and **bracket the session** with an identical
+  arm first and last. The bracket alone would have caught this within minutes.
+- **Verify the drive between arms**: a 4 GiB `dd` write should return to baseline;
+  if it does not, stop and let the drive recover.
+- Budget total bytes written per session against drive capacity, and record it.
+
 **AC**
 - Worker sweep 1-16, plus `cp -R`, `ditto` and `rsync -a` baselines. `ditto` is
   the macOS-native tool and the fairest local comparison on this platform.
