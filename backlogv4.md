@@ -175,8 +175,45 @@ possible*, and only then testing.
 
 ### 4.8 — Get Windows to a green test suite
 
-- [ ] `cargo check` passes for `x86_64-pc-windows-msvc` (D0.1), but linking and
-  tests need MSVC, and an earlier run had **13 of 24 tests failing**.
+- [x] **Done 2026-08-29. 265 tests pass, 0 fail, 2 ignored**, against the previous
+  record of 13 of 24 failing. `xs.exe` builds (6.29 MB, `x86_64-pc-windows-msvc`,
+  blake3 + zstd, wire v2) and the engine runs real transfers under test with 24
+  workers, including resume checkpointing.
+
+**Host:** Ryzen 9 7900X (12C/24T), 31 GB RAM, Windows 11 Pro build 26200, Visual
+Studio Community 2026 (MSVC was already working — it compiled zstd's C sources
+without intervention).
+
+**Four defects fixed**, two of them regressions introduced earlier in this
+session that macOS could never have caught:
+
+1. **`xattr` was an unconditional dependency** (added for V3.3 dropped-metadata
+   reporting) and does not compile on Windows. Both call sites were already
+   inside `#[cfg(unix)]`; only the manifest entry was ungated. Moved to
+   `[target.'cfg(unix)'.dependencies]`.
+2. **`note_dropped_metadata` was defined twice** — the parallelisation refactor
+   left the old pre-refactor `#[cfg(not(unix))]` arm behind. `cfg(unix)` compiles
+   it out on macOS and Linux, so it was invisible until Windows compiled both.
+3. **`clone_spike.rs` referenced `status` on non-Unix**, where the early `return`
+   was still followed by a parsed `if status.success()` and neither `let status`
+   arm exists. Restructured so each platform arm is self-contained.
+4. **Unix-only research spikes blocked the workspace build.**
+   `xsync-remote-spike` uses `MetadataExt`, `PermissionsExt` and
+   `CommandExt::exec` pervasively. `benches/engine` is now excluded from
+   `default-members` rather than ported — `cargo test --workspace` on Unix still
+   runs all 19 suites, so no coverage is lost.
+
+**Note:** SSH sessions could not run `cargo` at first — rustup's shims are
+symlinks to `rustup.exe`, and Windows disables *remote-to-local* symlink
+evaluation by default, so a network logon cannot traverse them. Worked around by
+putting the real toolchain `bin` on `PATH` rather than changing the machine's
+symlink policy.
+
+**Still open from the original AC:**
+- [ ] CI runs the Windows job and is allowed to fail the build.
+- [ ] Path-semantics tests: drive letters, UNC paths, `\` vs `/`, reserved names
+  (`CON`, `NUL`, `AUX`), trailing dots and spaces, and the 260-character limit.
+  None of these have a Unix analogue and they are where a file copier breaks.
 
 **AC**
 - `cargo test` runs and passes on Windows, or every failure is triaged and either

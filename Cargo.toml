@@ -6,6 +6,16 @@ members = [
     "crates/xsync",
     "crates/xsync-core",
 ]
+# `benches/engine` holds Unix-only research spikes (`xsync-remote-spike` uses
+# `MetadataExt`, `PermissionsExt` and `CommandExt::exec` throughout) and is not
+# part of the product. Excluding it from the default set keeps `cargo build` and
+# `cargo test` green on Windows without pretending to port those tools. Build
+# them explicitly with `-p xsync-engine-bench` on a Unix host.
+default-members = [
+    "benches",
+    "crates/xsync",
+    "crates/xsync-core",
+]
 
 [workspace.package]
 edition = "2021"

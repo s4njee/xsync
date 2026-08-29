@@ -31,7 +31,11 @@ shlex = "1.3"
 tempfile = "3"
 thiserror = "2"
 unicode-normalization = "0.1"
-xattr = "1"
 zstd = "0.13"
+
+# `xattr` is Unix-only and does not compile on Windows. The dropped-metadata
+# preflight already gates every use behind `#[cfg(unix)]`.
+[target.'cfg(unix)'.dependencies]
+xattr = "1"
 
 [dev-dependencies]

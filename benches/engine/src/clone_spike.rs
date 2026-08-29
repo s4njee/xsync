@@ -8,6 +8,7 @@
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
 use filetime::{set_file_times, set_symlink_file_times, FileTime};
@@ -335,17 +336,21 @@ fn platform_clone_file(source: &Path, destination: &Path) -> io::Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "platform clone probe unavailable",
-    ));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if status.success() {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "platform clone/reflink command failed",
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "platform clone probe unavailable",
         ))
     }
 }
@@ -367,17 +372,21 @@ fn platform_clone_directory(source: &Path, destination: &Path) -> io::Result<()>
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "platform directory clone probe unavailable",
-    ));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if status.success() {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "platform directory clone/reflink command failed",
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (source, destination);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "platform directory clone probe unavailable",
         ))
     }
 }

@@ -374,17 +374,6 @@ fn xattr_is_significant(name: &std::ffi::OsStr) -> bool {
         .is_none_or(|name| !KERNEL_MAINTAINED.contains(&name))
 }
 
-#[cfg(not(unix))]
-fn note_dropped_metadata(
-    _dropped: &mut DroppedMetadata,
-    _entry: &FileEntry,
-    _metadata: &std::fs::Metadata,
-    _path: &Path,
-    _owner: Option<Owner>,
-    _links: &mut HashMap<(u64, u64), usize>,
-) {
-}
-
 #[cfg(unix)]
 // The non-Unix arm of this function has nothing to report, so the
 // `Option` is load-bearing there even though this arm always fills it.
