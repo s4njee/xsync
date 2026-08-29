@@ -37,6 +37,12 @@ pub struct DroppedMetadata {
     /// Entries carrying extended attributes. On macOS this includes resource
     /// forks, Finder info, and quarantine flags.
     pub with_xattrs: usize,
+    /// Sparse files that will be written dense because holes are not preserved.
+    ///
+    /// Populated on Windows, where the sparse *attribute* is visible through
+    /// stable std but the allocated size is not, so the byte saving cannot be
+    /// reported the way [`SparseReport`] does on Unix.
+    pub sparse_written_dense: usize,
     /// Entries owned by a user or group other than the one running xsync, whose
     /// ownership therefore cannot be reproduced.
     pub foreign_owner: usize,
@@ -46,7 +52,10 @@ impl DroppedMetadata {
     /// Whether anything at all will be lost.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.hardlinked == 0 && self.with_xattrs == 0 && self.foreign_owner == 0
+        self.hardlinked == 0
+            && self.with_xattrs == 0
+            && self.foreign_owner == 0
+            && self.sparse_written_dense == 0
     }
 }
 
@@ -201,6 +210,7 @@ struct Partial {
     sparse: SparseReport,
     with_xattrs: usize,
     foreign_owner: usize,
+    sparse_written_dense: usize,
     /// `(device, inode, size)` for each entry whose inode has more than one
     /// name, in encounter order.
     links: Vec<(u64, u64, u64)>,
@@ -221,6 +231,7 @@ fn merge(partials: Vec<Partial>, capacity_hint: usize) -> Preflight {
         result.sparse.files.extend(partial.sparse.files);
         result.dropped.with_xattrs += partial.with_xattrs;
         result.dropped.foreign_owner += partial.foreign_owner;
+        result.dropped.sparse_written_dense += partial.sparse_written_dense;
         for (device, inode, size) in partial.links {
             result.dropped.hardlinked += 1;
             let count = seen.entry((device, inode)).or_insert(0_usize);
@@ -352,7 +363,48 @@ fn note_dropped_metadata(
     }
 }
 
-#[cfg(not(unix))]
+/// Record dropped metadata on platforms without Unix ownership.
+///
+/// On Windows this reports sparse files, which are otherwise written out dense
+/// in silence — a 10 MB sparse file occupying almost nothing on disk becomes
+/// 10 MB of real zeros at the destination, with no warning at all before this.
+///
+/// Two things NTFS loses are deliberately *not* reported, because stable Rust
+/// cannot see them and this crate denies `unsafe` outside one documented
+/// exemption:
+///
+/// - **Hardlinks.** `std::os::windows::fs::MetadataExt::number_of_links` is
+///   behind the unstable `windows_by_handle` feature. Measured behaviour: a
+///   hardlinked pair arrives as two independent copies.
+/// - **Alternate data streams.** Enumerating them needs `FindFirstStreamW`.
+///   Measured behaviour: the stream is silently dropped.
+///
+/// Junctions are also converted to symlinks, which `file_attributes` cannot
+/// distinguish from a real symlink without reading the reparse tag.
+#[cfg(windows)]
+fn note_dropped_metadata(
+    partial: &mut Partial,
+    entry: &FileEntry,
+    path: &Path,
+    _owner: Option<Owner>,
+) {
+    use std::os::windows::fs::MetadataExt;
+
+    /// `FILE_ATTRIBUTE_SPARSE_FILE`.
+    const SPARSE: u32 = 0x0000_0200;
+
+    if entry.kind != EntryKind::File {
+        return;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if metadata.file_attributes() & SPARSE != 0 {
+        partial.sparse_written_dense += 1;
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn note_dropped_metadata(
     _partial: &mut Partial,
     _entry: &FileEntry,

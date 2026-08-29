@@ -3656,7 +3656,11 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         // is another host, where uids mean something different, so comparing
         // them would produce a warning that cannot be acted on.
         let preflight = crate::sparse::inspect(&transferable, source_path, None);
-        crate::local::report_preflight(&preflight, false, &mut emit);
+        crate::local::report_preflight(
+            &preflight,
+            crate::local::OwnershipCheck::Unsupported,
+            &mut emit,
+        );
         dropped = preflight.dropped;
     }
     emit(LocalEvent::Phase {

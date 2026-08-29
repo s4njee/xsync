@@ -227,7 +227,54 @@ symlink policy.
 
 ### 4.9 — Windows filesystem behaviour
 
-- [ ] NTFS differs from APFS and ext4 in ways this project already cares about.
+- [~] **Measured 2026-08-29 against a purpose-built NTFS fixture** (hardlink pair,
+  10 MB sparse file, alternate data stream, directory symlink, junction, file
+  symlink, read-only file). One fix landed; three gaps documented as
+  undetectable on stable Rust.
+
+**What works**
+
+| Behaviour | Result |
+|---|---|
+| Files, directories, read-only attribute | preserved |
+| Symlinks, file and directory | preserved as symlinks |
+| Reflink/clone probe | declines cleanly: 0 clones, byte-copy path, no error |
+
+**What silently loses data** — all four were completely silent before this work:
+
+| Behaviour | Measured result | Detectable? |
+|---|---|---|
+| **Sparse files** | 10 MB sparse file written as 10 MB of real zeros | **Yes — now warns** |
+| **Hardlinks** | pair with 2 links each arrives as 2 independent copies, 1 link each | No: `number_of_links` needs unstable `windows_by_handle` |
+| **Alternate data streams** | 20-byte `:hidden` stream dropped entirely | No: needs `FindFirstStreamW` (FFI) |
+| **Junctions** | silently converted to symlinks | No: needs the reparse tag, which `file_attributes` does not expose |
+
+The three undetectable cases need either an unstable feature or `unsafe` FFI, and
+this crate denies `unsafe` outside one documented exemption. They are recorded in
+the `note_dropped_metadata` doc comment with their measured behaviour so the next
+person does not have to rediscover them.
+
+**Fixed:** sparse files are now reported on Windows via
+`FILE_ATTRIBUTE_SPARSE_FILE`, which stable std does expose. The byte saving
+cannot be quantified the way `SparseReport` does on Unix — the allocated size is
+not reachable — so the warning states the consequence without inventing a number.
+
+**Also fixed, found by this work:** on a *real* run Windows reported "ownership
+was not checked: **a dry run** does not write to the destination". `Owner::probe`
+returns `None` both when a dry run declines to write and when the platform has no
+Unix ownership, and V3.3 conflated the two. Replaced with an explicit
+`OwnershipCheck` enum: `Performed`, `SkippedForDryRun`, `Unsupported`. Windows is
+`Unsupported` and stays silent, because that is not a limitation of the run.
+
+**Still open**
+
+- [ ] V3.1 collision detection is **untested on NTFS**. A colliding pair cannot be
+  created locally — NTFS is case-insensitive, so writing `readme.md` overwrote
+  `README.md` in the fixture. Testing it needs a case-sensitive *source*, i.e. a
+  transfer from a Linux host. Deferred to the remote leg of 4.10.
+- [ ] Hardlinks, ADS and junction conversion remain undetected. Revisit if a
+  `windows-sys` dependency or an `unsafe` exemption is ever judged worthwhile;
+  each is a real, silent data loss on NTFS.
 
 **AC**
 - Case-insensitivity: NTFS is case-insensitive but case-preserving, so the V3.1

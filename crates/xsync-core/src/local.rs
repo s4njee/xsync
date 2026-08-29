@@ -588,7 +588,18 @@ where
         owner,
         options.local_workers,
     );
-    report_preflight(&preflight, owner.is_some(), &mut emit);
+    // `Owner::probe` returns `None` both when a dry run declines to write and
+    // when the platform has no Unix ownership at all. Reporting those the same
+    // way told Windows users, on a real run, that "a dry run does not write to
+    // the destination".
+    let ownership = if owner.is_some() {
+        OwnershipCheck::Performed
+    } else if cfg!(unix) {
+        OwnershipCheck::SkippedForDryRun
+    } else {
+        OwnershipCheck::Unsupported
+    };
+    report_preflight(&preflight, ownership, &mut emit);
     if options.dry_run {
         emit_plan_actions(&plan, &mut emit);
     }
@@ -1681,14 +1692,26 @@ fn cache_hash(
 /// Reported as warnings rather than failures: a dense copy of a sparse file is
 /// wasteful and may not fit, but it is not incorrect, and refusing outright
 /// would block a user who knows their destination has room.
+/// Why ownership was or was not compared, so the caveat can be truthful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnershipCheck {
+    /// Ownership was compared against a file created at the destination.
+    Performed,
+    /// A dry run cannot create that file, so ownership went unchecked.
+    SkippedForDryRun,
+    /// The platform has no Unix ownership to compare. Not a limitation of this
+    /// run, so it is not worth a warning.
+    Unsupported,
+}
+
 pub(crate) fn report_preflight(
     preflight: &crate::sparse::Preflight,
-    ownership_checked: bool,
+    ownership: OwnershipCheck,
     emit: &mut impl FnMut(LocalEvent),
 ) {
     let dropped = !preflight.dropped.is_empty();
     report_dropped_metadata(&preflight.dropped, emit);
-    if dropped && !ownership_checked {
+    if dropped && ownership == OwnershipCheck::SkippedForDryRun {
         report_unchecked_ownership(emit);
     }
     report_sparse_files(&preflight.sparse, emit);
@@ -1715,6 +1738,13 @@ fn report_dropped_metadata(
             "{} entr(ies) carry extended attributes (resource forks, Finder info, \
              quarantine flags) that will not be copied",
             dropped.with_xattrs
+        ));
+    }
+    if dropped.sparse_written_dense > 0 {
+        parts.push(format!(
+            "{} sparse file(s) will be written dense; holes are not preserved on this \
+             platform, so the destination needs room for the full logical size",
+            dropped.sparse_written_dense
         ));
     }
     if dropped.foreign_owner > 0 {
