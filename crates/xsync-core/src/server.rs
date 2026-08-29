@@ -5374,6 +5374,9 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     let job_id = session_job_id(source_path.to_string_lossy().as_ref(), dest_path);
 
     // ---- Control session: handshake, destination scan, plan ----
+    // Settle the remote shell family first: the data threads below spawn their
+    // own children and must agree with this one about how to quote the command.
+    ensure_remote_shell_known(rsh, host);
     let mut control = spawn_server_child(dest_path, rsh, host)?;
     let control_stderr = control.stderr.take();
     let cstderr_handle = control_stderr.map(|mut pipe| {
@@ -6754,6 +6757,51 @@ pub fn remote_server_command(
         None => RemoteShell::Posix,
     };
     remote_server_command_with_shell(remote_path, rsh, host, shell)
+}
+
+/// Determine the remote shell family before a multi-stream session spawns anything.
+///
+/// Only the single-stream path discovers this, by attempting the POSIX form and
+/// retrying as `RemoteShell::Windows` when the remote turns out to be cmd.exe.
+/// It caches the answer with `remember_remote_shell`, and later
+/// `spawn_server_child` calls pick it up. A fresh process that goes straight to
+/// `--streams N` never runs that discovery: it assumes POSIX, cmd.exe cannot
+/// parse the single-quoted command, the child exits, and the transfer dies with
+/// "server stream disconnected" rather than anything naming the cause.
+///
+/// The probe runs a harmless marker command, never the server itself. An earlier
+/// version spawned a real `xs --server` against the destination and killed it,
+/// which left the destination's lock and journal state behind and broke the
+/// Linux path that had been working.
+fn ensure_remote_shell_known(rsh: Option<&str>, host: Option<&str>) {
+    let Some(host_name) = host else {
+        return;
+    };
+    if remote_shell_cache()
+        .lock()
+        .ok()
+        .is_some_and(|map| map.contains_key(&remote_shell_key(rsh, host_name)))
+    {
+        return;
+    }
+    // POSIX is tried first because its marker command cannot run under cmd.exe,
+    // while the cmd form would also succeed under a POSIX shell and so cannot
+    // discriminate on its own.
+    for (shell, command) in [
+        (RemoteShell::Posix, "printf 'XSYNCSHELLOK\n'"),
+        (RemoteShell::Windows, "echo XSYNCSHELLOK"),
+    ] {
+        let (program, args) = base_remote_invocation(rsh, host_name, command);
+        let Ok(output) = Command::new(program).args(args).output() else {
+            continue;
+        };
+        if String::from_utf8_lossy(&output.stdout).contains("XSYNCSHELLOK") {
+            remember_remote_shell(rsh, host_name, shell);
+            return;
+        }
+    }
+    // Neither form answered. Leave the cache alone and let the session report
+    // the real failure rather than masking it here.
 }
 
 fn spawn_server_child(

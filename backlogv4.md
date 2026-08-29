@@ -375,6 +375,36 @@ of this story.
 
 Recorded so they are not lost, explicitly *not* scheduled.
 
+### 4.13 — `--streams` was broken against Windows servers *(fixed 2026-08-29)*
+
+- [x] Multi-stream transfers to a Windows host failed outright with
+  `transport error on stream 0: server stream disconnected`.
+
+**Cause.** Only the single-stream path discovers the remote shell family. It
+tries the POSIX form, retries as `RemoteShell::Windows` on
+`RemoteShellMismatch`, and caches the answer with `remember_remote_shell`;
+later `spawn_server_child` calls read that cache. A fresh process invoked with
+`--streams N` never runs that discovery — it assumed POSIX, cmd.exe could not
+parse the single-quoted command, every child exited, and the error named the
+symptom rather than the cause.
+
+**Fix.** `ensure_remote_shell_known` probes once before the multi-stream control
+session spawns, and caches the result so the control session and all data
+threads agree.
+
+**A mistake worth recording.** The first version of that probe spawned a real
+`xs --server` against the destination and killed it, which left the destination's
+lock and journal state behind and broke `--streams` to Linux, which had been
+working. It now runs a harmless marker command through the same quoting path and
+never touches the destination. Verified afterwards across all four combinations:
+single and multi-stream, to Linux and to Windows.
+
+**Also found:** freya's `~/.local/bin/xs` was three days stale and spoke an older
+wire version, which produced `version mismatch: local v1 / remote v2` and briefly
+looked like a third bug. Remote binaries need updating alongside the client when
+the wire changes — worth a check in the benchmark harness rather than a surprise
+mid-run.
+
 ### 4.11 — Detect hardlinks and alternate data streams on Windows
 
 - [ ] **Very low priority.** These are undetected on NTFS but no longer
