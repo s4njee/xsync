@@ -323,25 +323,6 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    // Configure the failure log before any work, so a failure during setup is
-    // captured too. A log that cannot be opened is reported and fatal: a caller
-    // who asked for failure records and silently did not get them is worse off
-    // than one told immediately.
-    if let Some(spec) = cli.log_json.as_deref() {
-        if let Err(error) = xsync_core::faillog::enable(spec) {
-            eprintln!("xs: {error}");
-            return ExitCode::FAILURE;
-        }
-    }
-
-    // Ask the remote for structured records whenever this side is producing
-    // them, and echo relayed records into the stdout stream only when that
-    // stream exists.
-    xsync_core::server::configure_remote_logging(
-        cli.log_json.is_some() || cli.progress_json,
-        cli.progress_json,
-    );
-
     if cli.man {
         let command = <Cli as clap::CommandFactory>::command();
         if clap_mangen::Man::new(command)
@@ -367,6 +348,19 @@ fn main() -> std::process::ExitCode {
             return ExitCode::FAILURE;
         }
     }
+
+    // Configure logging after job resolution so job-level log_json settings
+    // are active before any transfer setup can fail.
+    if let Some(spec) = cli.log_json.as_deref() {
+        if let Err(error) = xsync_core::faillog::enable(spec) {
+            eprintln!("xs: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    xsync_core::server::configure_remote_logging(
+        cli.log_json.is_some() || cli.progress_json,
+        cli.progress_json,
+    );
 
     match run(&cli, &matches) {
         Ok(RunOutcome::Complete) => ExitCode::SUCCESS,
@@ -500,6 +494,12 @@ fn resolve_job(cli: &mut Cli, matches: &ArgMatches) -> Result<JobOutcome, CliErr
     if cli.list_jobs {
         list_jobs(cli.config.as_deref())?;
         return Ok(JobOutcome::Listed);
+    }
+
+    if cli.job.is_some() && (cli.src.is_some() || cli.dest.is_some()) {
+        return Err(CliError::Usage(
+            "--job cannot be combined with explicit SRC or DEST positional arguments".to_owned(),
+        ));
     }
 
     // Three ways to name a job, in decreasing explicitness.
@@ -750,10 +750,18 @@ fn build_filter<'a>(
         ("include", Action::Include, &cli.include),
         ("exclude", Action::Exclude, &cli.exclude),
     ] {
-        if let Some(indices) = matches.indices_of(id) {
+        let typed_count = matches.indices_of(id).map_or(0, |indices| {
             for (index, value) in indices.zip(values) {
                 sources.push((index, Source::Pattern(action, value.as_str())));
             }
+            values.len()
+        });
+        // Config-derived job excludes are appended after clap parsing and have
+        // no ArgMatches indices. Put them after command-line rules so explicit
+        // CLI rules retain precedence.
+        for (offset, value) in values.iter().enumerate().skip(typed_count) {
+            let rank = values.len().saturating_sub(1).saturating_sub(offset);
+            sources.push((usize::MAX - rank, Source::Pattern(action, value.as_str())));
         }
     }
     for (id, action, values) in [
@@ -1931,6 +1939,21 @@ mod tests {
         assert_eq!(cli.compress_level, Some(9));
         assert_eq!(cli.streams, Some(4));
         assert_eq!(cli.transport, TransportArg::Rsync);
+    }
+
+    #[test]
+    fn job_excludes_reach_the_filter() {
+        let (mut cli, matches) = parse_with_matches(&["xs", "--job", "j"]);
+        merge_job(&mut cli, &matches, &job_fixture());
+        let filter = build_filter(&cli, &matches).unwrap();
+        assert!(!filter.decide("scratch.tmp").is_included());
+        assert!(filter.decide("keep.txt").is_included());
+    }
+
+    #[test]
+    fn job_rejects_explicit_positional_paths() {
+        let (mut cli, matches) = parse_with_matches(&["xs", "--job", "j", "src", "dest"]);
+        assert!(resolve_job(&mut cli, &matches).is_err());
     }
 
     #[test]

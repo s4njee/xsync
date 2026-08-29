@@ -25,7 +25,7 @@ use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -45,8 +45,8 @@ use crate::protocol::{
 use crate::protocol_v2::{self, V2CodecError, V2Frame, V2Message};
 use crate::protocol_v2::{BrowseEntry, MutationStatus};
 use crate::scanner::{
-    fingerprint_from_metadata, permission_mode, scan, EntryKind as ScanEntryKind, FileEntry,
-    FileIdentity, ScanError, SourceFingerprint,
+    fingerprint_from_metadata, permission_mode, scan, scan_with_filter, EntryKind as ScanEntryKind,
+    FileEntry, FileIdentity, ScanError, SourceFingerprint,
 };
 use crate::sink::{Sink, SinkError, SymlinkTargetKind};
 use crate::source::{SourceReadError, SourceReader};
@@ -2155,6 +2155,7 @@ impl Server {
                 Message::FileSegment {
                     file_id,
                     offset,
+                    digest,
                     data,
                 } => {
                     if let Some(record) = active_files.remove(&file_id) {
@@ -2169,7 +2170,7 @@ impl Server {
                             &file_entry.path,
                             &mut self.seen_destinations,
                         )?;
-                        let hash = blake3::hash(&data);
+                        let hash = blake3::Hash::from_bytes(digest);
                         sink.write_file_with_retry(
                             &file_entry,
                             &hash,
@@ -2178,7 +2179,7 @@ impl Server {
                         self.ack(writer, frame.message_id, 4)?;
                     } else if let Some(file_entry) = large_files.get(&file_id) {
                         let length = data.len() as u64;
-                        let hash = blake3::hash(&data);
+                        let hash = blake3::Hash::from_bytes(digest);
                         sink.write_chunk_with_retry(
                             file_entry,
                             offset,
@@ -2546,6 +2547,7 @@ impl Server {
                 Message::FileSegment {
                     file_id,
                     offset,
+                    digest,
                     data,
                 } => {
                     // Check if regular batch file or large file range.
@@ -2566,7 +2568,7 @@ impl Server {
                             &file_entry.path,
                             &mut self.seen_destinations,
                         )?;
-                        let hash = blake3::hash(&data);
+                        let hash = blake3::Hash::from_bytes(digest);
                         sink.write_file_with_retry(
                             &file_entry,
                             &hash,
@@ -2593,7 +2595,7 @@ impl Server {
                         writer.write_all(&bytes)?;
                         writer.flush()?;
                     } else if let Some(file_entry) = large_files.get(&file_id) {
-                        let hash = blake3::hash(&data);
+                        let hash = blake3::Hash::from_bytes(digest);
                         let length = data.len() as u64;
                         sink.write_chunk_with_retry(
                             file_entry,
@@ -2793,6 +2795,16 @@ impl Server {
                                 "LargeFileFinish for file_id {file_id} has incomplete byte coverage"
                             )));
                         }
+                        if paranoid {
+                            let staged_path = sink.temporary_path(&entry.path)?;
+                            let readback = fs::read(&staged_path)?;
+                            if *blake3::hash(&readback).as_bytes() != digest {
+                                return Err(ServerError::Sink(SinkError::VerificationFailed {
+                                    path: entry.path.to_string(),
+                                    attempts: 2,
+                                }));
+                            }
+                        }
                         sink.finish_large(&entry)?;
                         // The file is committed; discard its resume record.
                         let journal = self
@@ -2805,16 +2817,6 @@ impl Server {
                         };
                         journal.clear(&identity)?;
                         large_ranges.remove(&file_id);
-                        if paranoid {
-                            let committed_path = sink.path_for(&entry.path)?;
-                            let readback = fs::read(&committed_path)?;
-                            if *blake3::hash(&readback).as_bytes() != digest {
-                                return Err(ServerError::Sink(SinkError::VerificationFailed {
-                                    path: entry.path.to_string(),
-                                    attempts: 2,
-                                }));
-                            }
-                        }
                     }
                     let ack = Message::Ack {
                         acknowledged_id: frame.message_id,
@@ -2966,6 +2968,7 @@ impl Server {
                         let seg = Message::FileSegment {
                             file_id,
                             offset: 0,
+                            digest: *stable_read.blake3.as_bytes(),
                             data: stable_read.bytes,
                         };
                         let msg_id = self.next_id();
@@ -3046,6 +3049,7 @@ impl Server {
                         let seg = Message::FileSegment {
                             file_id,
                             offset: range.offset,
+                            digest: *blake3::hash(slice).as_bytes(),
                             data: slice.to_vec(),
                         };
                         let msg_id = self.next_id();
@@ -3302,6 +3306,7 @@ fn send_small_files_batched<R: Read, W: Write, F: FnMut(LocalEvent)>(
             let seg_msg = Message::FileSegment {
                 file_id,
                 offset: 0,
+                digest: *blake3::hash(&data).as_bytes(),
                 data,
             };
             let msg_id = next_id();
@@ -3565,7 +3570,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         .checksum
         .then(|| HashCache::open(HashCache::default_path()).ok())
         .flatten();
-    let source_scan = scan(source_path)?;
+    let source_scan = options.filter.as_ref().map_or_else(
+        || scan(source_path),
+        |filter| scan_with_filter(source_path, Arc::new(filter.clone())),
+    )?;
     let mut source_entries = Vec::new();
     for item in source_scan.entries() {
         let mut entry = item?;
@@ -3839,6 +3847,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 let seg_msg = Message::FileSegment {
                     file_id,
                     offset: 0,
+                    digest: *stable.blake3.as_bytes(),
                     data: stable.bytes,
                 };
                 let msg_id = alloc_id();
@@ -3954,6 +3963,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     let seg_msg = Message::FileSegment {
                         file_id,
                         offset: range.offset,
+                        digest: *blake3::hash(&stable.bytes[start..(start + len)]).as_bytes(),
                         data: stable.bytes[start..(start + len)].to_vec(),
                     };
                     let msg_id = alloc_id();
@@ -4673,15 +4683,15 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 report.wire_bytes = report
                     .wire_bytes
                     .saturating_add(decoder.last_wire_bytes() as u64);
-                let data = match seg_frame.message {
-                    Message::FileSegment { data, .. } => data,
+                let (data, digest) = match seg_frame.message {
+                    Message::FileSegment { data, digest, .. } => (data, digest),
                     other => {
                         return Err(ServerError::UnexpectedMessage(format!(
                             "expected FileSegment, got {other:?}"
                         )))
                     }
                 };
-                let hash = blake3::hash(&data);
+                let hash = blake3::Hash::from_bytes(digest);
                 sink.write_file_with_retry(file, &hash, |_attempt| Ok(data.clone()))?;
                 if options.paranoid {
                     let committed_path = sink.path_for(&file.path)?;
@@ -4752,8 +4762,8 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 report.wire_bytes = report
                     .wire_bytes
                     .saturating_add(decoder.last_wire_bytes() as u64);
-                let data = match seg_frame.message {
-                    Message::FileSegment { data, .. } => data,
+                let (data, digest) = match seg_frame.message {
+                    Message::FileSegment { data, digest, .. } => (data, digest),
                     other => {
                         return Err(ServerError::UnexpectedMessage(format!(
                             "expected FileSegment, got {other:?}"
@@ -4762,7 +4772,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 };
 
                 // Write and commit file locally with Sink.
-                let hash = blake3::hash(&data);
+                let hash = blake3::Hash::from_bytes(digest);
                 sink.write_file_with_retry(file, &hash, |_attempt| Ok(data.clone()))?;
 
                 if options.paranoid {
@@ -4884,8 +4894,8 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     report.wire_bytes = report
                         .wire_bytes
                         .saturating_add(decoder.last_wire_bytes() as u64);
-                    let data = match seg_frame.message {
-                        Message::FileSegment { data, .. } => data,
+                    let (data, digest) = match seg_frame.message {
+                        Message::FileSegment { data, digest, .. } => (data, digest),
                         other => {
                             return Err(ServerError::UnexpectedMessage(format!(
                                 "expected FileSegment, got {other:?}"
@@ -4893,7 +4903,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                         }
                     };
 
-                    let hash = blake3::hash(&data);
+                    let hash = blake3::Hash::from_bytes(digest);
                     sink.write_chunk_with_retry(file, offset, length, &hash, |_attempt| {
                         Ok(data.clone())
                     })?;
@@ -6135,7 +6145,6 @@ fn run_data_inner(
     let mut written: Vec<(WirePath, Vec<ByteRange>)> = Vec::new();
     let mut wire_bytes = 0_u64;
     for (file, ranges) in work {
-        // Read the file once as the source for this session's slices.
         let rel = if prefix.is_empty() {
             file.path.clone()
         } else {
@@ -6146,8 +6155,6 @@ fn run_data_inner(
         };
         let mut file_to_read = file.clone();
         file_to_read.path = rel;
-        let stable = source_reader.read(&file_to_read)?;
-
         let record = entry_record_from_file_entry(file);
         let file_id = alloc();
         write_frame(
@@ -6165,8 +6172,6 @@ fn run_data_inner(
         expect_ack(&mut decoder, &mut reader)?;
 
         for range in ranges {
-            let start = usize::try_from(range.offset).unwrap_or(0);
-            let len = usize::try_from(range.length).unwrap_or(0);
             write_frame(
                 &mut writer,
                 alloc(),
@@ -6184,13 +6189,15 @@ fn run_data_inner(
             ) {
                 return Err(ServerError::UnexpectedMessage("data range ack".to_owned()));
             }
+            let data = source_reader.read_range(&file_to_read, range.offset, range.length)?;
             wire_bytes = wire_bytes.saturating_add(write_data_frame(
                 &mut writer,
                 alloc(),
                 &Message::FileSegment {
                     file_id,
                     offset: range.offset,
-                    data: stable.bytes[start..start + len].to_vec(),
+                    digest: *blake3::hash(&data).as_bytes(),
+                    data,
                 },
                 compress,
                 compression_level,
@@ -7455,12 +7462,13 @@ mod tests {
 
         let mut mixed = opening;
         mixed.extend_from_slice(
-            &encode_frame(
+            &crate::protocol::encode_frame_with_version(
                 2,
                 &Message::Ack {
                     acknowledged_id: 1,
                     acknowledged_type: 1,
                 },
+                1,
             )
             .unwrap(),
         );
@@ -7753,6 +7761,7 @@ mod tests {
                 &Message::FileSegment {
                     file_id: 9_999,
                     offset: 0,
+                    digest: *blake3::hash(b"must not be silently dropped").as_bytes(),
                     data: b"must not be silently dropped".to_vec(),
                 },
             )
@@ -7847,6 +7856,7 @@ mod tests {
                 &Message::FileSegment {
                     file_id: 501,
                     offset: 0,
+                    digest: *blake3::hash(b"hello").as_bytes(),
                     data: b"hello".to_vec(),
                 },
             )
@@ -8347,6 +8357,7 @@ mod tests {
         let fs_msg = Message::FileSegment {
             file_id: (4 << 16) | 0,
             offset: 0,
+            digest: *blake3::hash(b"stdout validity").as_bytes(),
             data: b"stdout validity".to_vec(),
         };
         client_to_server.extend_from_slice(&encode_frame(5, &fs_msg).unwrap());

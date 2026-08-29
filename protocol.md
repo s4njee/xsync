@@ -1,6 +1,6 @@
-# xsync Protocol v1
+# xsync Native Sync Protocol v2
 
-This document is the compatibility contract for the v1 remote protocol. The
+This document is the compatibility contract for the native sync v2 remote protocol. The
 Rust types in `xsync-core::protocol` implement this layout; Rust enum layout or
 the choice of serialization library is not observable on the wire.
 
@@ -19,7 +19,7 @@ exactly `payload_len` bytes:
 | 0 | 4 | magic, ASCII `xsn1` |
 | 4 | 2 | header length, exactly `32` |
 | 6 | 2 | reserved, zero |
-| 8 | 4 | protocol version, exactly `1` |
+| 8 | 4 | protocol version, exactly `2` |
 | 12 | 1 | message type |
 | 13 | 1 | flags, bit 0 is zstd compression |
 | 14 | 2 | reserved, zero |
@@ -69,7 +69,7 @@ The type byte assignments are frozen:
 | 1 | Handshake | role `u8`, capabilities `u32`, max payload `u32`, max segment `u32`, window `u32`, job ID `[16]`, compression `u8` |
 | 2 | SessionConfig | streams `u8`, batch bytes `u32`, chunk bytes `u32`, window `u32`, delete/checksum/paranoid booleans |
 | 3 | FileBatch | batch ID `u64`, count, entry records |
-| 4 | FileSegment | file ID `u64`, offset `u64`, data bytes |
+| 4 | FileSegment | file ID `u64`, offset `u64`, segment digest `[32]`, data bytes |
 | 5 | LargeFilePrepare | file ID `u64`, path, size `u64`, mtime ns `i64`, mode `u32`, fingerprint `[32]` |
 | 6 | LargeFileRange | file ID `u64`, range offset `u64`, range length `u64` |
 | 7 | LargeFileFinish | file ID `u64`, digest `[32]` |

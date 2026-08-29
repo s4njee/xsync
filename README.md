@@ -76,7 +76,7 @@ README follows that rule, including where xsync currently loses.
 
 ## 2. Current status, stated honestly
 
-**Version `0.1.0`. Wire protocol v1 is frozen. Protocol v2 exists and is implemented as a
+**Version `0.1.0`. Native sync wire protocol v2 is current. Browse protocol v2 is exposed as a
 library surface. This is pre-release software with no packaging and no signing.**
 
 ### The test suite
@@ -112,8 +112,8 @@ Windows MSVC. It also enforces `cargo fmt` and a 1.88 MSRV. The whole workspace 
 | Capability | State |
 |---|---|
 | local → local | Works, with a directory-clone / reflink fast path |
-| local → remote (push) | Works over SSH, native protocol v1 |
-| remote → local (pull) | Works over SSH, native protocol v1 |
+| local → remote (push) | Works over SSH, native sync protocol v2 |
+| remote → local (pull) | Works over SSH, native sync protocol v2 |
 | remote → remote | **Not supported** — rejected at argument parsing |
 | rsync-protocol fallback | Push only, GNU rsync protocol 32 only |
 | Multi-stream striping | Implemented, 1–16 streams, **default 1** |
@@ -1176,25 +1176,12 @@ time.)
 Also on Windows: filenames that are not valid UTF-8 are unsupported, because the v1 scanner
 represents Windows filenames as UTF-8 protocol paths. Unix keeps full raw-byte fidelity.
 
-### Content verification is weaker than it looks without `--paranoid`
+### Content verification
 
-This is a real, open defect and it deserves to be stated plainly. In the receiver, small
-and medium files are verified as:
-
-```rust
-let hash = blake3::hash(&data);
-write_file_with_retry(&entry, &hash, |_| Ok(data.clone()))
-```
-
-The expected hash is computed *from the received buffer*, so the comparison always passes.
-Only the declared length is genuinely checked end to end. The sender does compute a real
-digest, but it reaches the receiver only in `LargeFileFinish`, and `finish_large` compares
-it only under `--paranoid`.
-
-`EntryRecord.fingerprint` cannot simply be reused for this, because it carries device and
-inode identity for resume and `--checksum` classification. Closing the gap properly likely
-needs a protocol version bump. **Until then, `--paranoid` is the flag that gives you real
-end-to-end content verification on the sub-32 MiB path.**
+Complete `FileSegment` messages carry a sender-computed BLAKE3 digest, and the receiver
+checks that digest before publishing the staged file. This required the native sync wire
+version bump to v2. Large-file pulls still verify each received range, but a complete-file
+digest is not yet exchanged for the final striped publication; see `BUGS.md`.
 
 ### Everything is one-shot
 

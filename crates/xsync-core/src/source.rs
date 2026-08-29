@@ -1,7 +1,7 @@
 //! Stable source reads with scan/open/read/verify mutation detection.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::path::WirePath;
@@ -110,6 +110,83 @@ impl SourceReader {
     /// path/filesystem error.
     pub fn read(&self, entry: &FileEntry) -> Result<StableRead, SourceReadError> {
         self.read_with_observer(entry, |_| {})
+    }
+
+    /// Read one bounded range from a scanned file without buffering the rest
+    /// of the file. The descriptor and pathname are checked before and after
+    /// the read so a replacement is reported instead of being mixed in.
+    ///
+    /// # Errors
+    /// Returns a source-read error when the file is replaced, disappears, or
+    /// cannot be opened/read for the requested range.
+    pub fn read_range(
+        &self,
+        entry: &FileEntry,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, SourceReadError> {
+        if entry.kind != EntryKind::File {
+            return Err(SourceReadError::WrongKind {
+                path: entry.path.to_string(),
+                kind: entry.kind,
+            });
+        }
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > entry.size)
+        {
+            return Err(SourceReadError::Read {
+                path: self.source_path(&entry.path)?,
+                source: io::Error::new(io::ErrorKind::InvalidInput, "range exceeds file size"),
+            });
+        }
+        let path = self.source_path(&entry.path)?;
+        let file = open_without_following(&path).map_err(|source| SourceReadError::Open {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata_fingerprint(&file, &path)? != entry.fingerprint {
+            return Err(SourceReadError::Unstable {
+                path: entry.path.to_string(),
+                attempts: 1,
+            });
+        }
+        let length = usize::try_from(length).map_err(|_| SourceReadError::Read {
+            path: path.clone(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, "range is too large"),
+        })?;
+        let mut bytes = vec![0_u8; length];
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|source| SourceReadError::Read {
+                path: path.clone(),
+                source,
+            })?;
+        file.read_exact(&mut bytes)
+            .map_err(|source| SourceReadError::Read {
+                path: path.clone(),
+                source,
+            })?;
+        if metadata_fingerprint(&file, &path)? != entry.fingerprint {
+            return Err(SourceReadError::Unstable {
+                path: entry.path.to_string(),
+                attempts: 1,
+            });
+        }
+        let pathname =
+            fs::symlink_metadata(&path).map_err(|source| SourceReadError::Fingerprint {
+                path: path.clone(),
+                source,
+            })?;
+        if metadata_fingerprint_from_metadata(&pathname, &path).map_err(AttemptFailure::Io)?
+            != entry.fingerprint
+        {
+            return Err(SourceReadError::Unstable {
+                path: entry.path.to_string(),
+                attempts: 1,
+            });
+        }
+        Ok(bytes)
     }
 
     /// Read one scanned file while observing bytes completed after each read
@@ -431,6 +508,17 @@ mod tests {
         assert_eq!(result.bytes, b"stable bytes");
         assert_eq!(result.blake3, blake3::hash(b"stable bytes"));
         assert_eq!(result.attempts, 1);
+    }
+
+    #[test]
+    fn read_range_returns_only_the_requested_bytes() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("data"), b"0123456789").unwrap();
+        let entry = scanned_file(temp.path());
+        let result = SourceReader::new(temp.path())
+            .read_range(&entry, 3, 4)
+            .unwrap();
+        assert_eq!(result, b"3456");
     }
 
     #[test]

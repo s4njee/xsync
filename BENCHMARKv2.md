@@ -705,3 +705,67 @@ drive is far faster on paper. Cold reads of 1.3M small files are latency-bound,
 and USB SCSI/UAS translation adds per-I/O latency that parallelism only partly
 hides. Both directions run at 161-210 MB/s against a 979 MB/s link, confirming
 the workload stayed metadata-bound rather than hitting the USB ceiling.
+
+---
+
+## The core-count heuristic is wrong on small machines — orion (Pi 5), 2026-08-29
+
+freya could not answer whether `default_local_workers` should track the logical
+core count, because there the scaling plateau and the core count both sat at 32.
+A 4-core host breaks that coincidence. The USB NVMe was physically moved from
+freya to a Raspberry Pi 5, carrying the corpus with it.
+
+**orion** — Raspberry Pi 5 Model B, 4 cores, 3 GB RAM, Gentoo, kernel 6.18.
+
+| | Device | Link | Write | Read |
+|---|---|---|---:|---:|
+| `/` | SK hynix SHGP31-500GM-2 | PCIe 2.0 x1 | 434 MB/s | 471 MB/s |
+| `/mnt/usb` | the same USB NVMe as freya | **5 Gbps** (was 10 on freya) | 357 MB/s | 322 MB/s |
+
+16 GB of corpus against 3 GB of RAM means the source cannot be cached, so these
+are honest by construction. Caches were still dropped before every rep.
+
+### root NVMe -> USB NVMe, congress-1m (1,318,771 files), 2 reps
+
+| Workers | Median | MAD | vs 1 | vs 4 (= core count) | Files/s | MB/s |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 458.3 s | 0.5% | 1.00x | 0.57x | 2,878 | 36 |
+| 2 | 336.4 s | 0.4% | 1.36x | 0.77x | 3,921 | 49 |
+| 4 | 260.0 s | 1.9% | 1.76x | 1.00x | 5,073 | 63 |
+| 8 | 230.2 s | 3.6% | 1.99x | 1.13x | 5,729 | 71 |
+| 16 | 218.3 s | 0.3% | 2.10x | 1.19x | 6,042 | 75 |
+| 32 | 216.0 s | 0.9% | 2.12x | 1.20x | 6,107 | 76 |
+
+### The finding
+
+**Going past the core count is worth 20%.** Four workers on four cores — what
+`available_parallelism()` produces today — is 1.20x slower than 16 or 32. The
+curve flattens around 16; 32 buys a further 1%.
+
+**The optimum did not move with the core count.** Put the two machines together:
+
+| Host | Logical cores | Best worker count | Plateau |
+|---|---:|---:|---|
+| freya | 32 | 32 | flat to 64 |
+| orion | 4 | 16-32 | flat past 16 |
+
+An **8x** difference in core count produced no meaningful difference in the
+optimum, which sat in the 16-32 range on both. That is the refutation freya could
+not supply: the optimum tracks how many requests the storage will service
+concurrently, not how many cores the host has. `available_parallelism()` matched
+the optimum on freya by coincidence.
+
+Two supporting observations from the Pi, both visible before the sweep finished:
+scaling is already sub-linear *below* the core count (4 workers on 4 cores buys
+1.76x, not 4x), and at the plateau the run uses **21% of the USB write ceiling**
+with a load average near 2 on a 4-core box. The machine is waiting, not
+computing, at every point on this curve.
+
+### What this does not license
+
+Raising the floor everywhere. `MACOS_WORKER_CAP = 4` exists because on macOS
+additional workers measurably contend, so the same change that gains 20% here
+could lose on another platform. The device also matters: 16 concurrent writers
+suits NVMe and would likely thrash a spinning disk. The defensible reading is
+that worker count should be driven by the storage, with core count as at best a
+weak prior — see backlog V3.20.

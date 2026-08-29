@@ -11,6 +11,9 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 use filetime::FileTime;
 
 use crate::path::WirePath;
@@ -122,11 +125,24 @@ impl Sink {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)
             .map_err(|source| io_error("create destination root", &root, source))?;
-        Ok(Self {
+        Ok(Self::from_root(root))
+    }
+
+    /// Construct a sink for planning without creating the destination root.
+    ///
+    /// Dry runs must be observational: the planner only needs the path
+    /// mapping and an optional existing destination scan.
+    #[must_use]
+    pub fn new_without_creation(root: impl AsRef<Path>) -> Self {
+        Self::from_root(root.as_ref().to_path_buf())
+    }
+
+    fn from_root(root: PathBuf) -> Self {
+        Self {
             root,
             temporary_hashes: Arc::new(Mutex::new(HashMap::new())),
             ensured_directories: Arc::new(Mutex::new(HashSet::new())),
-        })
+        }
     }
 
     /// Return this sink's destination root.
@@ -524,14 +540,36 @@ fn write_new_temp(path: &Path, data: &[u8]) -> Result<(), SinkError> {
     // case needs no prior stat or unlink. Only a leftover directory or symlink
     // at the staging path requires removal, which is pathological, so it is
     // handled on the error path rather than paid for on every file.
-    let mut file = if let Ok(file) = File::create(path) {
+    let mut file = if let Ok(file) = open_temp_file(path) {
         file
     } else {
+        if is_symlink(path) {
+            return Err(io_error(
+                "refuse symlink staging path",
+                path,
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "temporary path is a symlink",
+                ),
+            ));
+        }
         remove_existing(path)?;
-        File::create(path).map_err(|source| io_error("create temp file", path, source))?
+        open_temp_file(path).map_err(|source| io_error("create temp file", path, source))?
     };
     file.write_all(data)
         .map_err(|source| io_error("write temp file", path, source))
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+fn open_temp_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path)
 }
 
 fn write_at(path: &Path, offset: u64, data: &[u8]) -> Result<(), SinkError> {
@@ -900,6 +938,29 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+        assert_eq!(fs::read(&outside_file).unwrap(), b"must remain unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_rejects_a_symlinked_stage_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let outside_file = outside.path().join("target");
+        fs::write(&outside_file, b"must remain unchanged").unwrap();
+        let sink = Sink::new(temp.path()).unwrap();
+        let file = entry("nested/file", EntryKind::File, 4, 0o600, 100);
+        let stage = sink.temporary_path(&file.path).unwrap();
+        fs::create_dir_all(stage.parent().unwrap()).unwrap();
+        symlink(&outside_file, &stage).unwrap();
+
+        let error = sink
+            .write_file_with_retry(&file, &blake3::hash(b"data"), |_| Ok(b"data".to_vec()))
+            .unwrap_err();
+
+        assert!(matches!(error, SinkError::Io { .. }));
         assert_eq!(fs::read(&outside_file).unwrap(), b"must remain unchanged");
     }
 

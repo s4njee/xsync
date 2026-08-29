@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
 #[cfg(any(unix, windows))]
@@ -152,6 +152,7 @@ pub struct Scan {
     worker: JoinHandle<()>,
     channel_capacity: usize,
     queue_high_water: Arc<AtomicUsize>,
+    filter_error: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl Scan {
@@ -185,10 +186,19 @@ impl Scan {
     /// Returns [`ScanError::WorkerPanicked`] if the coordinator thread panics.
     pub fn finish(self) -> Result<(), ScanError> {
         let Self {
-            entries, worker, ..
+            entries,
+            worker,
+            filter_error,
+            ..
         } = self;
         drop(entries);
-        worker.join().map_err(|_| ScanError::WorkerPanicked)
+        worker.join().map_err(|_| ScanError::WorkerPanicked)?;
+        if let Some(error) =
+            filter_error.and_then(|slot| slot.lock().ok().and_then(|mut error| error.take()))
+        {
+            return Err(ScanError::Walk(error));
+        }
+        Ok(())
     }
 }
 
@@ -259,15 +269,20 @@ fn scan_with_capacity_and_filter(
     let mut builder = WalkBuilder::new(&root);
     builder.standard_filters(false).follow_links(false);
     let emitted_filter = filter.clone();
+    let filter_error = filter.as_ref().map(|_| Arc::new(Mutex::new(None)));
     if let Some(filter) = filter {
         // The root's own ignore file has no `filter_entry` call of its own,
         // because depth 0 is accepted unconditionally.
-        if let Some(layer) = filter.ignore_layer() {
+        if filter.honours_ignore_files() {
+            let Some(layer) = filter.ignore_layer() else {
+                unreachable!("ignore discovery requires an ignore layer");
+            };
             layer
                 .load(&root, "")
                 .map_err(|error| ScanError::Walk(error.to_string()))?;
         }
         let filter_root = root.clone();
+        let filter_error_for_walk = filter_error.clone();
         builder.filter_entry(move |entry| {
             if entry.depth() == 0 {
                 return true;
@@ -282,10 +297,18 @@ fn scan_with_capacity_and_filter(
                 // judged. The walker calls `filter_entry` on a directory before
                 // yielding any of its children, which is what makes the
                 // lower-precedence tier well-defined under a parallel walk.
-                if let Some(layer) = filter.ignore_layer() {
+                if filter.honours_ignore_files() {
+                    let Some(layer) = filter.ignore_layer() else {
+                        unreachable!("ignore discovery requires an ignore layer");
+                    };
                     // A malformed ignore file must not silently stop applying;
                     // it is surfaced as a walk error through the entry stream.
-                    if layer.load(entry.path(), relative.as_ref()).is_err() {
+                    if let Err(error) = layer.load(entry.path(), relative.as_ref()) {
+                        if let Some(slot) = &filter_error_for_walk {
+                            if let Ok(mut first_error) = slot.lock() {
+                                first_error.get_or_insert_with(|| error.to_string());
+                            }
+                        }
                         return true;
                     }
                 }
@@ -325,6 +348,7 @@ fn scan_with_capacity_and_filter(
         worker,
         channel_capacity,
         queue_high_water,
+        filter_error,
     })
 }
 
@@ -683,6 +707,20 @@ mod tests {
 
         assert!(entries.iter().any(|entry| entry.path == "keep.txt"));
         assert!(!entries.iter().any(|entry| entry.path.starts_with("skip")));
+    }
+
+    #[test]
+    fn surfaces_malformed_nested_ignore_files() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("nested")).unwrap();
+        fs::write(temp.path().join("nested/.xsyncignore"), b"[").unwrap();
+        fs::write(temp.path().join("nested/secret.txt"), b"secret").unwrap();
+
+        let filter = Arc::new(FilterSet::new().with_ignore_files(true));
+        let scan = scan_with_filter(temp.path(), filter).unwrap();
+        let _entries: Vec<_> = scan.entries().iter().collect();
+        let error = scan.finish().unwrap_err();
+        assert!(error.to_string().contains("invalid filter pattern"));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! The wire representation in this module is deliberately written out field
 //! by field. Rust enum discriminants and serializer layout are not part of the
-//! protocol contract; see `protocol.md` for the frozen v1 layout.
+//! protocol contract; see `protocol.md` for the frozen native sync layout.
 
 use std::io::{self, Read, Write};
 
@@ -210,6 +210,8 @@ pub enum Message {
         file_id: u64,
         /// Starting byte offset.
         offset: u64,
+        /// BLAKE3 digest of this segment's logical bytes.
+        digest: [u8; 32],
         /// Segment bytes.
         data: Vec<u8>,
     },
@@ -972,7 +974,7 @@ fn validate_message(message: &Message) -> Result<usize, ProtocolError> {
             if data.len() > MAX_DATA_SEGMENT {
                 return Err(ProtocolError::DataSegmentTooLarge { length: data.len() });
             }
-            size = add_payload_size(20, data.len())?;
+            size = add_payload_size(20 + 32, data.len())?;
         }
         Message::LargeFilePrepare { path, .. } => {
             validate_path_length(path)?;
@@ -1155,6 +1157,7 @@ fn encode_message_payload(message: &Message, output: &mut Vec<u8>) -> Result<(),
         Message::FileSegment {
             file_id,
             offset,
+            digest,
             data,
         } => {
             if data.len() > MAX_DATA_SEGMENT {
@@ -1162,6 +1165,7 @@ fn encode_message_payload(message: &Message, output: &mut Vec<u8>) -> Result<(),
             }
             writer.u64(*file_id);
             writer.u64(*offset);
+            writer.array(digest);
             writer.blob(data, MAX_DATA_SEGMENT)?;
         }
         Message::LargeFilePrepare {
@@ -1357,10 +1361,12 @@ fn decode_message_payload(message_type: u8, payload: &[u8]) -> Result<Message, P
         MessageType::FileSegment => {
             let file_id = reader.u64()?;
             let offset = reader.u64()?;
+            let digest = reader.array::<32>()?;
             let data = reader.blob(MAX_DATA_SEGMENT)?;
             Message::FileSegment {
                 file_id,
                 offset,
+                digest,
                 data,
             }
         }
@@ -1994,13 +2000,13 @@ mod tests {
             message
         );
 
-        let mut v1_decoder = FrameDecoder::new();
+        let mut v1_decoder = FrameDecoder::for_version(1);
         assert_eq!(
             v1_decoder.decode(&v2_frame).unwrap_err().to_string(),
             "xsync version mismatch: local v1 / remote v2"
         );
 
-        let v1_frame = encode_frame(2, &message).unwrap();
+        let v1_frame = encode_frame_with_version(2, &message, 1).unwrap();
         let mut v2_decoder = FrameDecoder::for_version(2);
         assert_eq!(
             v2_decoder.decode(&v1_frame).unwrap_err().to_string(),
@@ -2052,6 +2058,7 @@ mod tests {
             Message::FileSegment {
                 file_id: 9,
                 offset: 16,
+                digest: *blake3::hash(b"hello").as_bytes(),
                 data: b"hello".to_vec(),
             },
             Message::LargeFilePrepare {
@@ -2137,7 +2144,7 @@ mod tests {
         };
         let frame = encode_frame(0x0102_0304_0506_0708, &message).unwrap();
         let expected = [
-            0x78, 0x73, 0x6e, 0x31, 0x20, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x78, 0x73, 0x6e, 0x31, 0x20, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00,
             0x00, 0x00, 0x26, 0x00, 0x00, 0x00, 0x26, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05,
             0x04, 0x03, 0x02, 0x01, 0x01, 0x44, 0x33, 0x22, 0x11, 0x04, 0x03, 0x02, 0x00, 0x08,
             0x07, 0x06, 0x00, 0x0c, 0x0b, 0x0a, 0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
@@ -2242,11 +2249,11 @@ mod tests {
             },
         )
         .unwrap();
-        wrong_version[8..12].copy_from_slice(&2_u32.to_le_bytes());
+        wrong_version[8..12].copy_from_slice(&1_u32.to_le_bytes());
         let error = decode_frame(&wrong_version).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "xsync version mismatch: local v1 / remote v2"
+            "xsync version mismatch: local v2 / remote v1"
         );
 
         let mut oversized_count = encode_frame(
@@ -2270,6 +2277,7 @@ mod tests {
         let message = Message::FileSegment {
             file_id: 4,
             offset: 0,
+            digest: *blake3::hash(&vec![b'x'; 128 * 1024]).as_bytes(),
             data: vec![b'x'; 128 * 1024],
         };
         let frame = encode_frame_with_options(
@@ -2313,6 +2321,7 @@ mod tests {
         let text = Message::FileSegment {
             file_id: 1,
             offset: 0,
+            digest: *blake3::hash(&vec![b't'; 256 * 1024]).as_bytes(),
             data: vec![b't'; 256 * 1024],
         };
         let mut random = Vec::with_capacity(256 * 1024);
@@ -2326,6 +2335,7 @@ mod tests {
         let incompressible = Message::FileSegment {
             file_id: 2,
             offset: 0,
+            digest: *blake3::hash(&random).as_bytes(),
             data: random,
         };
         let compressed = encode_frame_with_compression(1, &text, CompressionMode::Zstd, 9).unwrap();
@@ -2340,7 +2350,7 @@ mod tests {
 
     fn text_data_len(message: &Message) -> usize {
         match message {
-            Message::FileSegment { data, .. } => FRAME_HEADER_LEN + 20 + data.len(),
+            Message::FileSegment { data, .. } => FRAME_HEADER_LEN + 20 + 32 + data.len(),
             _ => unreachable!(),
         }
     }

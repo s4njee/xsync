@@ -36,7 +36,7 @@ pub mod transport;
 
 /// The version of the xsync wire protocol. Bumped on any incompatible change;
 /// `--server` peers reject a mismatch (see plan.md Story 3.1).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Magic bytes prefixing every handshake frame (see plan.md Story 3.1).
 pub const HANDSHAKE_MAGIC: &[u8; 4] = b"xsn1";
@@ -62,7 +62,7 @@ mod tests {
 
     #[test]
     fn protocol_version_and_magic_are_stable() {
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
         assert_eq!(HANDSHAKE_MAGIC, b"xsn1");
     }
 

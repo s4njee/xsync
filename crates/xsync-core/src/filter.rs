@@ -424,6 +424,20 @@ impl FilterSet {
         }
     }
 
+    /// Reuse rules discovered from the source tree without discovering ignore
+    /// files in another tree. This keeps destination planning subject to the
+    /// source's rules while preventing a stale destination `.xsyncignore`
+    /// from overwriting them.
+    #[must_use]
+    pub fn without_ignore_discovery(&self) -> Self {
+        Self {
+            rules: self.rules.clone(),
+            ignore_files: false,
+            ignore: self.ignore.clone(),
+            observing: self.observing,
+        }
+    }
+
     /// Whether per-directory ignore files are honoured.
     #[must_use]
     pub const fn honours_ignore_files(&self) -> bool {

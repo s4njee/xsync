@@ -1113,9 +1113,14 @@ fn prepare_transfer(
     for (entry, path) in cloud_skipped.iter_mut().zip(skipped_destinations) {
         entry.path = path;
     }
-    let destination_sink = Sink::new(&layout.destination_root)?;
+    let destination_sink = if options.dry_run {
+        Sink::new_without_creation(&layout.destination_root)
+    } else {
+        Sink::new(&layout.destination_root)?
+    };
+    let destination_filter = std::sync::Arc::new(filter.without_ignore_discovery());
     let (destination_entries, destination_queue_high_water) =
-        collect_scan(destination_sink.root(), &filter)?;
+        collect_scan(destination_sink.root(), &destination_filter)?;
     emit(LocalEvent::Metrics {
         queue_high_water: source_queue_high_water.max(destination_queue_high_water),
         compression_algorithm: None,
@@ -1331,6 +1336,12 @@ fn collect_scan(
     root: &Path,
     filter: &std::sync::Arc<crate::filter::FilterSet>,
 ) -> Result<(Vec<FileEntry>, usize), LocalSyncError> {
+    if matches!(
+        fs::symlink_metadata(root),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    ) {
+        return Ok((Vec::new(), 0));
+    }
     let scan = if filter.is_empty() {
         scan(root)?
     } else {
@@ -1488,10 +1499,13 @@ pub(crate) fn enforce_path_collisions(
         .iter()
         .flat_map(|group| group.iter().cloned())
         .collect();
-    let count = dropped.len();
+    let count = entries
+        .iter()
+        .filter(|entry| dropped.iter().any(|path| entry.path.starts_with(path)))
+        .count();
     let kept = entries
         .into_iter()
-        .filter(|entry| !dropped.contains(&entry.path))
+        .filter(|entry| !dropped.iter().any(|path| entry.path.starts_with(path)))
         .collect();
     Ok((kept, count))
 }

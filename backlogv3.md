@@ -1,12 +1,88 @@
-# xsync v3 — research directions and daily-driver polish
+# xsync backlog v3 — from capable engine to shippable rsync alternative
 
 Companion to [backlogv2.md](backlogv2.md) (protocol v2 and the browse surface),
 [DEPLOYMENT.md](DEPLOYMENT.md) (CI, signing, packaging), and
-[TUNING-TASKS.md](TUNING-TASKS.md) (performance). This file holds what none of those
-cover: correctness gaps that make xsync unsafe to reach for, research worth doing,
-and the ergonomics that decide whether a tool becomes the one you actually type.
+[TUNING-TASKS.md](TUNING-TASKS.md) (performance experiments). This is the product-level
+queue: it says what should happen next across those tracks, which work blocks a release,
+and what evidence is required before a research idea becomes a feature.
 
-Status legend: `[ ]` todo · `[~]` in progress · `[x]` done
+Status legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[—]` closed without
+shipping. Priority legend: **P0** release blocker · **P1** daily-driver release · **P2**
+parity or high-value follow-up · **R** measurement-gated research.
+
+---
+
+## Audited state — 2026-08-29
+
+This snapshot is based on the working tree, not only on roadmap status boxes.
+
+| Area | What exists now | Important qualification |
+|---|---|---|
+| Engine | Local copy, SSH push and pull, delete-after, dry-run, BLAKE3 classification, adaptive zstd, atomic staging, large-file chunk resume, APFS clone and Linux reflink paths | No remote-to-remote; whole-file transfer only |
+| Correctness | Source-stability retries, destination containment, symlink refusal, path-collision probing, bounded/fail-closed frames, independent benchmark oracle | Default small/medium remote verification still hashes bytes only after receipt; sparse content is still materialized densely |
+| Product surface | Named TOML jobs, ordered include/exclude files, `.xsyncignore`, JSON progress and failure logs, remote bootstrap, completions/man-page generation | Native remote include rules and remote ignore files are refused or unavailable; human output, cancellation, locking, timeouts and safe-delete controls are incomplete |
+| Protocol/ecosystem | Frozen v1 sync protocol; negotiated v2 browse/mutate/fetch/publish library surface; cross-language v2 vectors | Browse is not a first-class `xs` CLI workflow; sync-path v2 and skew testing are incomplete |
+| Delivery | Multi-platform CI and release workflows, reproducible packaging scripts, checksum/provenance flow, install script, Homebrew/Scoop/Linux-package scaffolds | No public release or end-to-end package-channel install is evidenced; macOS and Windows signing remain deferred |
+| Quality | `cargo fmt --all -- --check`, `cargo test --workspace --all-targets`, and strict workspace Clippy are green; 319 tests passed and 2 opt-in stress/benchmark tests were ignored | Failure injection, cross-version binaries, cross-OS pairs and sustained fuzzing are not yet release gates |
+| Performance | Strong large-file, no-op, compression and clone results; small-file batching fixed a 25.5x SSH regression | Local many-small-file initial copy is still about 2x slower than rsync in the retained measurement; multi-stream setup and capability bugs remain |
+
+The documentation is not yet a reliable source of truth. For example, the README says both
+that there is no packaging and that jobs/configuration do not exist, while the working tree
+contains packaging, release automation and `config.rs`. `DEPLOYMENT.md` still opens by saying
+there is no CI. Story V3.32 makes eliminating this drift a release requirement.
+
+## Product target and release gates
+
+"Comparable to rsync" does **not** mean accepting every historical rsync flag. It means a
+user can select xsync for ordinary local and SSH synchronization without risking a weaker
+integrity, recovery or automation contract. Unsupported semantics must be rejected before
+mutation and documented in the compatibility table.
+
+### Gate A — shippable technical preview
+
+- [ ] Default end-to-end integrity is real for every size class; `--paranoid` is additional
+      readback, not the only trustworthy mode.
+- [ ] Sparse sources either preserve holes or are refused before transfer when the dense
+      result cannot fit.
+- [ ] Interrupt, destination locking, timeout and delete guardrails have deterministic exit
+      codes and recovery tests.
+- [ ] Crash, disconnect, ENOSPC, permission failure and source mutation tests assert the
+      destination state, not only the error string.
+- [ ] A versioned artifact installs and uninstalls on every Tier 1 platform through the
+      documented path, with checksum/provenance verification.
+- [ ] The support, security and compatibility matrices match the released binary.
+
+### Gate B — dependable daily driver
+
+- [ ] The common selection and safety surface is present: `-a`, `-v`, `--itemize-changes`,
+      `--stats`, `--files-from`, `--max-delete`, `--bwlimit`, `--timeout`, `--update`,
+      `--ignore-existing`, `--max-size`, `--min-size`, and recoverable deletion.
+- [ ] Native push and pull have the same filter semantics as local sync.
+- [ ] `xs doctor`, config validation, state inspection and actionable retry output cover the
+      failures an operator otherwise discovers mid-run.
+- [ ] No supported regression-tier workload is below 0.9x its paired rsync baseline, unless
+      the release notes name the workload and the user can select a safe fallback.
+
+### Gate C — credible rsync replacement
+
+- [ ] Sparse files, hardlinks, xattrs/ACLs, ownership policy and common archive semantics are
+      either preserved or explicitly excluded by the declared product scope.
+- [ ] Delta transfer has a measured go/no-go decision and, if selected, is corruption- and
+      interruption-tested against rsync's algorithm.
+- [ ] Cross-version and cross-platform matrices have no undefined cells.
+- [ ] Every supported rsync-compatibility flag is implemented or fails before mutation with
+      a specific alternative.
+
+## Priority board
+
+| Order | Priority | Stories | Outcome |
+|---:|---|---|---|
+| 1 | **P0** | V3.20–V3.23, V3.11–V3.13 | Integrity, fault recovery, bounded waiting and destructive-operation safety |
+| 2 | **P0** | V3.31–V3.32 | One honest, installable preview rather than more unverified packaging surface |
+| 3 | **P1** | V3.14–V3.16, V3.24–V3.30 | Daily-driver UX, common rsync semantics, metadata policy and compatibility |
+| 4 | **P1** | V3.18, V3.33–V3.36, V3.40 | Close known latency regressions and prevent them from returning |
+| 5 | **P2** | V3.17, V3.41–V3.44 | Configuration, scheduling, cleanup and retry ergonomics |
+| 6 | **R** | V3.4–V3.8, V3.37–V3.39 | Structural speedups that ship only after their decision gates pass |
 
 ---
 
@@ -188,7 +264,7 @@ architecture already separates source reading from sink publication.
 The gap between "correct" and "the tool you type without thinking".
 
 ### Story V3.9 — Named jobs and a config file
-- [x] `xsync backup` should run a saved source, destination, and flag set.
+- [x] `xs backup` should run a saved source, destination, and flag set.
 
 The single largest ergonomic gap. Nobody retypes an exclude list and a destination path
 daily; they write a shell alias, and then the tool's own `--dry-run` and logging never
@@ -198,7 +274,7 @@ see the real configuration.
 - A documented config format and search path, with named jobs.
 - CLI flags override config; precedence is defined and tested.
 - A malformed config fails at startup with a precise error, never partial application.
-- `xsync --dry-run <job>` works, so a saved job can be inspected before it runs.
+- `xs --dry-run <job>` works, so a saved job can be inspected before it runs.
 
 **Done.** TOML config in `crates/xsync/src/config.rs`, with `--job NAME`, a bare positional
 job name, `--config FILE`, and `--list-jobs`. Search path: `--config` > `$XSYNC_CONFIG` >
@@ -292,7 +368,7 @@ unseen ignore file cannot widen the transfer beyond the explicit rules.
 un-masked capability bits for exactly this, so it is not a version bump.
 
 ### Story V3.11 — Make `--delete` survivable
-- [ ] `--delete` permanently removes files with no undo and no confirmation.
+- [ ] **P0.** `--delete` permanently removes files with no undo, maximum or confirmation.
 
 **AC**
 - A `--backup`/trash mode moving deletions aside instead of unlinking.
@@ -300,26 +376,39 @@ un-masked capability bits for exactly this, so it is not a version bump.
   interactive runs above a threshold count or fraction.
 - A refusal when the deletion set exceeds a suspicious share of the destination —
   the classic "source failed to mount, mirror wipes the backup" accident.
+- `--max-delete=N` is enforced in the planner before the first deletion. Non-interactive
+  runs never prompt and require an explicit policy when the safety threshold is exceeded.
+- Backup/trash paths are on the destination filesystem when possible so protection does not
+  turn each delete into a full cross-device copy. Retention and cleanup are documented.
+- Delete summaries and backup locations are included in JSON output and retry/recovery tests.
 
 ### Story V3.12 — Interrupt cleanly
-- [ ] There is no `SIGINT` handling. Ctrl-C leaves whatever state it lands in.
+- [ ] **P0.** There is no `SIGINT` handling. Ctrl-C leaves whatever state it lands in.
 
 **AC**
 - `SIGINT`/`SIGTERM` stop dispatch, let in-flight files finish or abandon their staging
   files, print a summary, and exit with a distinct code.
 - Staging files (`.xsync.tmp.*`) are removed or documented as resumable.
 - A second Ctrl-C exits immediately.
+- No delete phase begins after cancellation, and remote children/sessions are reaped within a
+  bounded time.
+- Exit status and JSON distinguish user cancellation from transport or integrity failure.
 
 ### Story V3.13 — Concurrent-run safety
-- [ ] Two xsync runs against one destination will interleave writes. `fslock` is already
+- [ ] **P0.** Two xsync runs against one destination will interleave writes. `fslock` is already
   a dependency, used only by the resume journal.
 
 **AC**
 - A destination lock, with a clear message naming the holding process.
-- `--force` for the case where the user knows the lock is stale.
+- The lock carries run ID, pid, host, start time, endpoints and version; local, push-sink and
+  pull-destination paths all acquire it before mutation.
+- Stale locks have a separate, explicit break operation. A generic `--force` never overrides
+  a lock whose owner is still provably active.
+- Overlapping roots are handled deliberately: `/backup` and `/backup/photos` cannot run as if
+  they were unrelated destinations.
 
 ### Story V3.14 — Output a human wants to read
-- [ ] `--progress-json` is excellent. The human-facing output is not yet its equal.
+- [ ] **P1.** `--progress-json` is excellent. The human-facing output is not yet its equal.
 
 **AC**
 - A final summary reporting files transferred, skipped, deleted, failed, bytes moved
@@ -332,7 +421,7 @@ un-masked capability bits for exactly this, so it is not a version bump.
 - Colour and progress suppressed when not a TTY.
 
 ### Story V3.15 — rsync muscle memory
-- [ ] Users arrive with rsync flags in their fingers.
+- [ ] **P1.** Users arrive with rsync flags in their fingers.
 
 **AC**
 - Accept `-a`/`--archive` as an explicit no-op alias with a note, since xsync's defaults
@@ -342,8 +431,8 @@ un-masked capability bits for exactly this, so it is not a version bump.
   `--max-size`, `--min-size`.
 - A documented rsync-to-xsync flag table in the README.
 
-### Story V3.16 — `xsync doctor`
-- [ ] One command that explains the environment before the user hits it as a surprise.
+### Story V3.16 — `xs doctor`
+- [ ] **P1.** One command that explains the environment before the user hits it as a surprise.
 
 **AC**
 - Reports: reflink support at the destination (the probe already exists), remote xsync
@@ -353,7 +442,7 @@ un-masked capability bits for exactly this, so it is not a version bump.
 - Exits non-zero when it finds something that would fail the real run.
 
 ### Story V3.17 — Scheduling that is not cron-by-hand
-- [ ] DEPLOYMENT D6 covers the daemon. This is the smaller, nearer thing: making a
+- [ ] **P2.** DEPLOYMENT D6 covers the daemon. This is the smaller, nearer thing: making a
   scheduled xsync run pleasant.
 
 **AC**
@@ -364,25 +453,9 @@ un-masked capability bits for exactly this, so it is not a version bump.
 
 ---
 
-## Suggested order
-
-**Part A first, all of it.** V3.1 is silent data loss and should be treated as a bug
-rather than a backlog item. V3.2 and V3.3 are one-run-away-from-angry-user problems and
-are mostly reporting work, not engine work.
-
-Then the cheap half of Part C — V3.12 (interrupt), V3.13 (locking), V3.14 (output),
-V3.15 (rsync flags) — which together are what makes the tool feel finished, and none of
-which need protocol or engine changes.
-
-Then V3.9/V3.10 (config and excludes), which are the features that turn it into
-something used daily rather than demonstrated occasionally.
-
-Part B is genuine research and should stay measurement-gated in the style TUNING.md
-established: spike, decision gate, and permission to conclude "do not build this".
-
 ### Story V3.18 — `--streams` correctness and the small-file path
 
-- [~] Three defects found while investigating the congress `--streams 8` regression
+- [~] **P1.** Three defects found while investigating the congress `--streams 8` regression
   (2026-08-28). Two fixed, one open. Full evidence in `BENCHMARKv2.md`.
 
 **Fixed.** Small files now go through `send_small_files_batched`, a single shared
@@ -430,7 +503,7 @@ pipeline would leave much more of the wire idle.
 
 ### Story V3.19 — The serial bottleneck that caps local scaling at 12 workers
 
-- [x] **Withdrawn 2026-08-29: the premise was a measurement artifact.** The
+- [—] **Withdrawn 2026-08-29: the premise was a measurement artifact.** The
   12-worker plateau appeared only with warm caches. Re-measured cold on
   congress-1m with `drop_caches` before every rep, scaling improves monotonically
   to 32 workers in all three device configurations (67.3 -> 53.6 s internal->USB,
@@ -463,3 +536,489 @@ nowhere near saturated, and 20 of 32 worker threads contribute nothing.
 16.4% of the run. `sparse::inspect_with_workers` now chunks it across the worker
 pool, taking that to ~1%, with a test asserting the parallel result is identical
 to the serial one for hardlink groups spanning chunk boundaries.
+
+---
+
+## Part D — P0 correctness and recoverability
+
+These stories define Gate A. A preview release is not honest while any is open.
+
+### Story V3.20 — Make end-to-end content integrity the default
+- [ ] **P0.** Small and medium remote files are currently "verified" against a digest
+  computed from the received buffer. That detects a bad disk write but cannot detect data
+  altered before or during receipt. Large-file sender digests only become a full-file check
+  under `--paranoid`.
+
+**AC**
+- The sender's BLAKE3 digest is carried independently for every complete-file transfer and
+  compared before publication. Chunked files also compare the sender's full-file digest
+  before the final rename.
+- A test corrupts payload bytes after the sender computes the digest and proves the receiver
+  rejects them, removes or retains only resumable staging state, and preserves an existing
+  destination.
+- Local, push, pull, one-stream and multi-stream paths share the same verification contract.
+- `--paranoid` means re-read the published destination from storage. It is no longer required
+  for ordinary end-to-end integrity.
+- The sync protocol change is capability/version negotiated. An older peer never receives a
+  frame it cannot decode; the CLI names the reduced guarantee and requires an explicit policy
+  to use it rather than silently weakening the default.
+- Protocol vectors, compatibility matrix, JSON events and README all name the selected
+  integrity level.
+
+### Story V3.21 — Preserve sparse files, with a safe refusal until then
+- [ ] **P0.** V3.2 made amplification visible; it did not make the transfer safe. Complete
+  [TUNING-TASKS Epic T2](TUNING-TASKS.md#epic-t2--sparse-aware-transfer-deferred).
+
+**AC**
+- APFS/ext4/btrfs/XFS sources enumerate data extents with `SEEK_DATA`/`SEEK_HOLE`; Windows
+  uses `FSCTL_QUERY_ALLOCATED_RANGES`. Unsupported filesystems fall back only through an
+  explicit, observable policy.
+- The wire represents holes as ranges without sending zero bytes. The sink punches/seeks
+  holes and verifies logical size, content digest and allocated-byte expectations.
+- Large extents and thousands of small extents stay bounded in memory and remain resumable.
+- Paired correctness/performance coverage uses `rsync -aS` and a non-compressing filesystem;
+  ZFS compression is not accepted as proof that holes were reproduced.
+- Until this ships, xsync refuses a sparse transfer when estimated dense bytes exceed free
+  space or a configurable amplification ceiling. `--allow-dense-sparse` is an explicit
+  override and is present in JSON output.
+
+### Story V3.22 — Turn failure modes into a release test matrix
+- [ ] **P0.** Happy-path coverage is strong; product trust comes from proving what remains
+  after the unhappy path.
+
+**AC**
+- Deterministic tests inject: client kill, server kill, SSH disconnect, short read/write,
+  corrupt frame, ENOSPC during stage and publish, read-only destination, permission denial,
+  disappearing source, source mutation, destination mutation, and failure during metadata
+  restoration.
+- Every cell asserts final destination content, staging/journal state, delete suppression,
+  emitted failure kind and exit code. "Returned an error" alone is insufficient.
+- Rerunning after every recoverable failure converges to the independent manifest without
+  retransmitting journal-verified large-file ranges.
+- A failed transfer never performs delete-after and never exposes a truncated final file.
+- At least one push and one pull fault cell run as real child processes rather than only
+  in-memory transports.
+- The matrix is documented and runs in CI at a bounded tier; slower power-loss/fsync tests
+  run on a scheduled or release tier.
+
+### Story V3.23 — Bound waiting and retry only safe failures
+- [ ] **P0.** SSH setup, frame reads and stalled peers can currently wait indefinitely.
+
+**AC**
+- Add separately observable connect, idle-I/O and optional whole-run timeouts. Defaults are
+  conservative and documented; zero disables only when the user asks.
+- Keepalive distinguishes a slow active transfer from a dead peer. Timeout errors name the
+  phase, host and last progress time.
+- Retry/backoff is limited to classified transient transport failures. Authentication,
+  host-key, protocol, path, permission and integrity failures are never retried.
+- A retry reuses safe resume state and never repeats an already-acknowledged destructive
+  mutation.
+- `SIGINT` interrupts timeout waits promptly and composes with V3.12's two-stage cancellation.
+- Fake transport tests pin attempt counts, backoff bounds and total elapsed-time bounds.
+
+---
+
+## Part E — P1 shippable product and rsync workflow parity
+
+### Story V3.24 — Destination capacity and topology preflight
+- [ ] **P1.** Fail before a long run when the destination obviously cannot accept the plan.
+
+**AC**
+- Estimate logical writes, allocated writes, staging headroom, backup/trash headroom and
+  metadata overhead. Keep each quantity distinct rather than publishing one misleading
+  "bytes needed" number.
+- Probe free space, read-only state, path semantics and reflink support at the actual
+  destination or nearest existing ancestor. Remote results are requested from the remote,
+  never inferred from the client platform.
+- `--dry-run` and `xs doctor` show the estimate and uncertainty. A known shortfall refuses
+  before mutation; an unmeasurable value is labelled unknown.
+- Source-inside-destination, destination-inside-source, missing mount and unexpectedly empty
+  source protections are covered, including the "backup disk was not mounted" case.
+
+### Story V3.25 — Preserve metadata by declared profiles
+- [ ] **P1/P2.** Warnings are the right interim behavior, but an rsync alternative needs a
+  preservation story that is clearer than one overloaded archive switch.
+
+**AC**
+- Define profiles: `portable` (current cross-platform subset), `archive` (hardlinks, xattrs,
+  ACLs and timestamps), and `system` (ownership, IDs, devices/specials where privileged).
+- Hardlinks use a bounded inode/file-ID map and retain link topology across local, push and
+  pull. Repeated content is not silently materialized as independent files.
+- xattrs include macOS resource forks; ACLs round-trip on macOS and Linux with an explicit
+  cross-platform translation/refusal policy.
+- Ownership supports `--numeric-ids` and an explicit mapping policy. Lack of privilege is a
+  preflight result, not a late stream of `chown` failures.
+- Unsupported metadata is counted before mutation and represented in JSON, including ACLs,
+  which the current preflight cannot inspect.
+- A metadata corpus and oracle compare xsync with `rsync -aHAX` on same-platform routes and
+  verify the declared portable subset on cross-platform routes.
+
+### Story V3.26 — Implement the common rsync selection semantics
+- [ ] **P1.** Group the cheap classifier options, but specify their interactions before
+  adding flags one by one.
+
+**Scope**
+- `-a`/`--archive`, `-v`, `--update`, `--ignore-existing`, `--existing`, `--size-only`,
+  `--ignore-times`, `--max-size`, `--min-size`, `--relative` and `--mkpath`.
+
+**AC**
+- A compatibility table says exact, deliberately different, or unsupported for each flag.
+- Combinations have one documented precedence model and table-driven classifier tests.
+- A flag never becomes an accepted no-op unless its promised behavior is already the default
+  and the help text says that explicitly.
+- Local, push and pull behave identically or reject before opening the destination.
+- Golden tests run representative commands against rsync and compare the selected path set
+  and destination manifest, not human wording.
+
+### Story V3.27 — Explicit path lists, list-only and native remote filter parity
+- [ ] **P1.** Complete the scripted-selection workflows and remove the current local/remote
+  semantic split.
+
+**AC**
+- Add `--files-from` with NUL-delimited input, stdin support and raw-byte Unix paths. Define
+  roots, ordering, duplicates and missing entries before implementation.
+- Add `--list-only` and a machine-readable plan/list mode. Reuse v2 browse primitives where
+  appropriate without making a tree sync depend on one-page directory requests.
+- Negotiate and send the complete ordered `FilterSet` (include/exclude and rule origin) to a
+  native remote source. A remote `.xsyncignore` is evaluated by that source.
+- An older peer either receives the existing safe exclude-only subset or the command refuses;
+  includes are never approximated by transferring more data.
+- Local, push and pull produce the same selected-path manifest for a shared conformance corpus.
+
+### Story V3.28 — Windows as a real remote and topology clarity
+- [ ] **P1/P2.** Windows initiator support exists; a stock Windows OpenSSH server must become
+  a supported endpoint before claiming Tier 1 route parity.
+
+**AC**
+- Command construction, missing-binary detection, remote bootstrap, home expansion and path
+  quoting work under stock `cmd.exe` and PowerShell without requiring Git Bash.
+- Windows destination tests cover drive letters, UNC paths, reserved names, trailing dots,
+  case collisions, long paths, symlinks/reparse points and non-UTF-8 limitations.
+- Cross-OS push and pull run in CI or in a documented release lab, with the manifest oracle.
+- Remote-to-remote receives an explicit product decision: direct relay, third-party copy, or
+  documented refusal. If implemented, bytes need not flow through the controller unless the
+  user chooses that mode.
+
+### Story V3.29 — Cross-version policy and executable compatibility matrix
+- [ ] **P1.** Source-level vectors are necessary but do not prove released binaries work
+  across version skew.
+
+**AC**
+- State the supported client/server skew for sync v1, sync v2 and browse v2, including what
+  security fixes can revoke compatibility.
+- CI downloads or builds the oldest supported binary and exercises new-client/old-server and
+  old-client/new-server push, pull and browse. Every cell is `works`, `degraded` with named
+  guarantees, or `refused` with an exact class of error.
+- Capability negotiation is recorded once before data frames; no feature is discovered by
+  starting a mutation and catching a protocol error.
+- Extend conformance vectors to the sync path, including content digests, filters, sparse
+  extents and malformed boundary cases introduced by v3 work.
+
+### Story V3.30 — Security and trust gate
+- [ ] **P1.** Turn the existing fail-closed design and dependency checks into a published,
+  continuously tested security posture.
+
+**AC**
+- Publish a threat model covering the local caller, SSH peer, server root, path traversal,
+  symlink races, decompression bombs, frame limits, temp files, journals and bootstrap binary.
+- Run protocol fuzzing continuously or on a schedule with retained corpus/crash artifacts;
+  gate releases on zero known reproducible crashes.
+- Test a malicious peer sending maximum counts, decompression expansion, duplicate IDs,
+  invalid paths and messages in the wrong role without unbounded CPU, memory or disk use.
+- Add `SECURITY.md`, a contact and response policy. Generate an SBOM and keep `cargo audit`,
+  `cargo deny`, checksums and provenance in the release evidence.
+- Any `unsafe` exception (currently the measured macOS `clonefile` wrapper) is isolated,
+  documented and directly tested; the workspace-wide deny remains the default.
+
+### Story V3.31 — Ship and rehearse the first public preview
+- [ ] **P0.** Packaging scaffolds do not count as distribution until a clean machine installs
+  a real tagged release from the channel a user will use.
+
+**AC**
+- Select one semantic version and freeze its support matrix, protocol compatibility, known
+  limitations and changelog entry.
+- Run the tag workflow, publish every Tier 1 archive, checksum set, provenance attestation,
+  man page and completions, then install each artifact on a clean machine.
+- Exercise install, `xs --version`, local sync, remote bootstrap, push, pull, upgrade and
+  uninstall. The installed binary—not `cargo run`—must pass the smoke.
+- Complete at least one package channel end to end (Homebrew is the smallest current gap),
+  and label other manifests preview-only until their repositories accept a real package.
+- Decide whether code signing blocks the preview. If deferred, test and document the exact
+  browser-download versus package-manager behavior instead of saying merely "unsigned".
+- Record the rehearsal as a release checklist artifact and repeat it for every tag.
+
+### Story V3.32 — One source of truth for status and compatibility
+- [ ] **P0.** Current documents contradict the code and each other.
+
+**AC**
+- Generate CLI flag, target, package and protocol tables from authoritative code/config where
+  practical. Hand-written prose links to those tables instead of restating volatile facts.
+- Reconcile README, MVP, DEPLOYMENT, backlog v2/v3 and TUNING status. Historical measurements
+  remain historical and carry commit, host, cache state and date.
+- A docs check catches placeholder URLs, stale version/test totals, broken local links and
+  claims such as "no CI" when the workflow exists.
+- README's first page says plainly: release status, install status, safe workloads, known
+  integrity/sparse limitations and the shortest successful local/push/pull examples.
+- Archive or label superseded plans. A new contributor can identify the active backlog
+  without reconciling six documents by hand.
+
+---
+
+## Part F — Speed and latency research
+
+Every story here starts with a benchmark or trace. A negative result closes the story and is
+retained; it does not justify a speculative production subsystem.
+
+### Story V3.33 — Establish latency budgets by phase and workload
+- [ ] **P1 research prerequisite.** Replace a single wall-time number with a budget that
+  identifies the first bottleneck worth fixing.
+
+**AC**
+- For local, push and pull, record connection/bootstrap, scan, preflight, plan, first-byte,
+  data, metadata, delete and teardown times plus CPU, peak RSS, syscall counts and wire bytes.
+- Cover: one tiny file, 10k/100k/1m tiny files, one large incompressible file, compressible
+  data, no-op, 1% churn and high-RTT/bandwidth-shaped routes, warm and genuinely cold.
+- Add user-facing latency metrics: time to first progress, time to first published file and
+  cancellation latency, not only total throughput.
+- The report names the top two contributors in each cell. Optimization work must cite the
+  cell and budget component it intends to move.
+
+### Story V3.34 — Reduce SSH setup latency and reuse connections safely
+- [ ] **P1/R.** One SSH setup is visible for tiny transfers; multi-stream currently pays N+1
+  setups and performs them sequentially.
+
+**Experiment**
+- Compare sequential versus concurrent setup, OpenSSH ControlMaster multiplexing, one
+  long-lived v2 session carrying multiple sync requests, and a native SSH library spike.
+- Measure 1/10/100 tiny sync jobs across LAN and 20/80/150 ms RTT, including authentication
+  agent behavior and teardown.
+
+**Decision gate / AC**
+- Ship concurrent setup if it removes at least 50% of multi-stream setup time without
+  triggering `MaxStartups`; use bounded concurrency plus jittered retry.
+- Ship session reuse only if median repeated-job latency improves at least 2x and isolation is
+  preserved: each job has a fresh root/policy context, cancellation and audit record.
+- A native SSH stack must beat OpenSSH multiplexing materially and pass host-key, agent,
+  ProxyJump, config-file and security review; otherwise keep OpenSSH.
+- Never modify the user's SSH config automatically.
+
+### Story V3.35 — Remove process-per-clone and choose native copy primitives
+- [ ] **P1.** macOS now calls `clonefile(2)` directly; Linux still shells out to `cp` for
+  reflink file/tree attempts.
+
+**AC**
+- Add a minimal reviewed Linux `FICLONE` wrapper or a maintained safe dependency. Probe once
+  per destination and fall back without leaving a stage.
+- Compare reflink, `copy_file_range`, `sendfile` and buffered copy on ext4, XFS and btrfs for
+  tiny, medium, huge, sparse and cross-filesystem files. Record cache effects as well as time.
+- Select by capability and measured size regime; do not use a global platform assumption.
+- Remove the external `cp` dependency from per-file operation. Keep a whole-tree subprocess
+  only if it wins a separate measured gate and its metadata semantics match the contract.
+- Fault tests cover unsupported ioctls, partial clone/copy, source mutation and publish crash.
+
+### Story V3.36 — Adaptive transport window, stream count and compression
+- [ ] **P1/R.** Static defaults cannot be optimal across a 5.8 MB/s WAN-like route and a
+  fast LAN; the current control connection also negotiates no compression in multi-stream
+  mode.
+
+**AC**
+- Finish V3.18: correct capabilities on every stream, concurrent bounded setup, actionable
+  `MaxStartups` handling and no single-file/small-file path divergence.
+- Measure bandwidth-delay product, CPU saturation and receiver backpressure without a
+  destructive link probe. Use them to select outstanding bytes, batch size, compression and
+  stream count, within user-set bounds.
+- Add `--bwlimit` with an aggregate token bucket across streams; observed rate stays within
+  5% after ramp-up and cancellation is prompt.
+- Adaptation never changes content semantics and is recorded in JSON. A deterministic override
+  makes benchmarks and incident reproduction possible.
+- Decision gate: automatic policy must beat the fixed one-stream default by at least 10% in
+  two distinct constrained regimes and regress no retained cell by more than 5%.
+
+### Story V3.37 — Persistent index and filesystem change journal
+- [ ] **R.** This is the highest-upside latency idea: make repeated sync proportional to
+  changes rather than tree size.
+
+**Experiment / gate**
+- Prototype an on-disk index plus FSEvents/inotify/USN change feed on a 1m-entry corpus.
+  Target: plan a <1% change in under one second and at least 5x faster than a full scan.
+- Force event loss, overflow, rename storms, journal wrap, clock changes, offline edits and
+  index corruption. Every uncertainty triggers a bounded rescan; none may silently bless a
+  stale index.
+- Measure steady-state disk, memory, startup and update costs. Do not ship if maintaining the
+  index regresses ordinary one-shot runs or requires an always-on privileged daemon.
+- The index is an optimization cache, never the only copy of correctness-critical state;
+  deletion or corruption must degrade to a full scan.
+
+### Story V3.38 — Compare rsync-style delta, CDC and no-delta strategies
+- [ ] **R.** V3.5 measures cross-file duplication; this story chooses the algorithm users
+  would actually receive.
+
+**Experiment**
+- Compare rsync fixed-block rolling checksums, FastCDC, whole-file resend and clone/reflink on:
+  one-byte edits, insertions near the front, VM images, database-like files, renamed copies,
+  repeated build artifacts and incompressible media.
+- Run across bandwidth/RTT regimes and include source hashing, destination reads, index size,
+  memory, wire bytes, wall time and resume behavior.
+
+**Decision gate / AC**
+- Select delta only where total wall time improves at least 1.5x or wire bytes fall at least
+  70% on a constrained route without a local/LAN regression above 10%.
+- The cost model may choose no delta. Users can force a strategy for reproducibility.
+- If CDC wins, chunk indexes are bounded, checksummed, garbage-collectable and untrusted; a
+  false match can never publish corrupt bytes because the final file digest is authoritative.
+- Interruption, index corruption and adversarial chunk boundaries have oracle-backed tests.
+
+### Story V3.39 — Resource efficiency and coexistence
+- [ ] **R.** A fast sync that evicts the working set or saturates the machine is not a good
+  background product.
+
+**AC**
+- Measure peak RSS, open FDs, CPU, context switches, page-cache displacement and destination
+  queue depth at 10k/100k/1m entries and multiple simultaneous jobs.
+- Add memory/FD budgets and backpressure assertions to the benchmark harness. Bounded protocol
+  frames alone do not prove a bounded whole run.
+- Compare normal/low-priority I/O and CPU modes (`nice`, platform I/O priority, cache hints).
+  Ship a background mode only if foreground latency improves materially and total sync time
+  stays within a documented bound.
+- Define behavior under system memory pressure and file-descriptor exhaustion; no busy loop or
+  unbounded retry is allowed.
+
+### Story V3.40 — Performance regression gates that can be trusted
+- [ ] **P1.** The harness is sophisticated, but the release still lacks a representative
+  checked-in gate baseline.
+
+**AC**
+- Nominate stable regression-tier cells for APFS and Linux, local and SSH, small-file, large,
+  no-op and churn. Pin corpus digests and environment identity.
+- Gate on paired ratios and phase budgets, not absolute developer-machine time. Noisy rows
+  cannot pass or fail a release.
+- Fail on correctness, source drift, memory/FD budget violations and a >10% regression in a
+  previously selected path. Retain reports as artifacts without committing scratch trees.
+- Run a lightweight PR gate and a broader scheduled/release matrix. The latter publishes the
+  crossover table used by strategy policy.
+
+---
+
+## Part G — Additional quality-of-life work
+
+### Story V3.41 — Config initialization, validation and effective-value display
+- [ ] **P2.** Named jobs exist; make them discoverable and safe to edit.
+
+**AC**
+- `xs config init` writes a commented example only after confirmation and never overwrites an
+  existing file. `xs config path` says which file would be loaded.
+- `xs config check` validates every job without contacting a remote. `xs job show NAME` prints
+  effective values and their origin (CLI, job, environment or default), with secrets redacted.
+- Add explicit negative boolean flags where a job can otherwise enable a destructive option
+  that the CLI cannot turn off, starting with `--no-delete`.
+- Job-level environment interpolation, if supported, is allowlisted and visible; missing values
+  fail before mutation rather than becoming empty paths.
+
+### Story V3.42 — Inspect and clean xsync-owned state
+- [ ] **P2.** Users should not need the README to find journals, cache databases, staging files
+  and bootstrap remnants.
+
+**AC**
+- `xs state list` reports hash cache, resume journals, locks, staged files and persisted remote
+  bootstrap binaries with sizes and last-use times.
+- `xs state clean` previews exact targets and requires an explicit scope/confirmation. It only
+  removes paths carrying an xsync ownership marker and never recursively targets a broad temp,
+  cache, home or destination root.
+- Active locks/journals are refused. Stale detection is documented and testable.
+- Package uninstall instructions call the same inspection logic and distinguish binary removal
+  from user-data cleanup.
+
+### Story V3.43 — Actionable retry manifests and small-file resume
+- [ ] **P2.** Partial failure code 23 says something was missed; it should also make the retry
+  exact and cheap.
+
+**AC**
+- `--write-retry-list FILE` atomically records raw paths, operation, source identity and error
+  class for entries not completed. A matching `--retry-from FILE` validates endpoints and source
+  identity before doing work.
+- The format is versioned, NUL-safe on Unix and consumable by `--files-from` without lossy text.
+- Small-file batches checkpoint at bounded intervals so a reconnect does not resend an entire
+  million-file run. Journal fsync policy is measured; it must not recreate the historical
+  fsync-per-file regression.
+- A retry never replays a successful deletion or mutation and still runs final manifest checks.
+
+### Story V3.44 — Stable automation and terminal contract
+- [ ] **P2.** Make the same command pleasant in a terminal and predictable in a scheduler.
+
+**AC**
+- Define stable exit classes for no change, successful change, partial transfer, policy refusal,
+  usage/config error, timeout/interruption and integrity failure. Preserve rsync's useful code 23
+  where practical without pretending every rsync code maps.
+- Human progress, color and prompts require a TTY; redirected stdout/stderr never receives ANSI or
+  waits for input. `--non-interactive` fails instead of prompting.
+- JSON schemas are versioned and contain run/job IDs, effective policy, phase timing, byte bases,
+  selected strategy and terminal outcome. Logs can be rotated externally without corruption.
+- `--quiet`, `--verbose`, `--stats`, `--itemize-changes` and `--progress-json` interactions are
+  table-tested. Server diagnostics appear only under explicit verbosity or in structured logs.
+- Provide launchd/systemd-timer examples for V3.17 and prove concurrent scheduled runs are stopped
+  by V3.13's destination lock.
+
+---
+
+## Recommended delivery sequence
+
+1. **Integrity before features:** V3.20, V3.21 and V3.22. Keep `--paranoid` and sparse warnings
+   prominent until their default-path replacements are complete.
+2. **Bound and contain operations:** V3.12, V3.13, V3.23, V3.11 and V3.24. This produces a tool
+   that stops, times out, cannot interleave destinations and cannot casually wipe a backup.
+3. **Rehearse the preview:** V3.32, V3.30 and V3.31. Publish one truthful, installable release
+   before expanding package channels or daemon work.
+4. **Make it the daily command:** V3.14–V3.16 and V3.26–V3.27, followed by V3.41–V3.44.
+5. **Close known performance losses:** V3.18, V3.33–V3.36 and V3.40. Optimize the measured phase,
+   then lock the win into the regression gate.
+6. **Expand archive/topology parity:** V3.25, V3.28 and V3.29.
+7. **Fund structural bets only on evidence:** V3.4–V3.8 and V3.37–V3.39. A recorded "do not build"
+   decision is a successful research outcome.
+
+## First ten executable tickets
+
+These are intentionally small enough to pull without first decomposing the whole backlog.
+
+1. Specify the sync-v2 per-file/full-file digest fields and add corrupt-payload vectors (V3.20).
+2. Add the interim sparse/free-space refusal and explicit override (V3.21/V3.24).
+3. Add destination-wide lock acquisition to local, push sink and pull destination paths (V3.13).
+4. Add first/second Ctrl-C behavior to the shared execution pipeline (V3.12).
+5. Add connect and idle timeout plumbing to the fake-rsh integration harness (V3.23).
+6. Add ENOSPC and permission fault cells that assert old-destination preservation (V3.22).
+7. Add `--max-delete` plus pre-delete summary and non-interactive refusal semantics (V3.11).
+8. Generate a status inventory and fix the README/DEPLOYMENT contradictions (V3.32).
+9. Fix multi-stream capability negotiation and add the streams-16 refusal/backoff test (V3.18).
+10. Capture the phase/first-byte baseline for tiny-file, congress-10k and one-large-file routes
+    before another optimization lands (V3.33).
+
+### Story V3.20 — Local worker count should follow the storage, not the core count
+
+- [ ] `default_local_workers` returns `available_parallelism()` (capped at 4 on
+  macOS). Measured across an 8x range of core counts, the optimum did not move
+  with cores. Evidence in `BENCHMARKv2.md`.
+
+| Host | Cores | Best worker count | Cost of the current default |
+|---|---:|---:|---:|
+| freya (7950X) | 32 | 32 | none — coincides |
+| orion (Pi 5) | 4 | 16-32 | **20% slower** |
+
+Both plateau in the 16-32 range. On the Pi the run uses 21% of the USB write
+ceiling at the plateau with load average ~2, so it is waiting on per-file I/O
+latency, which is a property of the device and not of the CPU.
+
+**AC**
+
+- The default is no longer a bare `available_parallelism()`. Options, cheapest
+  first: a floor (`max(cores, 16)`) for local transfers; a device-aware value
+  read from the queue depth of the destination's block device; or a short
+  ramp-up probe at the start of a large transfer.
+- The change is validated on all three platforms before it lands. macOS is the
+  live counter-example: `MACOS_WORKER_CAP = 4` exists because extra workers
+  contended there, and this change must not silently undo that finding.
+- Rotational destinations are considered. 16 concurrent writers suits NVMe;
+  `/sys/block/<dev>/queue/rotational` is one cheap signal.
+- Whatever lands, `default_local_workers` documents its reasoning the way
+  `MACOS_WORKER_CAP` does, so the next person does not have to re-derive it.
+
+**Related:** V3.19 was withdrawn as a warm-cache artifact. This story is the real
+version of that question, arrived at from cold measurements on two machines.

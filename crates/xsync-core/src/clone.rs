@@ -338,9 +338,22 @@ fn apply_file_metadata(path: &Path, entry: &FileEntry) -> Result<(), CloneError>
 }
 
 fn publish_file(stage: &Path, destination: &Path) -> Result<(), CloneError> {
-    remove_existing(destination)?;
-    fs::rename(stage, destination)
-        .map_err(|source| io_error("publish cloned file", destination, source))
+    match fs::rename(stage, destination) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            // Unix rename atomically replaces regular files and symlinks. Only
+            // a real directory requires removal before retrying; keep the old
+            // file intact if publication fails for any other reason.
+            let replaceable = fs::symlink_metadata(destination)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+            if !replaceable {
+                return Err(io_error("publish cloned file", destination, first));
+            }
+            remove_existing(destination)?;
+            fs::rename(stage, destination)
+                .map_err(|source| io_error("publish cloned file", destination, source))
+        }
+    }
 }
 
 /// Whether the destination filesystem can reflink, probed once per run.

@@ -18,12 +18,13 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::path::WirePath;
 
-/// Probe file names. Chosen to differ only in the property being tested.
-const CASE_PROBE_UPPER: &str = ".xsync.tmp.PathProbe";
-const CASE_PROBE_LOWER: &str = ".xsync.tmp.pathprobe";
+/// Probe suffixes. A unique temporary prefix is added for every probe so we
+/// never touch a user-owned, predictable basename.
+const CASE_PROBE_UPPER: &str = "PathProbe";
+const CASE_PROBE_LOWER: &str = "pathprobe";
 /// "é" as one codepoint (U+00E9) and as "e" + U+0301. Canonically equivalent.
-const NFC_PROBE: &str = ".xsync.tmp.probe-\u{e9}";
-const NFD_PROBE: &str = ".xsync.tmp.probe-e\u{301}";
+const NFC_PROBE: &str = "probe-\u{e9}";
+const NFD_PROBE: &str = "probe-e\u{301}";
 
 /// What a destination filesystem considers to be the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,16 +123,33 @@ fn nearest_existing_directory(path: &Path) -> Option<std::path::PathBuf> {
 
 /// Create `first`, then report whether `second` names the same file.
 fn probe_pair(root: &Path, first: &str, second: &str) -> bool {
-    let first_path = root.join(first);
-    let second_path = root.join(second);
-    let _ = fs::remove_file(&first_path);
-    let _ = fs::remove_file(&second_path);
-    if fs::write(&first_path, b"").is_err() {
+    let seed = tempfile::Builder::new()
+        .prefix(".xsync-probe-")
+        .tempfile_in(root)
+        .ok();
+    let Some(seed) = seed else {
+        return false;
+    };
+    let Some(prefix) = seed.path().file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let prefix = prefix.to_owned();
+    drop(seed);
+    let first_path = root.join(format!("{prefix}{first}"));
+    let second_path = root.join(format!("{prefix}{second}"));
+    let first_created = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&first_path)
+        .is_ok();
+    if !first_created {
         return false;
     }
     let collides = fs::symlink_metadata(&second_path).is_ok();
     let _ = fs::remove_file(&first_path);
-    let _ = fs::remove_file(&second_path);
+    // On a case/normalization-insensitive volume this is the same inode;
+    // removing the first name is sufficient. Never unlink the second path:
+    // another process may have created it after our metadata check.
     collides
 }
 
@@ -257,5 +275,16 @@ mod tests {
         if semantics.case_insensitive || semantics.normalization_insensitive {
             assert!(semantics.can_collide());
         }
+    }
+
+    #[test]
+    fn probe_does_not_touch_predictable_user_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let sentinel = temp.path().join(".xsync.tmp.PathProbe");
+        fs::write(&sentinel, b"user data").unwrap();
+
+        let _ = PathSemantics::probe(temp.path());
+
+        assert_eq!(fs::read(sentinel).unwrap(), b"user data");
     }
 }
