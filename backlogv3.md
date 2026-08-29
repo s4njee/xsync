@@ -1082,3 +1082,49 @@ back to back, including freya and orion. Those hosts showed *flat* curves past
 the optimum rather than degradation, so throttling would only have masked further
 gains rather than inventing a false decline — but the same bracketed-control
 practice should be adopted for future sweeps regardless.
+
+### Story V3.22 — Compress protocol metadata, the way rsync's `-z` does
+
+- [~] **Implemented, tests pass, NOT yet verified against a live peer or measured.**
+  Do not treat this as done. Committed so the work is not lost; the first task on
+  resuming is the verification below.
+
+xsync compresses file *payloads* but never the protocol chatter. rsync's `-z`
+compresses its file list too, and `BENCHMARKv2.md` had already hypothesised that
+this is part of the 1.57x deficit against `rsync -az`.
+
+**Why it is cheap.** The machinery already exists and is general:
+`encode_payload_frame` compresses any message type with an adaptive
+sample-and-skip, and **decompression keys off the frame header flags before any
+message-type dispatch**. So no protocol change, no version bump, and no
+capability beyond the `CAP_ZSTD` already negotiated — the change is send-side
+only.
+
+**Sizing** (measured on a real path sample): paths average 39 bytes and compress
+**15.5x** with zstd-3 because they share long prefixes. Extrapolated to
+congress-1m that is ~48.7 MB of path bytes down to ~3.2 MB, so roughly **45 MB
+saved on the wire** for one transfer.
+
+**What landed:** `encode_meta_frame` in `server.rs`, mirroring `encode_frame`
+rather than `write_frame` so call sites keep their own write-and-flush structure
+(using the flushing `write_data_frame` would have forced a flush per batch header
+and quietly changed pipelining). Four emit sites converted, covering both
+metadata streams in both directions: `FileBatch` on push and pull, and both
+chunked `Scan` emitters. The empty-page `Scan` emitter is deliberately left
+alone.
+
+**AC — none of this is done yet**
+
+- **Verified against a live remote peer.** This changes what goes on the wire and
+  has only been exercised by local tests. orion currently runs a pre-change
+  build, which makes it the ideal backward-compatibility check: a new client
+  talking to an old server must interoperate, since decompression is generic.
+- **Measured.** Compare `wire_bytes` from the `finished` event, before vs after,
+  on the same corpus and host. congress-100k is the natural target: many files,
+  highly compressible paths.
+- **`--no-compress` still means no compression**, metadata included, or the flag
+  is a lie.
+- **The multi-stream gap is addressed or noted.** The multi-stream control
+  session negotiates `capabilities=0x0`, so it compresses nothing at all — and
+  every small file goes over it. This change is blunted in exactly the
+  configuration where metadata volume is highest. See V3.18.
