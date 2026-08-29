@@ -1033,3 +1033,43 @@ still safely below the degradation at 16.
 
 **Related:** V3.19 was withdrawn as a warm-cache artifact. This story is the real
 version of that question, arrived at from cold measurements on two machines.
+
+### Story V3.21 — Re-run the macOS 16/32-worker arms controlling for enclosure heat
+
+- [ ] The macOS sweep ran worker counts in ascending order (1, 2, 4, 8, 16, 32)
+  across ~79 minutes of continuous load. The 16 and 32 arms therefore ran last, on
+  a USB enclosure that had been writing for over an hour and was hot to the touch.
+  **Accumulated heat is perfectly correlated with worker count**, so the observed
+  degradation past 8 workers may be thermal throttling of the enclosure rather
+  than macOS worker contention. Results in `BENCHMARKv2.md`.
+
+This matters beyond a data point: the turn-over past the optimum is the *only*
+evidence that macOS behaves differently from Linux, and it is what justifies
+having `MACOS_WORKER_CAP` at all. If it is thermal, macOS looks like Linux — flat
+past the optimum — and the cap can be raised freely rather than merely from 4 to
+8. The 4-vs-8 comparison itself is unaffected; both arms ran early.
+
+**AC**
+
+- **Order is not confounded with heat.** Run descending (32, 16, 8, 4) or
+  randomised, not ascending.
+- **Bracketed control.** Run an identical 8-worker arm first and last in the
+  session. If the closing 8-worker arm is slower than the opening one, the
+  session drifted — thermally or otherwise — and per-arm numbers cannot be
+  compared without correcting for it. This is the single most informative
+  addition and is cheap.
+- **Cooling between arms.** Idle the drive to a fixed floor between reps (several
+  minutes), or verify temperature has returned to baseline.
+- **Measure the temperature rather than inferring it.** `brew install
+  smartmontools`, then `smartctl -d sat -a /dev/diskN` for the NVMe composite
+  temperature; log it immediately before and after each rep. Nothing on the box
+  currently reports enclosure temperature, which is why this was invisible.
+- If throttling is confirmed, the affected arms are re-measured with adequate
+  cooling and `BENCHMARKv2.md` is corrected — including the claim that macOS
+  degrades past its optimum, and the V3.20 table that rests on it.
+
+**Applies more broadly.** Every long sweep in this file ran ascending and
+back to back, including freya and orion. Those hosts showed *flat* curves past
+the optimum rather than degradation, so throttling would only have masked further
+gains rather than inventing a false decline — but the same bracketed-control
+practice should be adopted for future sweeps regardless.

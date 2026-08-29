@@ -847,11 +847,23 @@ background load is near constant and the **scaling shape is trustworthy**;
 
 ### macOS really does behave differently
 
-**The cap's motivation is confirmed.** On both Linux hosts, worker counts past the
-optimum were *harmless* — freya was flat from 32 to 64, orion flat past 16. On
-macOS the curve turns over: 16 workers is 2.5% worse than 8, and 32 is 6.5%
-worse. Extra workers actively contend here, exactly as the cap assumed. That is a
-real OS difference, not noise; the 8-worker arm has 0.3% MAD.
+**The cap's motivation appears confirmed** — with one unresolved threat to the
+conclusion, below. On both Linux hosts, worker counts past the optimum were
+*harmless* — freya was flat from 32 to 64, orion flat past 16. On macOS the curve
+turns over: 16 workers is 2.5% worse than 8, and 32 is 6.5% worse. The 8-worker
+arm has 0.3% MAD, so the difference is not noise.
+
+> **⚠ Unresolved confound: the sweep ran in ascending worker order.** 1, 2, 4, 8,
+> 16, 32 executed back to back over ~79 minutes of continuous load, so the 16 and
+> 32 arms ran last, on an enclosure that had been writing for over an hour and was
+> reported hot to the touch. Accumulated heat is therefore **perfectly correlated
+> with worker count**, and thermal throttling of the USB enclosure would produce
+> exactly the observed turn-over. Nothing in this data distinguishes the two
+> explanations.
+>
+> The 10% figure for the cap (4 vs 8) is unaffected — both arms ran early. What is
+> in doubt is the claim that macOS *degrades* past its optimum, which is the part
+> that justifies keeping a cap at all. See backlog V3.21 for the re-run design.
 
 **The cap's value is too conservative.** The optimum is 8, not 4, and the cap
 costs **10%** on this workload. Raising it from 4 to 8 keeps the protection
