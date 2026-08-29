@@ -1,8 +1,30 @@
-# BENCHMARK v2 — `congress/118` → mars.local
+# BENCHMARK v2
 
-Wall-clock comparison of `xs` (xsync 0.1.0) against rsync, tar-over-ssh with
-several compressors, and scp, transferring the same corpus to the same host over
-the same link.
+Measured results for `xs` (xsync 0.1.0). This began as a single network
+comparison against rsync, tar-over-ssh and scp, and has accumulated further
+studies as questions arose; each is dated and self-contained, and later ones
+sometimes correct earlier ones.
+
+| Study | Machines | What it answers |
+|---|---|---|
+| [Baseline: congress/118 → mars](#dataset) | mac → mars, 1 GbE | xsync vs rsync/tar/scp over a network |
+| [`--streams` on large files](#--streams-on-large-files-corpus-b-manga--2026-08-28) | mac → mars | Where parallel streams pay, and where they do not |
+| [Fix and re-measurement on cb7](#fix-and-re-measurement-corpus-c-cb7--2026-08-28) | mac → mars | The small-file `--streams` regression, fixed (2.70x) |
+| [Cross-NVMe on freya](#cross-nvme-local-transfer-on-freya-corpus-a--2026-08-28) | freya, local | First local NVMe-to-NVMe; warm caches |
+| [Cold cross-device NVMe](#cold-cross-device-nvme-congress-1m-on-freya--2026-08-29) | freya, local | congress-1m cold; ZFS vs ext4 reads; QLC variance |
+| [Core-count heuristic refuted](#the-core-count-heuristic-is-wrong-on-small-machines--orion-pi-5-2026-08-29) | orion (Pi 5) | Whether worker count should track logical cores |
+
+**Two corrections carried in later sections**, noted here so they are not missed
+by anyone reading only the top: the `--streams` "contention" hypothesis in the
+first findings section is wrong (it was an unpipelined code path), and the
+12-worker scaling plateau reported on freya was a warm-cache artifact that does
+not survive cold measurement.
+
+## Baseline: congress/118 → mars.local
+
+Wall-clock comparison of `xs` against rsync, tar-over-ssh with several
+compressors, and scp, transferring the same corpus to the same host over the same
+link.
 
 ## Dataset
 
