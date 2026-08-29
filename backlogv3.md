@@ -1116,9 +1116,11 @@ alone.
 **AC — none of this is done yet**
 
 - **Verified against a live remote peer.** This changes what goes on the wire and
-  has only been exercised by local tests. orion currently runs a pre-change
-  build, which makes it the ideal backward-compatibility check: a new client
-  talking to an old server must interoperate, since decompression is generic.
+  has only been exercised by local tests, so the point is that compressed
+  metadata frames decode correctly end to end — not version skew. Backward
+  compatibility is *not* a requirement (see the note below), so if a mixed-version
+  pair misbehaves, the answer is to update both ends rather than to preserve the
+  old encoding.
 - **Measured.** Compare `wire_bytes` from the `finished` event, before vs after,
   on the same corpus and host. congress-100k is the natural target: many files,
   highly compressible paths.
@@ -1128,3 +1130,25 @@ alone.
   session negotiates `capabilities=0x0`, so it compresses nothing at all — and
   every small file goes over it. This change is blunted in exactly the
   configuration where metadata volume is highest. See V3.18.
+
+### Note — the v1 wire is not actually frozen (2026-08-29)
+
+Recorded because several decisions in this backlog were made under the
+assumption that it was, and they should be revisited. **xsync is greenfield with
+no deployed users, so protocol compatibility is not a constraint.** The
+"frozen v1" language in the code and docs reflects a design intent to keep the
+wire stable, not an obligation to any existing peer.
+
+This unblocks work that was previously routed around:
+
+| Story | What was worked around | What is now possible |
+|---|---|---|
+| **V3.3** | The index encoding carries identity, size and times but not ownership or link count, so the dropped-metadata preflight re-`stat`s every file. Measured at ~6% of a 100k-file copy before it was parallelised. | Carry `uid`/`gid`/`nlink` in the encoding and drop the extra `stat` entirely. |
+| **V3.10** | `--include` is *refused* for remote transfers because the wire carries only a flat exclude list, and sending excludes alone would transfer more than asked for. | Carry the ordered rule set. The encoding and round-trip tests already exist in `filter::encode`/`decode`; only the wire field is missing. |
+| **V3.18** | The multi-stream control session negotiates `capabilities=0x0`, so it compresses nothing — and every small file goes over it. | Negotiate properly rather than documenting the gap. |
+| **V3.22** | Metadata compression was deliberately built to need no wire change. | Still the right design, but no longer constrained to it. |
+
+None of these are urgent. The point is that "the wire cannot change" should stop
+being cited as the reason, and where a story says so, the real trade-off should
+be restated. `protocol.md` should also lose its frozen-format framing, or gain a
+line saying the freeze is a goal rather than a compatibility obligation.
