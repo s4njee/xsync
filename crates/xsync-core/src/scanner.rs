@@ -568,12 +568,28 @@ pub(crate) fn permission_mode(metadata: &fs::Metadata) -> u32 {
     metadata.permissions().mode() & 0o7777
 }
 
+/// Synthesise a Unix mode for a platform that has none.
+///
+/// Windows exposes only a read-only flag, so the mode is derived from that. The
+/// **execute bit must be set on directories**: a directory without its search
+/// bit cannot be entered or listed, so a tree pulled from Windows to a Unix host
+/// arrived as `drw-rw-rw-` and was completely inaccessible — the files were
+/// there and could not be reached. Regular files get no execute bit, since
+/// Windows executability is decided by extension and inventing it here would
+/// mark every file executable.
 #[cfg(not(unix))]
 pub(crate) fn permission_mode(metadata: &fs::Metadata) -> u32 {
-    if metadata.permissions().readonly() {
+    let read_only = metadata.permissions().readonly();
+    if metadata.is_dir() {
+        if read_only {
+            0o555
+        } else {
+            0o755
+        }
+    } else if read_only {
         0o444
     } else {
-        0o666
+        0o644
     }
 }
 
