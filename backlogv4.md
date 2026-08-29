@@ -249,10 +249,20 @@ symlink policy.
 | **Alternate data streams** | 20-byte `:hidden` stream dropped entirely | No: needs `FindFirstStreamW` (FFI) |
 | **Junctions** | silently converted to symlinks | No: needs the reparse tag, which `file_attributes` does not expose |
 
-The three undetectable cases need either an unstable feature or `unsafe` FFI, and
-this crate denies `unsafe` outside one documented exemption. They are recorded in
-the `note_dropped_metadata` doc comment with their measured behaviour so the next
-person does not have to rediscover them.
+**None of these fail silently any more.** Preservation is not required for
+feature-completeness; silence is the actual defect, because it reads as "you had
+none" when it means "I cannot see them".
+
+- **Junctions are now counted.** Reparse points are visible through
+  `FILE_ATTRIBUTE_REPARSE_POINT` even though their *kind* is not, so the run
+  reports how many will be recreated as symlinks.
+- **Hardlinks and ADS are declared unchecked.** `Preflight::unchecked` carries the
+  categories this platform cannot inspect, reported once per run in the summary
+  and as `unchecked_metadata` in the `finished` event. The message says xsync
+  cannot detect them *here* — not that the source had none.
+
+Their measured behaviour is also recorded in the `note_dropped_metadata` doc
+comment, so the next person does not have to rediscover it.
 
 **Fixed:** sparse files are now reported on Windows via
 `FILE_ATTRIBUTE_SPARSE_FILE`, which stable std does expose. The byte saving
@@ -272,9 +282,11 @@ Unix ownership, and V3.3 conflated the two. Replaced with an explicit
   created locally — NTFS is case-insensitive, so writing `readme.md` overwrote
   `README.md` in the fixture. Testing it needs a case-sensitive *source*, i.e. a
   transfer from a Linux host. Deferred to the remote leg of 4.10.
-- [ ] Hardlinks, ADS and junction conversion remain undetected. Revisit if a
-  `windows-sys` dependency or an `unsafe` exemption is ever judged worthwhile;
-  each is a real, silent data loss on NTFS.
+- [ ] Hardlinks and ADS remain *undetected* (though no longer unreported).
+  Detecting them needs the unstable `windows_by_handle` feature or
+  `FindFirstStreamW` via FFI. Revisit only if a `windows-sys` dependency or a
+  second `unsafe` exemption is judged worthwhile — the reporting now makes the
+  gap visible, which was the actual problem.
 
 **AC**
 - Case-insensitivity: NTFS is case-insensitive but case-preserving, so the V3.1

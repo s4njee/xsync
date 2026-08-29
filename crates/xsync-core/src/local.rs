@@ -564,11 +564,16 @@ where
     }
     // xsync has no concept of a hole, so a sparse source is read and written at
     // its apparent size. Say so before starting work that may not fit.
+    // Symlinks are included so the preflight can see reparse points on Windows,
+    // where a junction is silently recreated as a symlink. Counting only
+    // `plan.files` reported zero reparse points for a tree that contained three.
     let transferable: Vec<FileEntry> = plan
         .files
         .new
         .iter()
         .chain(&plan.files.changed)
+        .chain(&plan.symlinks.new)
+        .chain(&plan.symlinks.changed)
         .cloned()
         .collect();
     // The ownership question is "who will own the copies", and the only way to
@@ -1714,7 +1719,29 @@ pub(crate) fn report_preflight(
     if dropped && ownership == OwnershipCheck::SkippedForDryRun {
         report_unchecked_ownership(emit);
     }
+    report_unchecked_categories(&preflight.unchecked, emit);
     report_sparse_files(&preflight.sparse, emit);
+}
+
+/// Say which metadata this platform cannot inspect at all.
+///
+/// Not preserving something is a documented limitation; being unable to tell the
+/// user whether they had any is a different and worse one. Silence here would
+/// read as "you have none" when it means "I cannot see them", so this is stated
+/// once per run on affected platforms rather than left implicit.
+fn report_unchecked_categories(unchecked: &[&'static str], emit: &mut impl FnMut(LocalEvent)) {
+    if unchecked.is_empty() {
+        return;
+    }
+    emit(LocalEvent::Warning {
+        path: String::new(),
+        message: format!(
+            "not inspected on this platform: {}. xsync cannot detect these here, \
+             so it cannot tell you whether the source had any — if it did, they \
+             are not preserved.",
+            unchecked.join(", ")
+        ),
+    });
 }
 
 /// Say what will not survive the transfer. Silent when nothing is dropped.
@@ -1738,6 +1765,13 @@ fn report_dropped_metadata(
             "{} entr(ies) carry extended attributes (resource forks, Finder info, \
              quarantine flags) that will not be copied",
             dropped.with_xattrs
+        ));
+    }
+    if dropped.reparse_points > 0 {
+        parts.push(format!(
+            "{} reparse point(s) are recreated as symlinks; a junction is not \
+             equivalent to a symlink and its kind is not preserved",
+            dropped.reparse_points
         ));
     }
     if dropped.sparse_written_dense > 0 {

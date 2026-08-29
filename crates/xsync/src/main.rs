@@ -1851,6 +1851,8 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "dropped_xattr_entries": dropped_metadata.with_xattrs,
             "foreign_owner_entries": dropped_metadata.foreign_owner,
             "sparse_written_dense": dropped_metadata.sparse_written_dense,
+            "reparse_points": dropped_metadata.reparse_points,
+            "unchecked_metadata": xsync_core::sparse::unchecked_categories(),
         }),
     }
 }

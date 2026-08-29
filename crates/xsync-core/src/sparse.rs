@@ -46,6 +46,10 @@ pub struct DroppedMetadata {
     /// Entries owned by a user or group other than the one running xsync, whose
     /// ownership therefore cannot be reproduced.
     pub foreign_owner: usize,
+    /// Reparse points (Windows). Junctions and symlinks share this attribute and
+    /// cannot be told apart without reading the reparse tag, so both are counted
+    /// together — a junction is recreated as a symlink, which is not equivalent.
+    pub reparse_points: usize,
 }
 
 impl DroppedMetadata {
@@ -56,6 +60,7 @@ impl DroppedMetadata {
             && self.with_xattrs == 0
             && self.foreign_owner == 0
             && self.sparse_written_dense == 0
+            && self.reparse_points == 0
     }
 }
 
@@ -103,6 +108,30 @@ pub struct Preflight {
     pub sparse: SparseReport,
     /// Metadata the transfer will not preserve.
     pub dropped: DroppedMetadata,
+    /// Metadata categories this platform cannot inspect, so xsync can neither
+    /// preserve them nor tell you whether you had any.
+    ///
+    /// Reporting this is the difference between "you have no hardlinks" and "I
+    /// cannot see hardlinks here" — silence would imply the first while meaning
+    /// the second.
+    pub unchecked: Vec<&'static str>,
+}
+
+/// Metadata categories that cannot be inspected on this platform.
+///
+/// Windows: `number_of_links` is behind the unstable `windows_by_handle`
+/// feature, and enumerating alternate data streams needs `FindFirstStreamW`.
+/// Both would require an unstable feature or `unsafe` FFI, which this crate
+/// denies outside one documented exemption. Measured consequences on NTFS: a
+/// hardlinked pair arrives as two independent copies, and an alternate data
+/// stream is dropped entirely.
+#[must_use]
+pub fn unchecked_categories() -> Vec<&'static str> {
+    if cfg!(windows) {
+        vec!["hardlinks", "alternate-data-streams"]
+    } else {
+        Vec::new()
+    }
 }
 
 /// What a planned transfer will actually cost in written bytes.
@@ -211,13 +240,17 @@ struct Partial {
     with_xattrs: usize,
     foreign_owner: usize,
     sparse_written_dense: usize,
+    reparse_points: usize,
     /// `(device, inode, size)` for each entry whose inode has more than one
     /// name, in encounter order.
     links: Vec<(u64, u64, u64)>,
 }
 
 fn merge(partials: Vec<Partial>, capacity_hint: usize) -> Preflight {
-    let mut result = Preflight::default();
+    let mut result = Preflight {
+        unchecked: unchecked_categories(),
+        ..Preflight::default()
+    };
     let mut seen: HashMap<(u64, u64), usize> = HashMap::with_capacity(capacity_hint / 16 + 1);
     for partial in partials {
         result.sparse.apparent_bytes = result
@@ -232,6 +265,7 @@ fn merge(partials: Vec<Partial>, capacity_hint: usize) -> Preflight {
         result.dropped.with_xattrs += partial.with_xattrs;
         result.dropped.foreign_owner += partial.foreign_owner;
         result.dropped.sparse_written_dense += partial.sparse_written_dense;
+        result.dropped.reparse_points += partial.reparse_points;
         for (device, inode, size) in partial.links {
             result.dropped.hardlinked += 1;
             let count = seen.entry((device, inode)).or_insert(0_usize);
@@ -257,6 +291,8 @@ fn inspect_chunk(entries: &[FileEntry], source_root: &Path, owner: Option<Owner>
     for entry in entries {
         let path = entry.path.to_native_path(source_root);
         note_dropped_metadata(&mut partial, entry, &path, owner);
+        #[cfg(windows)]
+        note_reparse_point(&mut partial, &path);
 
         if entry.kind != EntryKind::File || entry.size < SPARSE_PROBE_MIN_BYTES {
             continue;
@@ -401,6 +437,21 @@ fn note_dropped_metadata(
     };
     if metadata.file_attributes() & SPARSE != 0 {
         partial.sparse_written_dense += 1;
+    }
+}
+
+/// Count reparse points, which are visible even though their *kind* is not.
+#[cfg(windows)]
+fn note_reparse_point(partial: &mut Partial, path: &Path) {
+    use std::os::windows::fs::MetadataExt;
+
+    /// `FILE_ATTRIBUTE_REPARSE_POINT`.
+    const REPARSE: u32 = 0x0000_0400;
+
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_attributes() & REPARSE != 0 {
+            partial.reparse_points += 1;
+        }
     }
 }
 
