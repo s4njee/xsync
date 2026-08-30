@@ -507,37 +507,38 @@ Unix ownership, and V3.3 conflated the two. Replaced with an explicit
 
 ---
 
-### 4.12 — Measure the Windows Defender tax on file-copy throughput
+### 4.12 — The Windows Defender tax *(measured 2026-08-30)*
 
-- [ ] **Medium priority.** Real-time protection scans every written file. On a
-  109,615-file corpus that is a per-file cost paid on top of everything xsync
-  does, and it is the leading hypothesis for why Mac -> Windows staged at
-  **1,025 files/s** against 6,351 files/s for the same corpus Mac -> Linux.
+- [x] congress-100k, one NTFS volume, two sibling directories so both arms ran
+  without touching Defender again: `C:\xsdef` scanned, `C:\xsab` covered by a
+  temporary `Add-MpPreference -ExclusionPath`. Real-time protection enabled
+  throughout. Alternating arms, three rounds.
 
-**This is not a recommendation to disable it.** Nobody realistically turns
-Defender off, so the default configuration is the honest one to benchmark and
-report. The value of measuring the delta is explanatory: it separates "xsync is
-slow on Windows" from "Windows file creation is expensive under real-time
-scanning", and gives the writeup a number to point at instead of a hypothesis.
+| arm | reps | median | files/s |
+|---|---|---|---|
+| Windows as configured | 87.23, 87.18, 87.48 | **87.23 s** | 1,257 |
+| Windows, benchmark path excluded | 72.06, 71.19, 71.39 | **71.39 s** | 1,536 |
+| WSL2 ext4, same NVMe, same session | 7.85, 7.86, 7.84, 7.85, 7.85 | **7.85 s** | 13,964 |
 
-**AC**
-- Same corpus, same host, two arms: stock Defender, and with a temporary
-  `Set-MpPreference -ExclusionPath` covering only the benchmark source and
-  destination. The exclusion is a **security setting change and needs the
-  operator's explicit consent** — it is not something the benchmark harness
-  should do on its own.
-- The exclusion is removed afterwards, and the writeup states it was temporary.
-- Results are reported as "Windows as configured" (the headline) and "Windows
-  with the benchmark paths excluded" (the explanatory figure). The first is the
-  number users will experience.
-- If the gap is large, it belongs in the README's platform notes, since it
-  affects how xsync's Windows numbers should be read against Linux and macOS.
+**Defender costs 1.22× — 15.84 s, or 144 µs per file.** That is 18% of the wall
+clock a Windows user actually experiences.
 
-**Related, found while setting this up:** the machine's existing Defender
-exclusions point at `C:\Users\sanje\...` — the pre-local-account profile path.
-They no longer match `C:\Users\sanjee\...`, so cargo builds and everything else
-in the current profile are being scanned. Worth fixing on the box independently
-of this story.
+**But it is not the explanation for Windows being slow.** Against the same-session
+Linux reference on the same NVMe, the gap is 79.38 s, and Defender is 15.84 s of
+it. **Scanning accounts for 20% of the Windows-versus-Linux gap; the other 80% is
+Windows itself.** With scanning entirely removed Windows still runs **9.09×**
+slower than Linux on identical hardware. The hypothesis this story was filed on —
+that real-time scanning was the leading explanation for 1,025 files/s against
+6,351 — is therefore **false**, and worth stating plainly because it was the
+prevailing assumption.
+
+**Reporting**: the headline is "Windows as configured", 1,257 files/s, since that
+is what users have. The excluded figure is explanatory only.
+
+**Operator action outstanding**: the temporary exclusion on `C:\xsab` is still in
+place and should be removed. The pre-existing stale exclusions pointing at
+`C:\Users\sanje\...` (the pre-local-account profile) are unrelated and still
+worth cleaning up.
 
 ## Phase 5 — Very low priority
 
@@ -1573,13 +1574,26 @@ belongs to the operator.
 | destination | userspace + filesystem | files/s | vs native Windows |
 |---|---|---:|---|
 | native Windows | Win32 + NTFS | 1,150 | — |
-| WSL2 | Linux + ext4 in a VHDX on the same NVMe | **5,565** | **4.84× faster** |
+| WSL2 | Linux + ext4 in a VHDX on the same NVMe | **13,964** | **11.1× faster** |
 | WSL2 `/mnt/c` | Linux + NTFS through the 9p bridge | ~32–37 | **~32× slower** |
 
 **Row 2 is the result worth keeping.** Every prior OS comparison in this project
 crossed machines, filesystems and kernels at once. This one holds CPU, disk,
-network and source constant and still finds **4.84×**, which is the first
-defensible version of `docs/OS.md`'s "the OS is worth ~6×".
+network and source constant and finds **11.1×** — far larger than
+`docs/OS.md`'s "the OS is worth ~6×", not smaller.
+
+> **Corrected 2026-08-30.** This row first read 5,565 files/s and 4.84×, from a
+> single run. That run was the *first* large write into WSL's ext4, and its
+> VHDX is dynamically expanding: the cost of growing the file on NTFS was
+> charged to the transfer. Five later reps on the settled VHDX give 7.84–7.86 s
+> against the original 19.70 s, a 2.5× warmup effect. **Any WSL benchmark must
+> discard first-touch runs or disclose them** — a requirement for 4.21 and
+> 4.47, and the second time this cycle a single unbracketed run produced a
+> wrong headline.
+
+**Defender is not the explanation.** 4.12 measured it on the same hardware in
+one session: scanning costs 1.22×, which is 20% of the Windows-versus-Linux
+gap. Windows remains **9.09×** slower with scanning removed entirely.
 
 **Row 3 did not do what it was designed to do, as the original AC anticipated.**
 `/mnt/c` is 9p — a per-operation RPC protocol, not a filesystem driver — so at
