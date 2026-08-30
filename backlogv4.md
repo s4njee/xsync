@@ -17,9 +17,10 @@ not by value. Anything marked *unverified* has been built but not proven.
 |---|---|
 | Measured platforms | macOS (M1 Max), Linux x86_64 (freya 7950X; mars 7900X), Linux aarch64 (orion, Pi 5), Windows 11 (7900X — the same physical box as mars, dual-boot) |
 | Measured corpora | congress (1k/10k/100k/1m), cb7, Manga |
-| Not yet measured | Anything above ~1 GbE; any x86 that is not Zen 4; XFS and btrfs; WiFi; BSD. See 4.18 |
+| Not yet measured | Anything above ~1 GbE; any x86 that is not Zen 4; XFS and btrfs; WiFi; BSD. See 4.18. WSL2 is enabled but has no distro — 4.47 |
 | Known-unverified code | None. Phase 2 is complete: 4.4 verified V3.22 on the wire, 4.5, 4.6 and 4.7 are landed and measured |
 | Recently invalidated | The v1 wire is not frozen. `wire_bytes` is not the bytes on the wire (4.44). The preflight's "frozen wire" comment blamed the wrong encoding (4.5). The ~1.3 s sequential-spawn cost did not reproduce (4.7) |
+| Measured but not yet trustworthy | 4.15's 1.86× on freya was taken under ~950% competing CPU. The ratio reproduced five times; the absolute figures did not match an idle run of equivalent code. See 4.49 |
 
 **The result the next few phases exist to act on.** Small-file network sync is
 bound by neither endpoint: both sit near 50% CPU, and a Pi 5 receives within 7%
@@ -759,6 +760,9 @@ Blank areas, in priority order:
 5. **BSD** — correctness first (does the suite pass on FreeBSD?), performance
    second.
 
+WSL closes part of this cheaply: 4.48 adds two more OS paths on hardware
+already in the fleet, without buying anything.
+
 **AC**: not exhaustive coverage — a prioritized matrix in `docs/OS.md` marking
 each cell measured / inferred / unknown, plus measurements for (1) and (2),
 which are the two most likely to change engineering decisions.
@@ -966,6 +970,9 @@ overlap fixes the client, this fixes the server, and the two multiply.
   already measures where that time goes. io_uring can batch and overlap them
   on Linux; macOS and Windows have no equivalent, which makes this a
   Linux-only fast path behind a runtime probe.
+
+**Now testable on the Windows box**: the WSL2 kernel supports io_uring, so
+4.47 makes this measurable on that hardware for the first time.
 
 **Research questions**: what share of receiver wall time is syscall overhead
 at 100k files (T1 data may already answer this)? Does a registered-buffers
@@ -1420,6 +1427,137 @@ the project already controls (mars, freya), and shapes *any* route.
 - Thresholds are set for large regressions only, with the shared-runner
   noise caveat documented rather than implied.
 - The release checklist item points at the workflow that enforces it.
+
+## Phase 11 — WSL, and what identical hardware can settle
+
+Written 2026-08-30. The Windows box (7900X) has WSL2 enabled with no distro
+installed, on build 26200 — new enough for mirrored networking. Installing one
+turns that machine into the only host in the fleet that can run three operating
+system paths over **the same CPU, the same NVMe, and the same network link**.
+
+Every OS conclusion recorded so far changed more than one variable at a time.
+`docs/OS.md` says the OS is worth ~6× and the CPU roughly nothing — the 7900X
+does 1,099 files/s under Windows against 6,046 under Linux — but that pair also
+crossed filesystems, kernels, and machines. These stories exist to hold the
+hardware still.
+
+### 4.47 — Stand WSL2 up as a measurement platform
+
+- [ ] Install a distro on the Windows host and make it reachable, reproducible,
+  and able to build `xs`.
+
+**Setup** (the distro install prompts for a UNIX account, so it is an operator
+step):
+
+```
+wsl --install -d Ubuntu
+```
+
+`C:\Users\sanjee\.wslconfig`:
+
+```
+[wsl2]
+networkingMode=mirrored
+memory=16GB
+processors=16
+swap=0
+autoMemoryReclaim=disabled
+vmIdleTimeout=-1
+```
+
+`mirrored` gives WSL the host's IP, so it is reachable at `192.168.1.120`
+without `netsh portproxy`. The rest is not convenience: **dynamic memory
+reclaim and idle-VM suspension are exactly the class of drift that produced the
+three harness lies in 4.21**, and a benchmark host that resizes itself between
+runs cannot be trusted.
+
+Inside the distro: `systemd=true` in `/etc/wsl.conf`, `openssh-server` on
+**port 2222** (the Windows sshd owns 22 and mirrored mode shares the port
+space), `build-essential`, rustup, and the same `authorized_keys` Windows
+already accepts — copyable from `/mnt/c/Users/sanjee/.ssh/`. Then
+`wsl --shutdown` so systemd and the config take effect.
+
+**AC**
+
+- `ssh -p 2222 sanjee@192.168.1.120` works from the Mac, and `xs` builds there.
+- The `.wslconfig` pinning is committed to `docs/` with the reasoning, not just
+  applied — a future run on an unpinned VM is not comparable.
+- Recorded honestly: `drop_caches` works inside WSL, but Windows still caches
+  the VHDX underneath, so "cold" is colder than warm and not as cold as freya.
+  Any writeup says so rather than implying parity.
+
+**Operational finding to record while it is fresh.** Building on the Windows
+host over SSH fails with `os error 448`, "the path cannot be traversed because
+it contains an untrusted mount point". Every tool in `.cargo\bin` is a symlink
+to `rustup.exe`, and Windows does not evaluate symlinks for a remote session by
+default. Invoking the real toolchain binaries directly works and needs no
+system change:
+
+```
+$tc = "C:\Users\sanjee\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin"
+$env:RUSTC = "$tc\rustc.exe"; & "$tc\cargo.exe" build --release
+```
+
+Setting `RUSTC` matters as much as calling `cargo.exe` by path: cargo finds
+`rustc` on `PATH` and hits the same symlink. The alternative,
+`fsutil behavior set SymlinkEvaluation R2L:1`, is a system security setting and
+belongs to the operator.
+
+### 4.48 — Decompose the OS penalty on identical hardware
+
+- [ ] Answer the question `docs/OS.md` raises and cannot settle: **is Windows
+  slow because of NTFS metadata, or the Win32 layer, or both?**
+
+WSL supplies three paths that differ in exactly one thing at a time:
+
+| path | userspace | filesystem | isolates |
+|---|---|---|---|
+| native Windows | Win32 | NTFS | today's baseline |
+| WSL `~/` | Linux | ext4 in a VHDX on the same NVMe | Linux syscalls + Linux FS |
+| WSL `/mnt/c/` | Linux | NTFS via drvfs | Linux syscalls, Windows FS |
+
+**The third row is the decisive one.** If WSL-ext4 lands near native Linux and
+WSL-drvfs near native Windows, the penalty is the filesystem. If both WSL paths
+are fast, it is the Win32 layer. If drvfs is worse than native Windows, the
+bridge dominates and the row says nothing about NTFS — which is itself worth
+knowing before anyone quotes it.
+
+**AC**
+
+- congress-100k over SSH to all three paths, plus the existing native-Windows
+  and native-Linux numbers, medians with MAD, bracketed controls.
+- cb7 as a second shape, since congress is one file per directory and cb7 is
+  7.2 — directory-metadata cost is the suspected mechanism and the two corpora
+  disagree on it.
+- `docs/OS.md` gains the decomposition and either keeps or retires "the OS is
+  worth ~6×" with the mechanism named.
+- drvfs is reported as the bridge it is, not as "NTFS from Linux".
+
+**Consumers.** 4.26 (receiver-side parallel apply) wants NTFS-vs-ext4 write cost
+on one disk. 4.27 (io_uring) becomes testable on this hardware for the first
+time, since the WSL2 kernel supports it. 4.12 (Defender) gets a cleaner
+isolation, as Defender treats the VHDX and `/mnt/c` differently. 4.18 fills a
+matrix cell.
+
+### 4.49 — Re-measure 4.15 and the freya baseline on an idle host
+
+- [ ] The 4.15 A/B was run while freya was executing an unrelated job at ~950%
+  CPU. Five paired runs agreed, so the **1.86× ratio is reproducible**, but the
+  absolute figures are not the platform's: equivalent code measured 14.4 s on an
+  idle freya earlier in the cycle against 24.88 s under load.
+
+Until this is redone, **1.86× must not be quoted as the platform number** — the
+honest statement today is "1.86× under contention, 1.15× on an idle Windows
+receiver, unmeasured idle on Linux".
+
+**AC**
+
+- congress-100k, Mac → freya, both arms, alternating, with the host confirmed
+  idle (`uptime` and top process recorded alongside the numbers).
+- If the idle ratio differs materially from 1.86×, `BENCHMARKv2.md` and the
+  4.15 entry are corrected rather than annotated.
+- Load state is recorded for every future cross-host benchmark, since this is
+  the second measurement this cycle contaminated by something outside the tool.
 
 ## Phase 4 — Carried forward
 
