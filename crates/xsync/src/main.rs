@@ -693,25 +693,20 @@ fn list_jobs(explicit: Option<&std::path::Path>) -> Result<(), CliError> {
 
 /// Refuse, or warn about, the parts of a filter a remote peer cannot honour.
 ///
-/// The v1 wire carries a flat list of exclude patterns and nothing else. That
-/// is enough for `--exclude` and `--exclude-from`, and not enough for include
-/// rules, whose whole meaning is their position relative to the excludes.
-/// Sending the excludes alone would transfer a *different, larger* set of files
-/// than the user asked for, silently — so it is refused instead.
-fn reconcile_remote_filter(
+/// Include rules now cross the wire, so this no longer refuses them: the
+/// decision moved to where the peer's capabilities are actually known.
+/// `server::filter_for_peer` refuses a remote that does not advertise
+/// `CAP_FILTER_RULES`, and `rsync::validate_options` refuses the rsync
+/// fallback, which carries exclude patterns only. Refusing here as well would
+/// reject include rules against peers that can honour them perfectly.
+///
+/// What remains is the ignore-file note, which is a warning rather than a
+/// refusal.
+fn note_remote_filter_limits(
     filter: &xsync_core::filter::FilterSet,
     source_is_remote: bool,
     quiet: bool,
-) -> Result<(), CliError> {
-    if filter.has_includes() {
-        return Err(CliError::Usage(
-            "--include is not supported for remote transfers yet: the v1 wire carries only \
-             exclude patterns, and sending those alone would transfer more than you asked \
-             for. Use --exclude/--exclude-from, or run xsync on the remote host so both \
-             ends of the filter are local."
-                .to_owned(),
-        ));
-    }
+) {
     if source_is_remote && filter.honours_ignore_files() && !quiet {
         // Not fatal: unlike an include rule, an unseen ignore file cannot make
         // the transfer wider than the explicit rules already allow. But the
@@ -721,7 +716,6 @@ fn reconcile_remote_filter(
              remote; only --exclude/--exclude-from rules apply"
         );
     }
-    Ok(())
 }
 
 /// Assemble the filter in the order the rules were written.
@@ -812,7 +806,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<RunOutcome, CliError> {
     let mut filter = build_filter(cli, matches)?;
     let remote = src.is_remote() || dest.is_remote();
     if remote {
-        reconcile_remote_filter(&filter, src.is_remote(), cli.quiet)?;
+        note_remote_filter_limits(&filter, src.is_remote(), cli.quiet);
         if src.is_remote() {
             // The remote source is walked by the far side, which never sees the
             // tree's own ignore files.
@@ -2123,10 +2117,11 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_transfer_refuses_include_rules_rather_than_approximating_them() {
-        // Sending the excludes alone would transfer a larger set than asked for,
-        // silently. Failing is the only safe answer until the wire can carry the
-        // whole ruleset.
+    fn include_rules_are_no_longer_refused_at_argument_time() {
+        // The refusal moved to where the peer's capabilities are known:
+        // `server::filter_for_peer` for the native transport and
+        // `rsync::validate_options` for the fallback. Refusing here too would
+        // reject include rules against peers that honour them perfectly.
         let filter =
             xsync_core::filter::FilterSet::from_rules(vec![xsync_core::filter::Rule::new(
                 xsync_core::filter::Action::Include,
@@ -2134,15 +2129,38 @@ mod tests {
                 xsync_core::filter::Origin::CommandLine,
             )
             .unwrap()]);
-        let error = reconcile_remote_filter(&filter, false, true).unwrap_err();
-        assert_eq!(error.kind(), "usage");
+        note_remote_filter_limits(&filter, false, true);
+        note_remote_filter_limits(&filter, true, true);
+    }
+
+    #[test]
+    fn the_rsync_fallback_still_refuses_include_rules() {
+        // That path applies exclude patterns only, so honouring the excludes
+        // alone would silently transfer a wider set than asked for.
+        let options = xsync_core::local::LocalSyncOptions {
+            filter: Some(xsync_core::filter::FilterSet::from_rules(vec![
+                xsync_core::filter::Rule::new(
+                    xsync_core::filter::Action::Include,
+                    "keep/**",
+                    xsync_core::filter::Origin::CommandLine,
+                )
+                .unwrap(),
+            ])),
+            ..Default::default()
+        };
+        let error = xsync_core::rsync::validate_options(&options).unwrap_err();
         assert!(error.to_string().contains("--include"), "{error}");
     }
 
     #[test]
-    fn a_remote_transfer_accepts_an_exclude_only_filter() {
-        let filter = xsync_core::filter::from_exclude_patterns(&["*.tmp".to_owned()]).unwrap();
-        assert!(reconcile_remote_filter(&filter, true, true).is_ok());
+    fn the_rsync_fallback_still_accepts_an_exclude_only_filter() {
+        let options = xsync_core::local::LocalSyncOptions {
+            filter: Some(
+                xsync_core::filter::from_exclude_patterns(&["*.tmp".to_owned()]).unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert!(xsync_core::rsync::validate_options(&options).is_ok());
     }
 
     #[test]

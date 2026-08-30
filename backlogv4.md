@@ -229,22 +229,52 @@ tracing inflates syscall cost by roughly an order of magnitude.
 every file for `FILE_ATTRIBUTE_SPARSE_FILE`. The same treatment would need
 `file_attributes` carried in the record. Filed as 4.45.
 
-### 4.6 — Carry filter rules on the wire *(unblocks V3.10)*
+### 4.6 — Carry filter rules on the wire *(done 2026-08-30)*
 
-- [ ] `--include` is currently **refused outright** for remote transfers. This is
-  the most user-visible consequence of the old constraint.
+- [x] `--include` now works against a remote. The ordered rule set crosses the
+  wire in a new `filter_rules` field on `SessionConfig`, gated by
+  `CAP_FILTER_RULES` (`1 << 4`).
 
-**AC**
-- The ordered rule set crosses the wire. `filter::encode`/`decode` and their
-  round-trip tests already exist; only the wire field and the server-side
-  `FilterSet` are missing.
-- `--include` works remotely with the same first-match-wins semantics as local,
-  including the directory-descent rule that removes rsync's `--include '*/'`
-  footgun.
-- Per-tree `.xsyncignore` on a remote source either works or keeps warning
-  honestly.
-- The fail-closed refusal is removed only once the capability is negotiated, so a
-  peer that cannot represent the rules still refuses rather than approximating.
+**AC1 — the ordered rule set crosses the wire: PASS.** `filter::encode`/`decode`
+already existed; this added the wire field, the capability, and the server-side
+`FilterSet`. The two representations are mutually exclusive and the decoder
+*rejects* a message carrying both, so a receiver never has to guess which one
+describes the transfer.
+
+**AC2 — `--include` works remotely with local semantics: PASS.** Verified
+against freya with matching binaries on both ends, on a tree of 7 files:
+
+| | result |
+|---|---|
+| local `--include 'keep/**' --exclude '*'` | `keep/a.txt`, `keep/b.log`, `keep/nested/deep.txt` |
+| push to freya, same filter | identical |
+| pull from freya, same filter | identical |
+| push `--exclude '*.log'` | both `.log` files dropped, rest transferred |
+
+The directory-descent rule holds across the wire: `keep/nested/deep.txt`
+arrives without anyone writing rsync's `--include '*/'`.
+
+**AC3 — `.xsyncignore` on a remote source keeps warning honestly: PASS.** The
+note still fires; only the include *refusal* moved.
+
+**AC4 — fail-closed until the capability is negotiated: PASS.** The refusal
+moved out of argument parsing, where the peer is unknown, to the two places
+that actually know: `server::filter_for_peer` refuses a peer that does not
+advertise `CAP_FILTER_RULES`, and `rsync::validate_options` refuses the rsync
+fallback, which applies `exclude_patterns` only and would otherwise silently
+transfer a wider set. Refusing at parse time as well would have rejected
+include rules against peers that honour them perfectly.
+
+**Wire compatibility was deliberately not preserved.** An intermediate version
+made `filter_rules` an optional trailing block so pre-capability binaries kept
+working. That was removed: this is a greenfield project with no deployed users,
+and the compatibility machinery bought nothing while complicating the codec.
+Peers must be rebuilt, which is what `--version` skew reporting and the D5.2
+bootstrap exist for.
+
+**Incidental fix.** The four client-side filter sites rebuilt the entire
+pattern vector *for every entry scanned* — an allocation per file. They now
+share one hoisted `FilterSet`.
 
 ### 4.7 — Fix multi-stream capability negotiation *(V3.18 remainder)*
 
@@ -832,6 +862,22 @@ same box's 6,046 on Linux.
 — one more optional block, or a widening of that one — with the same
 round-trip test and the same before/after syscall measurement, taken on the
 Windows host rather than inferred from the Unix result.
+
+### 4.46 — Pull always asks the remote to checksum everything
+
+- [ ] `run_client_pull` hardcodes `checksum: true` in the `SessionConfig` it
+  sends (`server.rs:4380`), while `run_client_push` passes `options.checksum`.
+  Every pull therefore asks the remote source to compute BLAKE3 content hashes
+  for every file, whether or not the user passed `--checksum`.
+
+Noticed while verifying 4.6; **not yet established as a bug.** The pull path
+may genuinely need content identity to classify, in which case the cost is
+load-bearing and the story is to document why rather than to change it.
+
+**AC**: determine whether the flag is load-bearing. If it is, comment it at the
+call site so the asymmetry with push stops looking like a typo. If it is not,
+pass `options.checksum` and measure the difference on congress-100k, where
+hashing 109,615 files on the far side is not free.
 
 ## Phase 9 — Parallelization research
 

@@ -39,7 +39,8 @@ use crate::planner::{try_plan_with_fingerprint, DestinationIndex, IndexConfig, P
 use crate::protocol::{
     common_capabilities, encode_frame, encode_frame_with_compression, negotiate_compression,
     negotiate_protocol_version, ByteRange, CompressionMode, EntryRecord, FrameDecoder, Message,
-    MetadataOperation, ProtocolError, Role, CAP_BROWSE_V2, CAP_VERSION_NEGOTIATION, CAP_ZSTD,
+    MetadataOperation, ProtocolError, Role, CAP_BROWSE_V2, CAP_FILTER_RULES,
+    CAP_VERSION_NEGOTIATION, CAP_ZSTD,
     DEFAULT_UNACKNOWLEDGED_WINDOW, MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
 };
 use crate::protocol_v2::{self, V2CodecError, V2Frame, V2Message};
@@ -110,6 +111,7 @@ impl ServerError {
             Self::RemoteFlagRejected => "remote-flag-rejected",
             Self::Bootstrap(_) => "bootstrap",
             Self::RemoteShellMismatch => "remote-shell",
+            Self::FilterUnrepresentable(_) => "filter-unrepresentable",
             Self::Transport { .. } => "transport",
             Self::PeerDisconnected => "peer-disconnected",
         }
@@ -155,6 +157,11 @@ pub enum ServerError {
     /// Unexpected message received for the current session state.
     #[error("unexpected protocol message: {0}")]
     UnexpectedMessage(String),
+
+    /// The peer cannot represent the requested filter, so it is refused
+    /// rather than approximated into a wider transfer.
+    #[error("{0}")]
+    FilterUnrepresentable(String),
     /// The remote server reported an error.
     #[error("remote error (code {code}): {message}")]
     RemoteError {
@@ -1161,7 +1168,7 @@ impl Server {
             journal: None,
             compression: CompressionMode::None,
             compression_level: 3,
-            capabilities: CAP_ZSTD | CAP_VERSION_NEGOTIATION,
+            capabilities: CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES,
         }
     }
 
@@ -1277,15 +1284,25 @@ impl Server {
 
         // 2. Receive SessionConfig from client.
         let frame = self.decoder.read(&mut reader)?;
-        let (paranoid, delete, checksum, dry_run, exclude_patterns) = match frame.message {
+        let (paranoid, delete, checksum, dry_run, exclude_patterns, filter_rules) = match
+            frame.message
+        {
             Message::SessionConfig {
                 paranoid,
                 delete,
                 checksum,
                 dry_run,
                 exclude_patterns,
+                filter_rules,
                 ..
-            } => (paranoid, delete, checksum, dry_run, exclude_patterns),
+            } => (
+                paranoid,
+                delete,
+                checksum,
+                dry_run,
+                exclude_patterns,
+                filter_rules,
+            ),
             other => {
                 return Err(ServerError::UnexpectedMessage(format!(
                     "expected SessionConfig, got {other:?}"
@@ -1300,8 +1317,9 @@ impl Server {
             delete,
             checksum,
             dry_run,
-            exclude_patterns.len()
+            exclude_patterns.len() + filter_rules.len()
         ));
+        let session_filter = filter_from_wire(&exclude_patterns, &filter_rules)?;
 
         // Send Ack for SessionConfig.
         let ack = Message::Ack {
@@ -1325,7 +1343,7 @@ impl Server {
                         delete,
                         checksum,
                         dry_run,
-                        &exclude_patterns,
+                        &session_filter,
                     )
                 }
             }
@@ -2292,7 +2310,7 @@ impl Server {
         delete: bool,
         checksum: bool,
         dry_run: bool,
-        exclude_patterns: &[Vec<u8>],
+        filter: &crate::filter::FilterSet,
     ) -> Result<(), ServerError> {
         let hash_cache = checksum
             .then(|| HashCache::open(HashCache::default_path()).ok())
@@ -2303,7 +2321,7 @@ impl Server {
             if let Ok(scan_result) = scan(&self.root) {
                 for item in scan_result.entries() {
                     if let Ok(entry) = item {
-                        if !excluded_path(exclude_patterns, &entry.path) {
+                        if filter.decide(&entry.path.to_string()).is_included() {
                             entries.push(if checksum {
                                 content_entry_record(&self.root, &entry, hash_cache.as_ref())?
                             } else {
@@ -3427,7 +3445,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     });
 
     // 1. Send Handshake (Client is Source).
-    let local_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION;
+    let local_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES;
     let handshake = Message::Handshake {
         role: Role::Source,
         capabilities: local_capabilities,
@@ -3496,6 +3514,8 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     });
 
     // 2. Send SessionConfig.
+    let wire_filter = filter_for_peer(options, remote_capabilities)?;
+    let active_filter = local_filter(options)?;
     let session_config = Message::SessionConfig {
         streams: u8::try_from(options.streams).unwrap_or(1),
         batch_bytes: 32 * 1024 * 1024,
@@ -3505,7 +3525,8 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         checksum: options.checksum,
         paranoid: options.paranoid,
         dry_run: options.dry_run,
-        exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
+        exclude_patterns: wire_filter.exclude_patterns,
+        filter_rules: wire_filter.rules,
     };
     let sc_id = alloc_id();
     let bytes = encode_frame(sc_id, &session_config)?;
@@ -3541,10 +3562,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             } => {
                 for rec in entries {
                     let entry = file_entry_from_entry_record(&rec)?;
-                    if !excluded_path(
-                        &encode_exclude_patterns(&options.exclude_patterns),
-                        &entry.path,
-                    ) {
+                    if active_filter.decide(&entry.path.to_string()).is_included() {
                         dest_entries.push(entry);
                     }
                 }
@@ -3611,10 +3629,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 hash_cache.as_ref(),
             )?;
         }
-        if !excluded_path(
-            &encode_exclude_patterns(&options.exclude_patterns),
-            &entry.path,
-        ) {
+        if active_filter.decide(&entry.path.to_string()).is_included() {
             source_entries.push(entry);
         }
     }
@@ -4286,7 +4301,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     // 1. Send Handshake (Client is Sink).
     let job_id = session_job_id(src_path, dest_path.to_string_lossy().as_ref());
     let resume_journal = crate::journal::ResumeJournal::new(&job_id)?;
-    let local_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION;
+    let local_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES;
     let handshake = Message::Handshake {
         role: Role::Sink,
         capabilities: local_capabilities,
@@ -4354,6 +4369,8 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     });
 
     // 2. Send SessionConfig.
+    let wire_filter = filter_for_peer(options, remote_capabilities)?;
+    let active_filter = local_filter(options)?;
     let session_config = Message::SessionConfig {
         streams: u8::try_from(options.streams).unwrap_or(1),
         batch_bytes: 32 * 1024 * 1024,
@@ -4363,7 +4380,8 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         checksum: true,
         paranoid: options.paranoid,
         dry_run: options.dry_run,
-        exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
+        exclude_patterns: wire_filter.exclude_patterns,
+        filter_rules: wire_filter.rules,
     };
     let sc_id = alloc_id();
     let bytes = encode_frame(sc_id, &session_config)?;
@@ -4415,10 +4433,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                         });
                     } else {
                         let entry = file_entry_from_entry_record(&rec)?;
-                        if !excluded_path(
-                            &encode_exclude_patterns(&options.exclude_patterns),
-                            &entry.path,
-                        ) {
+                        if active_filter.decide(&entry.path.to_string()).is_included() {
                             source_entries.push(entry);
                         }
                     }
@@ -4456,10 +4471,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         if let Ok(dest_scan) = scan(dest_path) {
             for item in dest_scan.entries() {
                 if let Ok(mut entry) = item {
-                    if !excluded_path(
-                        &encode_exclude_patterns(&options.exclude_patterns),
-                        &entry.path,
-                    ) {
+                    if active_filter.decide(&entry.path.to_string()).is_included() {
                         if entry.kind == ScanEntryKind::File {
                             let native = entry.path.to_native_path(dest_path);
                             entry.fingerprint.identity = cached_content_identity(
@@ -5151,6 +5163,92 @@ pub fn session_job_id(left: &str, right: &str) -> [u8; 16] {
     out
 }
 
+/// Rebuild the filter a session applies, from whichever representation arrived.
+///
+/// Fail-closed on both arms: a rule set that cannot be parsed exactly is an
+/// error, never an approximation, because approximating either transfers files
+/// the user excluded or skips files they asked for.
+fn filter_from_wire(
+    exclude_patterns: &[Vec<u8>],
+    filter_rules: &[Vec<u8>],
+) -> Result<crate::filter::FilterSet, ServerError> {
+    if !filter_rules.is_empty() {
+        return crate::filter::decode(filter_rules).map_err(|error| {
+            ServerError::FilterUnrepresentable(format!("peer sent unusable filter rules: {error}"))
+        });
+    }
+    let mut patterns = Vec::with_capacity(exclude_patterns.len());
+    for pattern in exclude_patterns {
+        let text = std::str::from_utf8(pattern).map_err(|_| {
+            ServerError::FilterUnrepresentable(
+                "peer sent an exclude pattern that is not valid UTF-8".to_owned(),
+            )
+        })?;
+        patterns.push(text.to_owned());
+    }
+    crate::filter::from_exclude_patterns(&patterns).map_err(|error| {
+        ServerError::FilterUnrepresentable(format!("peer sent an unusable exclude pattern: {error}"))
+    })
+}
+
+/// The filter this client applies to its own scans.
+///
+/// The ordered rule set when the user gave one, the flat excludes otherwise.
+fn local_filter(options: &LocalSyncOptions) -> Result<crate::filter::FilterSet, ServerError> {
+    match options.filter.as_ref() {
+        Some(filter) => Ok(filter.clone()),
+        None => filter_from_wire(&encode_exclude_patterns(&options.exclude_patterns), &[]),
+    }
+}
+
+/// How a session's filter is represented on the wire.
+///
+/// Exactly one side is populated; the decoder rejects a message carrying both,
+/// so a receiver never has to guess which describes the transfer.
+#[derive(Debug)]
+struct WireFilter {
+    exclude_patterns: Vec<Vec<u8>>,
+    rules: Vec<Vec<u8>>,
+}
+
+/// Choose the wire representation of the transfer's filter.
+///
+/// Returns `(exclude_patterns, filter_rules)`, exactly one of which is
+/// populated. A peer advertising [`CAP_FILTER_RULES`] receives the ordered rule
+/// set; one without it receives the flat exclude list, and is refused outright
+/// if the filter contains an include rule — sending the excludes alone would
+/// silently transfer a wider set of files than the user asked for.
+fn filter_for_peer(
+    options: &LocalSyncOptions,
+    remote_capabilities: u32,
+) -> Result<WireFilter, ServerError> {
+    let Some(filter) = options.filter.as_ref() else {
+        return Ok(WireFilter {
+            exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
+            rules: Vec::new(),
+        });
+    };
+    if remote_capabilities & CAP_FILTER_RULES != 0 {
+        return Ok(WireFilter {
+            exclude_patterns: Vec::new(),
+            rules: crate::filter::encode(filter),
+        });
+    }
+    if filter.has_includes() {
+        return Err(ServerError::FilterUnrepresentable(
+            "--include is not supported against this remote: it is an older xsync that carries \
+             only exclude patterns, and sending those alone would transfer more than you asked \
+             for. Update the remote, use --exclude/--exclude-from, or run xsync on the remote \
+             host so both ends of the filter are local."
+                .to_owned(),
+        ));
+    }
+    Ok(WireFilter {
+        exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
+        rules: Vec::new(),
+    })
+}
+
 fn encode_exclude_patterns(patterns: &[String]) -> Vec<Vec<u8>> {
     patterns
         .iter()
@@ -5173,23 +5271,6 @@ fn ranges_cover_file(size: u64, ranges: &[ByteRange]) -> bool {
         if cursor >= size {
             return true;
         }
-    }
-    false
-}
-
-fn excluded_path(patterns: &[Vec<u8>], path: &WirePath) -> bool {
-    let display = path.to_string();
-    let mut candidate = Some(display.as_str());
-    while let Some(value) = candidate {
-        if patterns.iter().any(|pattern| {
-            std::str::from_utf8(pattern)
-                .ok()
-                .and_then(|glob| globset::Glob::new(glob).ok())
-                .is_some_and(|glob| glob.compile_matcher().is_match(value))
-        }) {
-            return true;
-        }
-        candidate = value.rsplit_once('/').map(|(parent, _)| parent);
     }
     false
 }
@@ -5493,6 +5574,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             paranoid: options.paranoid,
             dry_run: options.dry_run,
             exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
+            filter_rules: Vec::new(),
         },
     )?;
     expect_ack(&mut cdec, &mut creader)?;
@@ -5565,7 +5647,10 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         // path; do not prepend it a second time.
         String::new()
     };
-    let exclude_patterns = encode_exclude_patterns(&options.exclude_patterns);
+    let source_filter = match options.filter.as_ref() {
+        Some(filter) => filter.clone(),
+        None => filter_from_wire(&encode_exclude_patterns(&options.exclude_patterns), &[])?,
+    };
     let hash_cache = options
         .checksum
         .then(|| HashCache::open(HashCache::default_path()).ok())
@@ -5591,7 +5676,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         if !prefix.is_empty() {
             entry.path = entry.path.with_prefix(&WirePath::from(prefix.as_str()));
         }
-        if !excluded_path(&exclude_patterns, &entry.path) {
+        if source_filter.decide(&entry.path.to_string()).is_included() {
             mapped.push(entry);
         }
     }
@@ -6271,6 +6356,7 @@ fn run_data_inner(
             paranoid: false,
             dry_run: false,
             exclude_patterns: Vec::new(),
+            filter_rules: Vec::new(),
         },
     )?;
     expect_ack(&mut decoder, &mut reader)?;
@@ -7085,6 +7171,87 @@ where
 
 #[cfg(test)]
 mod tests {
+    fn include_filter() -> crate::filter::FilterSet {
+        crate::filter::FilterSet::from_rules(vec![
+            crate::filter::Rule::new(
+                crate::filter::Action::Include,
+                "keep/**",
+                crate::filter::Origin::CommandLine,
+            )
+            .unwrap(),
+            crate::filter::Rule::new(
+                crate::filter::Action::Exclude,
+                "*",
+                crate::filter::Origin::CommandLine,
+            )
+            .unwrap(),
+        ])
+    }
+
+    /// A peer that advertises the capability receives the ordered set, and the
+    /// flat exclude list is left empty so the receiver cannot apply both.
+    #[test]
+    fn a_capable_peer_receives_the_ordered_rule_set() {
+        let options = LocalSyncOptions {
+            filter: Some(include_filter()),
+            ..LocalSyncOptions::default()
+        };
+        let wire = filter_for_peer(&options, CAP_FILTER_RULES).unwrap();
+        assert!(wire.exclude_patterns.is_empty());
+        assert_eq!(wire.rules, vec![b"+ keep/**".to_vec(), b"- *".to_vec()]);
+    }
+
+    /// Sending the excludes alone would transfer a wider set than asked for, so
+    /// an older peer is refused instead of approximated at.
+    #[test]
+    fn an_incapable_peer_is_refused_rather_than_sent_the_excludes_alone() {
+        let options = LocalSyncOptions {
+            filter: Some(include_filter()),
+            ..LocalSyncOptions::default()
+        };
+        let error = filter_for_peer(&options, CAP_ZSTD).unwrap_err();
+        assert_eq!(error.kind(), "filter-unrepresentable");
+        assert!(error.to_string().contains("--include"), "{error}");
+    }
+
+    /// An exclude-only filter has always fit the flat list, so an older peer
+    /// keeps working exactly as before.
+    #[test]
+    fn an_incapable_peer_still_accepts_an_exclude_only_filter() {
+        let options = LocalSyncOptions {
+            filter: Some(crate::filter::from_exclude_patterns(&["*.tmp".to_owned()]).unwrap()),
+            exclude_patterns: vec!["*.tmp".to_owned()],
+            ..LocalSyncOptions::default()
+        };
+        let wire = filter_for_peer(&options, CAP_ZSTD).unwrap();
+        assert!(wire.rules.is_empty());
+        assert_eq!(wire.exclude_patterns, vec![b"*.tmp".to_vec()]);
+    }
+
+    /// Rules that arrive unparseable are an error, never an approximation.
+    #[test]
+    fn unusable_rules_from_a_peer_are_refused() {
+        let error = filter_from_wire(&[], &[b"keep/** with no sigil".to_vec()]).unwrap_err();
+        assert_eq!(error.kind(), "filter-unrepresentable");
+    }
+
+    /// The order of the rules is what carries their meaning across the wire.
+    #[test]
+    fn rules_survive_the_wire_with_their_order_intact() {
+        let filter = include_filter();
+        let wire = filter_for_peer(
+            &LocalSyncOptions {
+                filter: Some(filter),
+                ..LocalSyncOptions::default()
+            },
+            CAP_FILTER_RULES,
+        )
+        .unwrap();
+        let rebuilt = filter_from_wire(&[], &wire.rules).unwrap();
+        assert!(rebuilt.decide("keep/a.txt").is_included());
+        assert!(!rebuilt.decide("other/a.txt").is_included());
+    }
+
     use super::*;
     use std::io::Cursor;
     use tempfile::tempdir;
@@ -7915,6 +8082,7 @@ mod tests {
                     paranoid: false,
                     dry_run: false,
                     exclude_patterns: Vec::new(),
+            filter_rules: Vec::new(),
                 },
             )
             .unwrap(),
@@ -7997,6 +8165,7 @@ mod tests {
                     paranoid: false,
                     dry_run: false,
                     exclude_patterns: Vec::new(),
+            filter_rules: Vec::new(),
                 },
             )
             .unwrap(),
@@ -8508,6 +8677,7 @@ mod tests {
             paranoid: false,
             dry_run: false,
             exclude_patterns: Vec::new(),
+            filter_rules: Vec::new(),
         };
         client_to_server.extend_from_slice(&encode_frame(2, &sc).unwrap());
 

@@ -276,6 +276,7 @@ fn handshake_session<R: Read, W: Write>(
                     paranoid: false,
                     dry_run: false,
                     exclude_patterns: Vec::new(),
+                    filter_rules: Vec::new(),
                 },
             )
             .map_err(|e| BenchError::Handshake(std::io::Error::other(e)))?,

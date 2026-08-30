@@ -51,6 +51,16 @@ pub const CAP_BROWSE_V2: u32 = 1 << 2;
 /// Peer understands the version-negotiation handshake extension.
 pub const CAP_VERSION_NEGOTIATION: u32 = 1 << 3;
 
+/// Peer understands ordered include/exclude filter rules.
+///
+/// `exclude_patterns` carries a flat list whose entries are all exclusions, so
+/// it cannot express an include rule, whose meaning is entirely its position
+/// relative to the excludes. `filter_rules` carries the ordered set instead.
+/// Sent only to a peer advertising this, and a peer without it is refused
+/// rather than sent the excludes alone, which would transfer a wider set of
+/// files than the user asked for.
+pub const CAP_FILTER_RULES: u32 = 1 << 4;
+
 /// Capability bits with a defined meaning in the current contract.
 pub const KNOWN_CAPABILITIES: u32 =
     CAP_DATA_ONLY | CAP_ZSTD | CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
@@ -195,7 +205,15 @@ pub enum Message {
         /// Do discovery and classification without destination mutation.
         dry_run: bool,
         /// Relative-path glob patterns applied by both endpoints.
+        ///
+        /// Every entry is an exclusion. Empty when `filter_rules` is used.
         exclude_patterns: Vec<Vec<u8>>,
+        /// Ordered include/exclude rules, `"+ pattern"` or `"- pattern"`.
+        ///
+        /// Populated only when the peer advertises [`CAP_FILTER_RULES`], and
+        /// mutually exclusive with `exclude_patterns` so a receiver never has
+        /// to guess which of the two describes the transfer.
+        filter_rules: Vec<Vec<u8>>,
     },
     /// A bounded collection of metadata records.
     FileBatch {
@@ -935,6 +953,7 @@ fn validate_message(message: &Message) -> Result<usize, ProtocolError> {
             streams,
             window,
             exclude_patterns,
+            filter_rules,
             ..
         } => {
             if *streams == 0 || *streams > 16 {
@@ -956,6 +975,22 @@ fn validate_message(message: &Message) -> Result<usize, ProtocolError> {
                     });
                 }
                 size = add_payload_size(size, prefixed_len(pattern.len())?)?;
+            }
+            if filter_rules.len() > MAX_EXCLUDE_PATTERNS {
+                return Err(ProtocolError::CountTooLarge {
+                    count: filter_rules.len(),
+                    maximum: MAX_EXCLUDE_PATTERNS,
+                });
+            }
+            size = add_payload_size(size, 2)?;
+            for rule in filter_rules {
+                if rule.len() > MAX_EXCLUDE_PATTERN_BYTES {
+                    return Err(ProtocolError::PayloadTooLarge {
+                        length: rule.len(),
+                        maximum: MAX_EXCLUDE_PATTERN_BYTES,
+                    });
+                }
+                size = add_payload_size(size, prefixed_len(rule.len())?)?;
             }
         }
         Message::FileBatch { entries, .. } => {
@@ -1129,6 +1164,7 @@ fn encode_message_payload(message: &Message, output: &mut Vec<u8>) -> Result<(),
             paranoid,
             dry_run,
             exclude_patterns,
+            filter_rules,
         } => {
             if *streams == 0 || *streams > 16 {
                 return Err(ProtocolError::InvalidValue { field: "streams" });
@@ -1145,6 +1181,10 @@ fn encode_message_payload(message: &Message, output: &mut Vec<u8>) -> Result<(),
             writer.count(exclude_patterns.len(), MAX_EXCLUDE_PATTERNS)?;
             for pattern in exclude_patterns {
                 writer.blob(pattern, MAX_EXCLUDE_PATTERN_BYTES)?;
+            }
+            writer.count(filter_rules.len(), MAX_EXCLUDE_PATTERNS)?;
+            for rule in filter_rules {
+                writer.blob(rule, MAX_EXCLUDE_PATTERN_BYTES)?;
             }
         }
         Message::FileBatch { batch_id, entries } => {
@@ -1327,6 +1367,18 @@ fn decode_message_payload(message_type: u8, payload: &[u8]) -> Result<Message, P
             for _ in 0..count {
                 exclude_patterns.push(reader.blob(MAX_EXCLUDE_PATTERN_BYTES)?);
             }
+            let rule_count = reader.count(MAX_EXCLUDE_PATTERNS)?;
+            let mut filter_rules = Vec::with_capacity(rule_count);
+            for _ in 0..rule_count {
+                filter_rules.push(reader.blob(MAX_EXCLUDE_PATTERN_BYTES)?);
+            }
+            if !exclude_patterns.is_empty() && !filter_rules.is_empty() {
+                // The two describe the same thing in different ways. A receiver
+                // that had to choose could silently apply the wrong one.
+                return Err(ProtocolError::InvalidValue {
+                    field: "filter_rules",
+                });
+            }
             if payload.len() > MAX_SESSION_CONFIG_PAYLOAD {
                 return Err(ProtocolError::PayloadTooLarge {
                     length: payload.len(),
@@ -1347,6 +1399,7 @@ fn decode_message_payload(message_type: u8, payload: &[u8]) -> Result<Message, P
                 paranoid,
                 dry_run,
                 exclude_patterns,
+                filter_rules,
             }
         }
         MessageType::FileBatch => {
@@ -1970,6 +2023,67 @@ impl RangeTracker {
 
 #[cfg(test)]
 mod tests {
+    /// The two representations describe the same thing differently, so a
+    /// message carrying both is rejected rather than one being picked.
+    #[test]
+    fn session_config_rejects_carrying_both_filter_representations() {
+        let message = Message::SessionConfig {
+            streams: 1,
+            batch_bytes: 32 * 1024 * 1024,
+            chunk_bytes: 16 * 1024 * 1024,
+            window: u32::try_from(DEFAULT_UNACKNOWLEDGED_WINDOW).unwrap(),
+            delete: false,
+            checksum: false,
+            paranoid: false,
+            dry_run: false,
+            exclude_patterns: vec![b"*.tmp".to_vec()],
+            filter_rules: vec![b"- *.tmp".to_vec()],
+        };
+        let encoded = encode_frame(1, &message).unwrap();
+        let mut decoder = FrameDecoder::new();
+        let error = decoder.read(&mut encoded.as_slice()).unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::InvalidValue { field } if field == "filter_rules"),
+            "{error:?}"
+        );
+    }
+
+    /// Ordered rules must survive the wire intact: their meaning is their order.
+    #[test]
+    fn session_config_round_trips_ordered_filter_rules() {
+        let rules = vec![
+            b"+ keep/**".to_vec(),
+            b"- *.tmp".to_vec(),
+            b"+ keep/important.tmp".to_vec(),
+        ];
+        let message = Message::SessionConfig {
+            streams: 1,
+            batch_bytes: 32 * 1024 * 1024,
+            chunk_bytes: 16 * 1024 * 1024,
+            window: u32::try_from(DEFAULT_UNACKNOWLEDGED_WINDOW).unwrap(),
+            delete: false,
+            checksum: false,
+            paranoid: false,
+            dry_run: false,
+            exclude_patterns: Vec::new(),
+            filter_rules: rules.clone(),
+        };
+        let encoded = encode_frame(7, &message).unwrap();
+        let mut decoder = FrameDecoder::new();
+        let frame = decoder.read(&mut encoded.as_slice()).unwrap();
+        match frame.message {
+            Message::SessionConfig {
+                filter_rules,
+                exclude_patterns,
+                ..
+            } => {
+                assert_eq!(filter_rules, rules);
+                assert!(exclude_patterns.is_empty());
+            }
+            other => panic!("expected SessionConfig, got {other:?}"),
+        }
+    }
+
     use std::io::Cursor;
 
     use super::*;
@@ -2047,6 +2161,7 @@ mod tests {
                 paranoid: false,
                 dry_run: true,
                 exclude_patterns: vec![b"*.log".to_vec(), b"cache".to_vec()],
+                filter_rules: Vec::new(),
             },
             Message::FileBatch {
                 batch_id: 8,
