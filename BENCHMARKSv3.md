@@ -235,3 +235,71 @@ Recorded so they are not resurrected from older notes:
   no configuration tested, including its own commit built for both ends. Treated
   as an erroneous measurement; the host is stable (24.88 / 24.79 / 26.30 s for
   the same code across three sessions).
+
+---
+
+## Does the sender matter? A 3 × 2 matrix
+
+Every result above used the same macOS client, so "the OS is worth 3.6×" was
+really a statement about *receivers*. Varying the sender deliberately — an
+M1 Max, a 32-thread 7950X and a 4-core Pi 5, each pushing the same two corpora
+to the same two receivers on one machine — separates the two roles.
+
+Two reps each, warmup discarded, every run verified.
+
+**congress-100k** — 109,615 files, 850 MB, mean 7.9 KB
+
+| sender | → WSL2 ext4 | → Windows NTFS |
+|---|---:|---:|
+| freya (7950X) | 14.24, 14.19 → **14.21 s** | 50.12, 50.77 → **50.45 s** |
+| macOS (M1 Max) | 15.70, 15.54 → **15.62 s** | 52.00, 51.88 → **51.94 s** |
+| orion (Pi 5) | 17.03, 17.03 → **17.03 s** | 51.60, 56.40 → **54.00 s** |
+| *sender spread* | *1.20×* | *1.07×* |
+
+**cb7** — 62,621 entries, 5.6 GB, mean 99 KB
+
+| sender | → WSL2 ext4 | → Windows NTFS |
+|---|---:|---:|
+| freya | 62.21, 61.31 → **61.76 s** | 96.58, 95.11 → **95.84 s** |
+| macOS | 65.92, 66.07 → **66.00 s** | 98.10, 96.11 → **97.10 s** |
+| orion | 117.98, 116.35 → **117.16 s** | 142.45, 141.67 → **142.06 s** |
+| *sender spread* | *1.90×* | *1.48×* |
+
+### The sender scales with bytes; the receiver scales with file count
+
+On congress the sender is nearly irrelevant — **1.07× to 1.20×** across three
+very different machines — while swapping the *receiver* from WSL to Windows on
+one box costs **3.33×**. A Pi 5 sends a hundred thousand small files about as
+fast as a 7950X does.
+
+On cb7 that inverts. The sender spread widens to **1.90×** and the receiver
+effect narrows to **1.47×**, because cb7 moves 6.7× the bytes. The rates say
+why: to WSL, freya sustains 93 MB/s, macOS 87 MB/s — at its measured
+`ssh` ceiling of ~86.5 MB/s — and orion only 49 MB/s, consistent with the
+53–62 MB/s SSH throughput measured on that link. **Every sender is
+bandwidth-bound on cb7**, so the ranking is simply each machine's SSH
+throughput, and the Pi's weaker crypto shows.
+
+The rule that falls out: **per-file work is paid by the receiver, per-byte work
+by the sender.** Small-file corpora are a receiver benchmark; large-byte corpora
+are a sender-and-link benchmark. It is why 4.26 (the receiver) beat 4.15 (the
+sender) on congress, and why the OS ratio collapses as files get bigger.
+
+### orion is excluded as a receiver
+
+It failed mid-transfer with `ssh: connect to host … port 22: Operation timed
+out` on congress, before and after a restart, while remaining healthy by every
+other measure — load 0.22, 62.2 MB/s link, correct binary, corpora intact. It
+sends fine. **Receiving 109,615 files is the specific thing it cannot do**,
+which is worth investigating on its own rather than working around: it is the
+only 3 GB host in the fleet, and 4.26 now spawns an apply pool on the receiver.
+
+### A caution this matrix earned
+
+Its first run was collected while the LAN was degraded — 1.7 MB/s to Windows,
+9.4 to freya, 28 to orion, against an 86.5 MB/s baseline. Every one of those
+numbers was discarded after a router reboot restored freya to 89.6 MB/s. In
+between, a receiver measuring 17 s against a remembered 9 s looked exactly like
+a regression in 4.25, and an A/B of the 4.25 and 4.26 server builds on that host
+(15.5 s vs 17–18 s) is what proved the code innocent. **Third time this cycle
+that an environment change impersonated a code change.**
