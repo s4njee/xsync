@@ -1473,9 +1473,34 @@ runs cannot be trusted.
 
 Inside the distro: `systemd=true` in `/etc/wsl.conf`, `openssh-server` on
 **port 2222** (the Windows sshd owns 22 and mirrored mode shares the port
-space), `build-essential`, rustup, and the same `authorized_keys` Windows
-already accepts — copyable from `/mnt/c/Users/sanjee/.ssh/`. Then
-`wsl --shutdown` so systemd and the config take effect.
+space), `build-essential`, and rustup. Then `wsl --shutdown` so systemd and the config
+take effect.
+
+**Key authorisation is not where it looks.** There is no
+`C:\Users\sanjee\.ssh\authorized_keys` on this host. `sanjee` is an
+administrator, and the Windows sshd config ends with
+
+```
+Match Group administrators
+       AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys
+```
+
+so the accepted key lives in `C:\ProgramData\ssh\administrators_authorized_keys`.
+Copying it across from WSL is unreliable — that file's ACL grants only SYSTEM
+and Administrators, and a WSL session runs under the *unelevated* token, which
+UAC strips of administrator group membership. Write the key in directly
+instead:
+
+```
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+cat >> ~/.ssh/authorized_keys <<'KEY'
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINh14bwS7GKQcz7VpmHU18DKIV9JxjjvlvP4iIPdzobx sanjee@Sanjees-MacBook-Pro.local
+KEY
+chmod 600 ~/.ssh/authorized_keys
+```
+
+WSL's sshd is an ordinary Linux sshd, so the per-user path applies there and no
+`Match Group` block is involved.
 
 **AC**
 
