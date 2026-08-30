@@ -11,13 +11,27 @@ not by value. Anything marked *unverified* has been built but not proven.
 
 ## Where things stand
 
+*Table refreshed 2026-08-30.*
+
 | | |
 |---|---|
-| Measured platforms | macOS (M1 Max), Linux x86_64 (freya), Linux aarch64 (orion, Pi 5) |
+| Measured platforms | macOS (M1 Max), Linux x86_64 (freya 7950X; mars 7900X), Linux aarch64 (orion, Pi 5), Windows 11 (7900X — the same physical box as mars, dual-boot) |
 | Measured corpora | congress (1k/10k/100k/1m), cb7, Manga |
-| Not yet measured | Windows, anything |
-| Known-unverified code | V3.22 metadata compression — builds and passes tests, never run against a live peer |
-| Recently invalidated | The v1 wire is not frozen; several designs routed around a constraint that does not exist |
+| Not yet measured | Anything above ~1 GbE; any x86 that is not Zen 4; XFS and btrfs; WiFi; BSD. See 4.18 |
+| Known-unverified code | 4.7 — multi-stream capability negotiation still hands the control session `capabilities=0x0` |
+| Recently invalidated | The v1 wire is not frozen. `wire_bytes` is not the bytes on the wire (4.44). The preflight's "frozen wire" comment blamed the wrong encoding entirely (settled in 4.5) |
+
+**The result the next few phases exist to act on.** Small-file network sync is
+bound by neither endpoint: both sit near 50% CPU, and a Pi 5 receives within 7%
+of a 7950X. The sender's batch builder is serial and phase-separated — it issues
+up to 8,192 blocking reads with the network idle, then hashes, compresses, and
+frames with the disk idle. 4.15 fixes the sender, 4.26 the receiver, and 4.25
+notes that `--streams` currently buys *zero* parallelism on small-file corpora
+because everything under `MAX_DATA_SEGMENT` rides the control session.
+
+**Numbering note.** Phase 10 owns 4.29–4.43 and cross-references its own ids, so
+the two stories filed from the 4.4 and 4.5 work took 4.44 and 4.45 rather than
+renumbering it.
 
 ---
 
@@ -132,7 +146,7 @@ and `decoder.last_wire_bytes()` feed `report.wire_bytes`; all four
 add to it. An A/B of two purpose-built binaries — one with `encode_meta_frame`
 forced to `CompressionMode::None` — returned **byte-identical** `wire_bytes` of
 139,736,860 on both arms, which measures the metric's blindness, not the
-feature. Filed as 4.29.
+feature. Filed as 4.44.
 
 Measured by instrumenting `encode_meta_frame` to encode both ways and report
 the sizes (throwaway build, not committed):
@@ -213,7 +227,7 @@ tracing inflates syscall cost by roughly an order of magnitude.
 
 **Follow-up not taken**: the Windows arm of `note_dropped_metadata` still stats
 every file for `FILE_ATTRIBUTE_SPARSE_FILE`. The same treatment would need
-`file_attributes` carried in the record. Filed as 4.30.
+`file_attributes` carried in the record. Filed as 4.45.
 
 ### 4.6 — Carry filter rules on the wire *(unblocks V3.10)*
 
@@ -773,7 +787,7 @@ and suggests the D5.2 bootstrap path to update the remote; `build.rs` re-runs
 when HEAD moves (`rerun-if-changed` on `.git/HEAD` and the ref it points at);
 a stale-commit repro test if practical.
 
-### 4.29 — `wire_bytes` is not the bytes on the wire
+### 4.44 — `wire_bytes` is not the bytes on the wire
 
 - [ ] **Found while verifying 4.4.** `wire_bytes` counts data frames only. Every
   `encode_meta_frame` call site writes to the transport without adding to
@@ -803,7 +817,7 @@ measure.
 - `BENCHMARKv2.md` and `docs/` numbers derived from `wire_bytes` get a note
   that pre-fix figures exclude metadata.
 
-### 4.30 — Windows preflight still stats every file
+### 4.45 — Windows preflight still stats every file
 
 - [ ] 4.5 removed the per-file `stat` from the Unix preflight by carrying
   ownership and link count in the planning record. The Windows arm of
