@@ -5642,9 +5642,13 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     if !options.dry_run {
         let mut dirs = plan.directories.new.clone();
         dirs.sort_by_key(|d| d.path.len());
+        // Pipelined, like the single-stream path. One synchronous ack per
+        // directory cost a full round trip each: on congress, which gives every
+        // bill its own directory, that is nearly one round trip per file and made
+        // `--streams` 30x slower than a single stream to a Raspberry Pi.
+        let mut pending = 0usize;
         for dir in dirs {
-            write_frame(
-                &mut cwriter,
+            let bytes = encode_frame(
                 calloc(),
                 &Message::Metadata {
                     operation: MetadataOperation::CreateDirectory,
@@ -5654,8 +5658,20 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                     mtime_ns: system_time_to_nanos(dir.mtime),
                 },
             )?;
-            expect_ack(&mut cdec, &mut creader)?;
+            cwriter.write_all(&bytes)?;
+            pending += 1;
+            if pending >= MAX_PIPELINED_FRAMES {
+                cwriter.flush()?;
+                drain_acks(
+                    &mut cdec,
+                    &mut creader,
+                    &mut pending,
+                    MAX_PIPELINED_FRAMES / 2,
+                )?;
+            }
         }
+        cwriter.flush()?;
+        drain_acks(&mut cdec, &mut creader, &mut pending, 0)?;
         for sym in plan.symlinks.new.iter().chain(&plan.symlinks.changed) {
             let local = if prefix.is_empty() {
                 sym.path.to_native_path(source_path)
@@ -5666,8 +5682,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                     .to_native_path(source_path)
             };
             let target = fs::read_link(&local)?;
-            write_frame(
-                &mut cwriter,
+            let bytes = encode_frame(
                 calloc(),
                 &Message::Metadata {
                     operation: MetadataOperation::CreateSymlink,
@@ -5677,8 +5692,20 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                     mtime_ns: system_time_to_nanos(sym.mtime),
                 },
             )?;
-            expect_ack(&mut cdec, &mut creader)?;
+            cwriter.write_all(&bytes)?;
+            pending += 1;
+            if pending >= MAX_PIPELINED_FRAMES {
+                cwriter.flush()?;
+                drain_acks(
+                    &mut cdec,
+                    &mut creader,
+                    &mut pending,
+                    MAX_PIPELINED_FRAMES / 2,
+                )?;
+            }
         }
+        cwriter.flush()?;
+        drain_acks(&mut cdec, &mut creader, &mut pending, 0)?;
     }
 
     let source_reader = SourceReader::new(source_path);
@@ -5935,9 +5962,12 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             .chain(&plan.directories.unchanged)
             .collect();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
+        // Pipelined for the same reason as the creation pass above: one ack per
+        // directory is a round trip per directory, and deep trees have roughly
+        // as many directories as files.
+        let mut meta_pending = 0usize;
         for dir in dirs {
-            write_frame(
-                &mut cwriter,
+            let bytes = encode_frame(
                 calloc(),
                 &Message::Metadata {
                     operation: MetadataOperation::SetDirectory,
@@ -5947,8 +5977,20 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                     mtime_ns: system_time_to_nanos(dir.mtime),
                 },
             )?;
-            expect_ack(&mut cdec, &mut creader)?;
+            cwriter.write_all(&bytes)?;
+            meta_pending += 1;
+            if meta_pending >= MAX_PIPELINED_FRAMES {
+                cwriter.flush()?;
+                drain_acks(
+                    &mut cdec,
+                    &mut creader,
+                    &mut meta_pending,
+                    MAX_PIPELINED_FRAMES / 2,
+                )?;
+            }
         }
+        cwriter.flush()?;
+        drain_acks(&mut cdec, &mut creader, &mut meta_pending, 0)?;
         if source_is_dir {
             write_frame(
                 &mut cwriter,
