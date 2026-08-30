@@ -518,16 +518,22 @@ Unix ownership, and V3.3 conflated the two. Replaced with an explicit
 |---|---|---|---|
 | Windows as configured | 87.23, 87.18, 87.48 | **87.23 s** | 1,257 |
 | Windows, benchmark path excluded | 72.06, 71.19, 71.39 | **71.39 s** | 1,536 |
-| WSL2 ext4, same NVMe, same session | 7.85, 7.86, 7.84, 7.85, 7.85 | **7.85 s** | 13,964 |
+| WSL2 ext4, same NVMe, verified | 18.70, 18.34, 18.70 | **18.70 s** | 5,862 |
 
 **Defender costs 1.22× — 15.84 s, or 144 µs per file.** That is 18% of the wall
 clock a Windows user actually experiences.
 
-**But it is not the explanation for Windows being slow.** Against the same-session
-Linux reference on the same NVMe, the gap is 79.38 s, and Defender is 15.84 s of
-it. **Scanning accounts for 20% of the Windows-versus-Linux gap; the other 80% is
-Windows itself.** With scanning entirely removed Windows still runs **9.09×**
-slower than Linux on identical hardware. The hypothesis this story was filed on —
+**But it is not the explanation for Windows being slow.** Against the Linux
+reference on the same NVMe the gap is 68.53 s, and Defender is 15.84 s of it.
+**Scanning accounts for 23% of the Windows-versus-Linux gap; the other 77% is
+Windows itself.** With scanning entirely removed Windows still runs **3.82×**
+slower than Linux on identical hardware.
+
+**The cost is per-file, not per-byte — confirmed directly.** On 3.94 GiB in 7
+large files, scanned and excluded are indistinguishable (62.65 s against
+65.98 s, the difference within noise and in the wrong direction). 144 µs across
+7 files is a millisecond. Defender is a tax on *file creations*, so it scales
+with file count and vanishes on bulk data. The hypothesis this story was filed on —
 that real-time scanning was the leading explanation for 1,025 files/s against
 6,351 — is therefore **false**, and worth stating plainly because it was the
 prevailing assumption.
@@ -1566,55 +1572,61 @@ Setting `RUSTC` matters as much as calling `cargo.exe` by path: cargo finds
 `fsutil behavior set SymlinkEvaluation R2L:1`, is a system security setting and
 belongs to the operator.
 
-### 4.48 — The OS penalty on identical hardware *(measured 2026-08-30; NTFS decomposition dropped)*
+### 4.48 — The OS penalty on identical hardware *(measured 2026-08-30)*
 
-- [x] congress-100k pushed from the same Mac, same source tree, same binary, to
-  three destinations on **one machine** (7900X, one NVMe, one link):
+- [x] Same Mac, same source, same binary, pushed to one machine (7900X, one
+  NVMe, one link). **Every figure below is verified**: non-zero exit rejected
+  and the landed file count checked against the corpus.
 
-| destination | userspace + filesystem | files/s | vs native Windows |
-|---|---|---:|---|
-| native Windows | Win32 + NTFS | 1,150 | — |
-| WSL2 | Linux + ext4 in a VHDX on the same NVMe | **13,964** | **11.1× faster** |
-| WSL2 `/mnt/c` | Linux + NTFS through the 9p bridge | ~32–37 | **~32× slower** |
+**Small files — congress-100k (109,615 files, 850 MB)**
 
-**Row 2 is the result worth keeping.** Every prior OS comparison in this project
-crossed machines, filesystems and kernels at once. This one holds CPU, disk,
-network and source constant and finds **11.1×** — far larger than
-`docs/OS.md`'s "the OS is worth ~6×", not smaller.
+| destination | userspace + filesystem | median | files/s |
+|---|---|---:|---:|
+| native Windows, as configured | Win32 + NTFS | 87.23 s | 1,257 |
+| native Windows, Defender-excluded | Win32 + NTFS | 71.39 s | 1,536 |
+| WSL2 | Linux + ext4 (VHDX, same NVMe) | 18.70 s | **5,862** |
+| WSL2 `/mnt/c` | Linux + NTFS over the 9p bridge | ~2,900 s est. | ~32 |
 
-> **Corrected 2026-08-30.** This row first read 5,565 files/s and 4.84×, from a
-> single run. That run was the *first* large write into WSL's ext4, and its
-> VHDX is dynamically expanding: the cost of growing the file on NTFS was
-> charged to the transfer. Five later reps on the settled VHDX give 7.84–7.86 s
-> against the original 19.70 s, a 2.5× warmup effect. **Any WSL benchmark must
-> discard first-touch runs or disclose them** — a requirement for 4.21 and
-> 4.47, and the second time this cycle a single unbracketed run produced a
-> wrong headline.
+**Linux is 4.66× faster than Windows on identical hardware** — same CPU, same
+NVMe, same link, same source tree. With Defender excluded it is still **3.82×**.
+This is the first version of `docs/OS.md`'s "the OS is worth ~6×" that holds the
+hardware constant, and it lands somewhat below that figure.
 
-**Defender is not the explanation.** 4.12 measured it on the same hardware in
-one session: scanning costs 1.22×, which is 20% of the Windows-versus-Linux
-gap. Windows remains **9.09×** slower with scanning removed entirely.
+**Large files — 3.94 GiB in 7 files (mean 576 MB)**
 
-**Row 3 did not do what it was designed to do, as the original AC anticipated.**
-`/mnt/c` is 9p — a per-operation RPC protocol, not a filesystem driver — so at
-~32 files/s it measures the bridge and **cannot separate NTFS from the Win32
-layer**. It survives as practical guidance (*never sync into `/mnt/c`*; it is
-30× worse than doing the same work natively on Windows) and as nothing else.
-The full run was abandoned after two independent rate samples agreed (37.5 and
-31.6 files/s, ETA ~58 min): more precision on a number whose only use is "don't"
-was not worth an idle-host window on freya.
+| destination | median | MB/s |
+|---|---:|---:|
+| native Windows, as configured | 62.65 s | 64.4 |
+| native Windows, Defender-excluded | 65.98 s | 61.2 |
+| WSL2 ext4 | 62.20 s | 64.9 |
+| freya (different box, native Linux) | 66.79 s | 60.3 |
 
-**The NTFS-vs-Win32 decomposition is deliberately not pursued.** Holding
-userspace constant and varying the filesystem would need a Dev Drive (ReFS),
-which is confounded by Defender's performance-mode default on Dev Drives — a
-poor isolation. More decisively, nothing depends on the answer: the one story
-that might consume it, 4.26, is better served by implementing receiver-side
-parallel apply and measuring it on Windows directly than by inferring a
-mechanism first.
+**The OS penalty disappears entirely on large files.** Everything lands within
+7%, which is link-bound, not platform-bound. So the honest headline is
+**"the OS costs 4.66× on small files and nothing on large ones"** — a much more
+precise and more useful claim than "the OS is worth ~6×", and one that matches
+the mechanism: the penalty is per-file metadata cost, and large files amortise
+it to nothing.
 
-**Still open**: medians rather than single runs for rows 1 and 2, and cb7 as a
-second corpus shape (congress is one file per directory, cb7 is 7.2, and
-directory-metadata cost is the suspected mechanism).
+**`/mnt/c` remains guidance only.** 9p is a per-operation RPC, so ~32 files/s
+measures the bridge, not NTFS. Never sync into `/mnt/c`.
+
+**The NTFS-vs-Win32 decomposition stays dropped** — see the reasoning below; the
+large-file row above already establishes that the cost is per-file, which is the
+part that matters for engineering.
+
+> **Two retractions, both mine.**
+>
+> This row briefly read **13,964 files/s and 11.1×**. Those runs never happened:
+> the WSL VM was intermittently shut down, `xs` was failing in ~7.85 s, and
+> `-q >/dev/null 2>&1` with no exit-code check turned every failure into a
+> plausible number. 513 MB/s over a gigabit link is what finally exposed it.
+>
+> Worse, I explained the bogus figure with a fabricated mechanism — "the first
+> large write expands the ext4 VHDX" — which sounded plausible and was invented
+> to fit bad data. The verified re-run gives 18.70 s, within noise of the
+> original 19.70 s. There was no warmup effect. **A mechanism proposed to
+> explain a surprising number must be tested before it is written down.**
 
 ### 4.49 — Re-measure 4.15 idle *(done 2026-08-30 — the stated hypothesis was wrong)*
 
