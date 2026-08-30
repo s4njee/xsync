@@ -822,6 +822,14 @@ of rsync's 23 "partial transfer") whenever `failed_entries > 0`; documented in
   that measured three failed connects as 2.2M files/s. None were xsync bugs;
   all cost real time and one poisoned recorded numbers.
 
+**A third failure mode, added 2026-08-30 after it produced a retracted
+headline.** Running `xs ... -q >/dev/null 2>&1` without checking the exit status
+turns every failure into a plausible timing. On WSL this yielded a steady
+7.85 s "result" across eight runs that had all failed, and it survived until
+513 MB/s over a gigabit link made it obvious. The harness must treat a non-zero
+exit and a destination file count that does not match the corpus as **hard
+errors that discard the run**, never as data.
+
 **AC**: a single harness in `benches/` that (1) **validates the transfer landed**
 — file count and byte total at the destination, nonzero-exit runs discarded
 loudly, (2) computes median and MAD correctly with the raw samples always
@@ -1526,6 +1534,22 @@ something launches it, so sshd is not merely unreachable, it does not exist.
 Start it with `wsl` after any shutdown. Running `wsl.exe` over SSH also needs
 `--cd /`: it tries to translate the session's working directory and fails with
 "The system cannot find the path specified".
+
+*The VM shuts itself down mid-benchmark, and `vmIdleTimeout=-1` does not stop
+it.* WSL terminates the VM shortly after the last **`wsl.exe` client on Windows**
+exits. An inbound sshd session into the distro does **not** count as a client, so
+a benchmark driven entirely over port 2222 boots the VM, transfers for ~13 s, and
+then dies with `Broken pipe` when the VM disappears underneath it. A keepalive
+started over SSH does not help either: sshd's job object kills it when that
+session ends. What works is holding a `wsl.exe` client open for the duration from
+the *driving* machine:
+
+```
+ssh sanjee@192.168.1.120 "wsl --cd / -d Ubuntu -- sleep 3600" &
+```
+
+Every WSL measurement must pin the VM this way, and must verify results rather
+than trust them — see the retraction in 4.48 for what this cost.
 
 *WSL's Hyper-V firewall blocks inbound by default.* With mirrored networking the
 VM holds the host's address (`eth0` shows `192.168.1.120/24`), but
