@@ -10,18 +10,33 @@ why?**
 
 ## What changed since v2
 
-**4.15 landed.** The batch builder used to be serial and phase-separated — it
-issued up to 8,192 blocking reads with the network idle, then hashed,
-compressed and framed with the disk idle. A loader thread now runs one batch
-ahead. Measured on an idle host, over the wired link, alternating arms, every
-run verified:
+Both halves of the small-file path were serialized. Both are now fixed, and
+they multiply.
 
-| congress-100k, Mac → freya | before 4.15 | after 4.15 |
-|---|---:|---:|
-| median of 2 reps | 26.30 s | **12.80 s** |
+**4.15 — the sender.** The batch builder issued up to 8,192 blocking reads with
+the network idle, then hashed, compressed and framed with the disk idle. A
+loader thread now runs one batch ahead. **2.05×**, reproduced across three
+sessions at 1.86× (loaded), 2.15× (idle) and 2.05× (idle, wired, verified).
 
-**2.05×**, reproduced across three sessions at 1.86× (loaded), 2.15× (idle) and
-2.05× (idle, wired, verified).
+**4.26 — the receiver.** The receive loop decoded *and applied* on one thread.
+Decoding must stay serial, but publishing a file is independent per file. An
+apply pool now does that off the decode thread, keeping the ack-on-commit
+contract. Measured with the client held constant and only the server binary
+alternated:
+
+| server | before | after | gain |
+|---|---:|---:|---|
+| Windows NTFS | 90.30 s | **55.83 s** | **1.62×** |
+| freya (Linux, ZFS) | 12.36 s | **8.46 s** | **1.46×** |
+| orion (Pi 5) | 12.21 s | **9.23 s** | **1.32×** |
+| WSL2 ext4 | 18.96 s | **15.62 s** | **1.21×** |
+
+**End to end, congress-100k to freya: 26.30 → 12.80 → 8.46 s — 3.11×.**
+
+Windows gains most because it is the receiver-bound platform. That has a
+consequence for the headline below: **part of what v3 first attributed to "the
+OS" was xsync's own receiver serialization** amplifying Windows' higher
+per-file cost.
 
 ---
 
@@ -82,21 +97,27 @@ they form a clean size ladder spanning five orders of magnitude.
 
 ### congress-100k — 109,615 small files
 
-| destination | reps (s) | median | files/s |
-|---|---|---:|---:|
-| freya — Linux, ZFS, 7950X | 11.57, 11.89, 11.40 | **11.57** | 9,474 |
-| orion — Linux, ext4, **Pi 5** | 11.53, 12.47, 14.55 | **12.47** | 8,790 |
-| WSL2 — Linux, ext4, 7900X | 18.33, 18.59, 18.54 | **18.54** | 5,912 |
-| Windows — NTFS, 7900X | 86.44, 90.50, 87.45 | **87.45** | 1,253 |
+*Post-4.26. The pre-4.26 column is in "What changed since v2" above.*
+
+| destination | median | files/s |
+|---|---:|---:|
+| freya — Linux, ZFS, 7950X | **8.46 s** | 12,961 |
+| orion — Linux, ext4, **Pi 5** | **9.23 s** | 11,890 |
+| WSL2 — Linux, ext4, 7900X | **15.62 s** | 7,019 |
+| Windows — NTFS, 7900X | **55.83 s** | 1,964 |
 
 ### cb7 — 62,621 entries, mixed sizes, 3,310 symlinks
 
-| destination | reps (s) | median | entries/s | MB/s |
-|---|---|---:|---:|---:|
-| freya | 57.22, 58.06, 60.50 | **58.06** | 1,078 | 98.8 |
-| WSL2 ext4 | 64.08, 65.64, 64.70 | **64.70** | 968 | 88.6 |
-| orion (Pi 5) | 94.07, 95.41, 96.64 | **95.41** | 656 | 60.1 |
-| Windows NTFS | 104.98, 104.23, 104.07 | **104.23** | 601 | 55.0 |
+| destination | median | entries/s | MB/s | note |
+|---|---:|---:|---:|---|
+| WSL2 ext4 | **62.85 s** | 996 | 91.2 | post-4.26 |
+| Windows NTFS | **92.59 s** | 676 | 61.9 | post-4.26 |
+| freya | 58.06 s | 1,078 | 98.8 | pre-4.26 |
+| orion (Pi 5) | 95.41 s | 656 | 60.1 | pre-4.26 |
+
+The two Linux rows predate 4.26 and are not re-measured; cb7 gains little there
+(WSL moved only 64.70 → 62.85 s, 1.03×) because at 99 KB mean the per-file cost
+is already small next to the bytes.
 
 ### large files — 3.94 GiB in 7 files
 
@@ -115,9 +136,14 @@ the OS and filesystem differing:
 
 | corpus | mean file size | Windows ÷ WSL-Linux |
 |---|---:|---:|
-| congress-100k | 7.9 KB | **4.72×** |
-| cb7 | 99.0 KB | **1.61×** |
+| congress-100k | 7.9 KB | **3.57×** |
+| cb7 | 99.0 KB | **1.47×** |
 | large files | 576 MB | **1.01×** |
+
+*All three rows post-4.26 except the large-file row, which is bandwidth-bound
+and unchanged by it. Before 4.26 the same ladder read 4.72× / 1.61× / 1.01×:
+the shape was identical, the small-file end simply exaggerated by xsync's own
+serialized receiver.*
 
 Monotonic collapse across five orders of magnitude. Windows is not "slower at
 I/O" — it charges a fixed cost per file creation, and once files are large
@@ -129,7 +155,9 @@ nothing on large ones"**, which is both more precise and more useful than
 
 ### Defender is real, but it is not the explanation
 
-Measured on one NTFS volume, two sibling directories, alternating, three rounds:
+Measured **before 4.26**, on one NTFS volume, two sibling directories,
+alternating, three rounds. The absolute tax should be unchanged — it is a
+per-file cost — but its share of a now-smaller gap will have grown:
 
 | arm | median | files/s |
 |---|---:|---:|
@@ -145,9 +173,10 @@ is per-file, not per-byte.
 
 ### A Raspberry Pi 5 ties a 7950X, and beats a 7900X sevenfold
 
-On congress, orion (4 cores, 3 GB) lands at 12.47 s against freya's 11.57 s —
-**within 8% of a 32-thread 7950X** — and against the *same class* of CPU running
-Windows, 87.45 s, it is **7.0× faster**.
+On congress, orion (4 cores, 3 GB) lands at 9.23 s against freya's 8.46 s —
+**within 9% of a 32-thread 7950X** — and against the *same class* of CPU running
+Windows, 55.83 s, it is **6.0× faster**. Parallelising the receiver did not
+change this: the Pi kept pace before and after.
 
 Small-file sync is not CPU-bound. It is bound by per-file work in the OS and
 the transport, which is why a Pi keeps up and why the operating system dominates
@@ -186,8 +215,10 @@ see backlog 4.50.
   nothing depends on the answer: the size ladder above already establishes the
   cost is per-file.
 - **Anything above 1 GbE**, any x86 that is not Zen 4, XFS, btrfs, and BSD.
-- **The receiver side.** After 4.15 the client sits near 80% of one core and the
-  server near 71%; neither is saturated. Backlog 4.26 is the other half.
+- **What still limits small files.** 4.26 closed the receiver half. The apply
+  pool is not wired into `run_data_sink`, the multi-stream data path, but small
+  files never travel that route — they ride the control session, which is
+  backlog 4.25.
 
 ## Figures retracted during this cycle
 

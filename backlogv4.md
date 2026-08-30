@@ -1058,6 +1058,10 @@ ever block on input.
 | freya, after | 8.69, 8.46, 8.33 | **8.46** | 12,961 | **1.46×** |
 | Windows, before | 90.25, 90.34 | 90.30 | 1,215 | — |
 | Windows, after | 55.75, 55.91 | **55.83** | 1,964 | **1.62×** |
+| orion (Pi 5), before | 11.63, 12.79 | 12.21 | 8,977 | — |
+| orion (Pi 5), after | 9.43, 9.02 | **9.23** | 11,875 | **1.32×** |
+| WSL2 ext4, before | 18.69, 19.23 | 18.96 | 5,782 | — |
+| WSL2 ext4, after | 15.54, 15.70 | **15.62** | 7,018 | **1.21×** |
 
 **Windows gains more, as the story predicted** — it is the receiver-bound
 platform, and unblocking the receiver is worth more there than on Linux.
