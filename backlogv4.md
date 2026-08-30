@@ -771,6 +771,36 @@ Blank areas, in priority order:
 1. **Faster links** — at 2.5/10 GbE does the sender bottleneck (4.15) simply
    dominate everything, or do new ceilings appear? Cheapest decisive test of
    whether tuning generalizes.
+
+   *Hardware survey, 2026-08-30.* Measured on the current pair:
+
+   | transport | throughput |
+   |---|---:|
+   | 1 GbE, Mac USB adapter, `dd \| ssh cat` | 86.5 MB/s |
+   | Wi-Fi 6, 5 GHz 80 MHz, same test | 72.3 MB/s |
+   | xsync, large files | 64.9 MB/s |
+
+   Wi-Fi is only 16% behind the wired USB gigabit adapter, which says the
+   adapter — not the medium — is the weak link.
+
+   **Thunderbolt/USB4 peer-to-peer is not available on this pair.** The Mac has
+   Thunderbolt Bridge (`bridge0`, ports `en1`–`en3`, 40 Gb/s buses). The
+   Windows box (Gigabyte X870) exposes `USB4 Root Router` and
+   `USB4(TM) Host Router (Microsoft)` but has **no networking device** in the
+   `Net` class for it: IP-over-Thunderbolt on Windows is an Intel-driver
+   feature, and the generic Microsoft USB4 stack on AMD does not provide it. A
+   USB-C cable between them enumerates but yields no IP link.
+
+   **The cheap path is already half-installed.** The Windows box has a *Realtek
+   PCIe 2.5GbE* controller, currently auto-negotiated down to 1 Gbps because
+   the other end is gigabit. A USB-C 2.5GbE adapter for the Mac plus a direct
+   cable and static addresses gives **2.5 Gbps (~280 MB/s) point-to-point with
+   no switch** — about 3.3× today's SSH ceiling, which is enough headroom to
+   reveal whether SSH crypto or xsync's chunked path binds next.
+
+   **10 GbE is premature.** It needs a PCIe NIC plus a Thunderbolt adapter, and
+   with `ssh` topping out at 86.5 MB/s it would mostly measure OpenSSH until
+   4.17's transport work lands.
 2. **Slower/older x86** — everything x86 measured is Zen 4. A ~2015 laptop
    would say whether "CPU ~0%" holds when the CPU is actually slow.
 3. **Filesystems** — ext4 and APFS are characterized; ZFS was abandoned for
