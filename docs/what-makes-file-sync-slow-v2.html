@@ -684,11 +684,13 @@
 <hr>
 <h2 id="why-this-matrix-is-a-trap">Why this matrix is a trap</h2>
 <p>The parameter space is sender OS × receiver OS × filesystem × corpus × stream count × worker count × link. You cannot sample it uniformly, and an unprincipled sample produces numbers that disagree for reasons you cannot attribute.</p>
-<p>That is the boring problem. The interesting problem is that <strong>the confounds are silent</strong>. Three results we recorded as fact and later had to retract:</p>
+<p>That is the boring problem. The interesting problem is that <strong>the confounds are silent</strong>. Four results we recorded as fact and later had to retract:</p>
 <p><strong>A 2.5× &quot;warmup effect&quot; that did not exist.</strong> WSL runs were coming in at a suspiciously consistent 7.85 s. We had run them as <code>xs … -q &gt;/dev/null 2&gt;&amp;1</code> without checking <code>$?</code>. The WSL VM was idle-shutting-down mid-transfer, every run was failing, and the failure path took a stable ~7.85 s. Worse, we then <em>explained</em> the bogus number — &quot;the first large write expands the dynamically-allocated ext4 VHDX&quot; — a mechanism that sounds right and is entirely fictional. What exposed it was arithmetic: the same runs implied 513 MB/s over a gigabit link.</p>
 <p><strong>A whole benchmark matrix taken on a degraded LAN.</strong> Mid-session, throughput to one host fell to 1.7 MB/s against an 86.5 MB/s baseline. Every cell collected in that window looked like a plausible slowdown. A router reboot restored it.</p>
+<p><strong>A stale IP address in our own harness.</strong> The Raspberry Pi appeared unable to <em>receive</em> a large transfer — it failed partway through with an SSH timeout, before and after a reboot, while sending perfectly and looking healthy on every other metric. We wrote that up as a probable memory-pressure defect in the receiver&#x27;s worker pool, since it is the only 3 GB host.</p>
+<p>It was nothing of the kind. The router reboot had moved the Pi from <code>.218</code> to <code>.217</code> by DHCP, and the benchmark script had the old address hardcoded. Every &quot;failure&quot; was our harness dialling a dead host. Once it resolved by name instead, the Pi received 109,615 files in <strong>8.9 s</strong> — the fastest receiver in the fleet — across four consecutive runs plus a killed-client test that confirmed the server exits cleanly rather than orphaning processes.</p>
 <p><strong>A baseline that never reproduced.</strong> One host measured 14.4 s for work that consistently took 24–26 s afterwards. We first wrote this up as <em>host drift</em> — which would taint every number ever taken there. Building the exact commit for both client and server and re-running gave 24.98 / 24.46 s: the code was identical, the host was stable, and the original figure was simply wrong.</p>
-<p>Two of those three initially looked like <strong>our code had regressed</strong>, which is the most expensive false positive available — it sends you bisecting a diff that contains nothing.</p>
+<p>Three of those four initially looked like <strong>our code was at fault</strong>, which is the most expensive false positive available — it sends you bisecting a diff that contains nothing.</p>
 <p>The discipline that survived contact:</p>
 <pre><code>1. A run is invalid unless exit == 0 AND landed entry count == corpus count.
    Report INVALID; never report a time.
@@ -697,7 +699,7 @@
 3. Alternate arms within one session.  Never compare across sessions.
 4. On any suspected regression, build both commits for BOTH ends and race them.
    Every single time we did this, the code was innocent.</code></pre>
-<p>Rule 4 has now fired three times with a 100% false-positive rate on the code.</p>
+<p>Rule 4 has now fired four times with a 100% false-positive rate on the code.</p>
 <hr>
 <h2 id="isolating-the-os-with-wsl2">Isolating the OS with WSL2</h2>
 <p><code>docs/OS.md</code> carried a standing claim that &quot;the OS is worth ~6×&quot;, derived from a 7900X under Windows doing 1,099 files/s against 6,046 on Linux. That comparison crosses machine, kernel, filesystem and network simultaneously — it is not an OS measurement, it is a <em>fleet</em> measurement.</p>
@@ -912,7 +914,7 @@ apply.collect(limit, |id| { acks_unflushed = true; self.ack_buffered(writer, id,
 <p>The experiment that would separate &quot;NTFS&quot; from &quot;the Windows I/O stack&quot; is NTFS vs ReFS on the same box, via a Dev Drive. <strong>We deliberately did not run it</strong>: Dev Drives get different antivirus treatment by default, which reintroduces exactly the confound we spent a day eliminating, and no engineering decision currently depends on the answer — the size ladder already tells us the cost is per-creation, which is the actionable part.</p>
 <hr>
 <h2 id="roadmap">Roadmap</h2>
-<p><strong>A real bug first.</strong> The Pi sends fine but fails partway through <em>receiving</em> 109,615 files, with the SSH connection timing out — before and after a reboot, while healthy on every other metric. It is the only 3 GB host, and the receiver now spawns a worker pool. That correlation is strong enough that we would treat it as a memory-pressure defect in the apply path rather than a flaky machine.</p>
+<p><strong>The Pi &quot;bug&quot; was ours.</strong> What looked like a receiver defect was a stale IP in the benchmark harness after a DHCP reassignment. With that fixed the Pi is the <em>fastest</em> receiver measured — 7.45 s from a 7950X sender, against 8.46 s for the 7950X itself. Nothing to fix in the tool; one lesson for the harness, which now resolves every host by name.</p>
 <p><strong>Attack the SSH ceiling.</strong> 23% off the top, single-threaded cipher, and it is the largest identified unaddressed loss. Options: <code>ControlMaster</code> multiplexing, cipher selection per host (the Pi has no AES acceleration), or moving the data plane off SSH entirely for the v2 daemon.</p>
 <p><strong>2.5 GbE point-to-point, then re-derive the knee.</strong> The desktop already has a 2.5 GbE NIC negotiated down to 1 Gb. A USB-C adapter and a direct cable is ~£25 and no switch. The goal is not throughput — it is to re-measure the 5.3 ms RTT without the USB NIC, because <code>MAX_PIPELINED_FRAMES = 2048</code> was tuned to that number and may be fitted to an artifact.</p>
 <p><strong>Corpus coverage.</strong> Three corpora, and congress compresses 4.2×, which flatters every wire-bytes figure. Incompressible small files and <code>node_modules</code>-shaped trees are the obvious gaps.</p>
@@ -929,8 +931,8 @@ apply.collect(limit, |id| { acks_unflushed = true; self.ack_buffered(writer, id,
     <!-- Statusbar -->
     <footer class="statusbar">
       <span class="status-saved">● rendered</span>
-      <span>496 lines</span>
-      <span>3,444 words</span>
+      <span>509 lines</span>
+      <span>3,580 words</span>
       <div style="flex: 1;"></div>
       <span>Markdown</span>
       <span>UTF-8</span>
@@ -979,7 +981,7 @@ count × worker count × link. You cannot sample it uniformly, and an unprincipl
 sample produces numbers that disagree for reasons you cannot attribute.
 
 That is the boring problem. The interesting problem is that **the confounds are
-silent**. Three results we recorded as fact and later had to retract:
+silent**. Four results we recorded as fact and later had to retract:
 
 **A 2.5× &quot;warmup effect&quot; that did not exist.** WSL runs were coming in at a
 suspiciously consistent 7.85 s. We had run them as `xs … -q &gt;/dev/null 2&gt;&amp;1`
@@ -993,13 +995,26 @@ was arithmetic: the same runs implied 513 MB/s over a gigabit link.
 one host fell to 1.7 MB/s against an 86.5 MB/s baseline. Every cell collected in
 that window looked like a plausible slowdown. A router reboot restored it.
 
+**A stale IP address in our own harness.** The Raspberry Pi appeared unable to
+*receive* a large transfer — it failed partway through with an SSH timeout,
+before and after a reboot, while sending perfectly and looking healthy on every
+other metric. We wrote that up as a probable memory-pressure defect in the
+receiver&#x27;s worker pool, since it is the only 3 GB host.
+
+It was nothing of the kind. The router reboot had moved the Pi from `.218` to
+`.217` by DHCP, and the benchmark script had the old address hardcoded. Every
+&quot;failure&quot; was our harness dialling a dead host. Once it resolved by name
+instead, the Pi received 109,615 files in **8.9 s** — the fastest receiver in
+the fleet — across four consecutive runs plus a killed-client test that
+confirmed the server exits cleanly rather than orphaning processes.
+
 **A baseline that never reproduced.** One host measured 14.4 s for work that
 consistently took 24–26 s afterwards. We first wrote this up as *host drift* —
 which would taint every number ever taken there. Building the exact commit for
 both client and server and re-running gave 24.98 / 24.46 s: the code was
 identical, the host was stable, and the original figure was simply wrong.
 
-Two of those three initially looked like **our code had regressed**, which is the
+Three of those four initially looked like **our code was at fault**, which is the
 most expensive false positive available — it sends you bisecting a diff that
 contains nothing.
 
@@ -1015,7 +1030,7 @@ The discipline that survived contact:
    Every single time we did this, the code was innocent.
 ```
 
-Rule 4 has now fired three times with a 100% false-positive rate on the code.
+Rule 4 has now fired four times with a 100% false-positive rate on the code.
 
 ---
 
@@ -1387,11 +1402,11 @@ cost is per-creation, which is the actionable part.
 
 ## Roadmap
 
-**A real bug first.** The Pi sends fine but fails partway through *receiving*
-109,615 files, with the SSH connection timing out — before and after a reboot,
-while healthy on every other metric. It is the only 3 GB host, and the receiver
-now spawns a worker pool. That correlation is strong enough that we would treat
-it as a memory-pressure defect in the apply path rather than a flaky machine.
+**The Pi &quot;bug&quot; was ours.** What looked like a receiver defect was a stale IP
+in the benchmark harness after a DHCP reassignment. With that fixed the Pi is
+the *fastest* receiver measured — 7.45 s from a 7950X sender, against 8.46 s
+for the 7950X itself. Nothing to fix in the tool; one lesson for the harness,
+which now resolves every host by name.
 
 **Attack the SSH ceiling.** 23% off the top, single-threaded cipher, and it is
 the largest identified unaddressed loss. Options: `ControlMaster` multiplexing,

@@ -654,8 +654,9 @@
 <li>a receiver that was &quot;2.5× faster&quot; — the runs had <strong>silently failed</strong>, and the tool printed a plausible time anyway</li>
 <li>a whole benchmark matrix taken while the <strong>house network had degraded</strong> to 2% of its normal speed</li>
 <li>a baseline that was 1.8× faster than anything we could reproduce afterwards, on the same machine with the same code</li>
+<li>a receiver that &quot;could not receive&quot; — our benchmark script had its IP hardcoded, and DHCP had moved it</li>
 </ul>
-<p>Every one of those looked like a real result at the time. Two of them looked specifically like <em>our code had gotten slower</em>, which is the most expensive kind of false alarm because it sends you hunting through a diff.</p>
+<p>Every one of those looked like a real result at the time. Three of them looked specifically like <em>our code was at fault</em>, which is the most expensive kind of false alarm because it sends you hunting through a diff.</p>
 <p>What eventually worked was boring discipline:</p>
 <ol>
 <li><strong>Verify every run.</strong> Check the exit status <em>and</em> count the files that actually arrived. If the count is wrong, it is not a slow run, it is a failed run, and it must never be reported as a time.</li>
@@ -834,7 +835,7 @@
 <p>A reasonable next experiment would compare NTFS against ReFS on the same Windows machine, which would separate &quot;the filesystem&quot; from &quot;the Windows I/O stack&quot;. We have deliberately not done it: ReFS volumes get different antivirus treatment by default, which would reintroduce the confound we just spent effort eliminating, and no decision currently depends on the answer.</p>
 <hr>
 <h2 id="what-we-would-do-next">What we would do next</h2>
-<p><strong>Investigate a real bug first.</strong> The Raspberry Pi copies files <em>out</em> perfectly but fails partway through receiving 109,615 of them, with the connection timing out. It is the only machine here with 3 GB of memory, and the receiver now starts a pool of worker threads. That smells like a genuine defect rather than a flaky machine, and it is the only outright failure in the whole matrix.</p>
+<p><strong>The Pi &quot;bug&quot; was ours.</strong> What looked like a receiver defect was a stale IP in the benchmark harness after a DHCP reassignment. With that fixed the Pi is the <em>fastest</em> receiver measured. Nothing to fix in the tool; one lesson for the harness, which now resolves every host by name.</p>
 <p><strong>Get a faster link — but only afterwards.</strong> The tool runs at 58% of a gigabit cable, so a faster network would mostly measure SSH. The interesting version of this experiment is not &quot;is it faster&quot; but &quot;which ceilings move&quot; — a fixed per-operation cost will not improve with bandwidth, which is exactly how you tell the two apart. The desktop already has a 2.5 Gb port, so this costs about £25 and a cable rather than a new network.</p>
 <p><strong>Look at the encryption cost.</strong> SSH takes 23% off the top, and a single connection is a single-threaded cipher. That is the largest identified, unaddressed loss in the whole stack.</p>
 <p><strong>Widen the corpus.</strong> Everything here rests on three collections of files. The size ladder is a strong result precisely because it spans five orders of magnitude, but we would like to know what happens with incompressible data, or with the deep, wide directory trees that a <code>node_modules</code> folder produces.</p>
@@ -851,8 +852,8 @@
     <!-- Statusbar -->
     <footer class="statusbar">
       <span class="status-saved">● rendered</span>
-      <span>433 lines</span>
-      <span>2,889 words</span>
+      <span>434 lines</span>
+      <span>2,892 words</span>
       <div style="flex: 1;"></div>
       <span>Markdown</span>
       <span>UTF-8</span>
@@ -901,9 +902,11 @@ to throw away:
   of its normal speed
 - a baseline that was 1.8× faster than anything we could reproduce afterwards,
   on the same machine with the same code
+- a receiver that &quot;could not receive&quot; — our benchmark script had its IP
+  hardcoded, and DHCP had moved it
 
-Every one of those looked like a real result at the time. Two of them looked
-specifically like *our code had gotten slower*, which is the most expensive kind
+Every one of those looked like a real result at the time. Three of them looked
+specifically like *our code was at fault*, which is the most expensive kind
 of false alarm because it sends you hunting through a diff.
 
 What eventually worked was boring discipline:
@@ -1249,11 +1252,10 @@ and no decision currently depends on the answer.
 
 ## What we would do next
 
-**Investigate a real bug first.** The Raspberry Pi copies files *out* perfectly
-but fails partway through receiving 109,615 of them, with the connection timing
-out. It is the only machine here with 3 GB of memory, and the receiver now
-starts a pool of worker threads. That smells like a genuine defect rather than a
-flaky machine, and it is the only outright failure in the whole matrix.
+**The Pi &quot;bug&quot; was ours.** What looked like a receiver defect was a stale IP
+in the benchmark harness after a DHCP reassignment. With that fixed the Pi is
+the *fastest* receiver measured. Nothing to fix in the tool; one lesson for
+the harness, which now resolves every host by name.
 
 **Get a faster link — but only afterwards.** The tool runs at 58% of a gigabit
 cable, so a faster network would mostly measure SSH. The interesting version of

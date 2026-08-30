@@ -40,9 +40,11 @@ to throw away:
   of its normal speed
 - a baseline that was 1.8× faster than anything we could reproduce afterwards,
   on the same machine with the same code
+- a receiver that "could not receive" — our benchmark script had its IP
+  hardcoded, and DHCP had moved it
 
-Every one of those looked like a real result at the time. Two of them looked
-specifically like *our code had gotten slower*, which is the most expensive kind
+Every one of those looked like a real result at the time. Three of them looked
+specifically like *our code was at fault*, which is the most expensive kind
 of false alarm because it sends you hunting through a diff.
 
 What eventually worked was boring discipline:
@@ -388,11 +390,10 @@ and no decision currently depends on the answer.
 
 ## What we would do next
 
-**Investigate a real bug first.** The Raspberry Pi copies files *out* perfectly
-but fails partway through receiving 109,615 of them, with the connection timing
-out. It is the only machine here with 3 GB of memory, and the receiver now
-starts a pool of worker threads. That smells like a genuine defect rather than a
-flaky machine, and it is the only outright failure in the whole matrix.
+**The Pi "bug" was ours.** What looked like a receiver defect was a stale IP
+in the benchmark harness after a DHCP reassignment. With that fixed the Pi is
+the *fastest* receiver measured. Nothing to fix in the tool; one lesson for
+the harness, which now resolves every host by name.
 
 **Get a faster link — but only afterwards.** The tool runs at 58% of a gigabit
 cable, so a faster network would mostly measure SSH. The interesting version of

@@ -285,14 +285,25 @@ by the sender.** Small-file corpora are a receiver benchmark; large-byte corpora
 are a sender-and-link benchmark. It is why 4.26 (the receiver) beat 4.15 (the
 sender) on congress, and why the OS ratio collapses as files get bigger.
 
-### orion is excluded as a receiver
+### orion as a receiver: the failure was our harness
 
-It failed mid-transfer with `ssh: connect to host … port 22: Operation timed
-out` on congress, before and after a restart, while remaining healthy by every
-other measure — load 0.22, 62.2 MB/s link, correct binary, corpora intact. It
-sends fine. **Receiving 109,615 files is the specific thing it cannot do**,
-which is worth investigating on its own rather than working around: it is the
-only 3 GB host in the fleet, and 4.26 now spawns an apply pool on the receiver.
+It looked like the Pi could not *receive* a large transfer — mid-transfer
+`ssh: … Operation timed out`, before and after a restart, while sending fine.
+Filed as a probable memory-pressure defect in the apply pool, since it is the
+only 3 GB host.
+
+**It was a stale IP.** The router reboot moved orion from `.218` to `.217` by
+DHCP and the benchmark script had the old address hardcoded. Resolving by name
+instead, orion receives congress-100k in **8.9 s** across four consecutive runs,
+and a killed-client test confirmed the server exits cleanly rather than
+orphaning processes. It is the **fastest receiver in the fleet**:
+
+| sender → orion | congress | cb7 |
+|---|---:|---:|
+| freya (7950X) | **7.45, 7.57 s** | 75.81, 75.40 s |
+| macOS (M1 Max) | 9.34, 9.39 s | 103.24, 98.59 s |
+
+The harness now resolves every host by name.
 
 ### A caution this matrix earned
 

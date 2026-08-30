@@ -40,7 +40,7 @@ count × worker count × link. You cannot sample it uniformly, and an unprincipl
 sample produces numbers that disagree for reasons you cannot attribute.
 
 That is the boring problem. The interesting problem is that **the confounds are
-silent**. Three results we recorded as fact and later had to retract:
+silent**. Four results we recorded as fact and later had to retract:
 
 **A 2.5× "warmup effect" that did not exist.** WSL runs were coming in at a
 suspiciously consistent 7.85 s. We had run them as `xs … -q >/dev/null 2>&1`
@@ -54,13 +54,26 @@ was arithmetic: the same runs implied 513 MB/s over a gigabit link.
 one host fell to 1.7 MB/s against an 86.5 MB/s baseline. Every cell collected in
 that window looked like a plausible slowdown. A router reboot restored it.
 
+**A stale IP address in our own harness.** The Raspberry Pi appeared unable to
+*receive* a large transfer — it failed partway through with an SSH timeout,
+before and after a reboot, while sending perfectly and looking healthy on every
+other metric. We wrote that up as a probable memory-pressure defect in the
+receiver's worker pool, since it is the only 3 GB host.
+
+It was nothing of the kind. The router reboot had moved the Pi from `.218` to
+`.217` by DHCP, and the benchmark script had the old address hardcoded. Every
+"failure" was our harness dialling a dead host. Once it resolved by name
+instead, the Pi received 109,615 files in **8.9 s** — the fastest receiver in
+the fleet — across four consecutive runs plus a killed-client test that
+confirmed the server exits cleanly rather than orphaning processes.
+
 **A baseline that never reproduced.** One host measured 14.4 s for work that
 consistently took 24–26 s afterwards. We first wrote this up as *host drift* —
 which would taint every number ever taken there. Building the exact commit for
 both client and server and re-running gave 24.98 / 24.46 s: the code was
 identical, the host was stable, and the original figure was simply wrong.
 
-Two of those three initially looked like **our code had regressed**, which is the
+Three of those four initially looked like **our code was at fault**, which is the
 most expensive false positive available — it sends you bisecting a diff that
 contains nothing.
 
@@ -76,7 +89,7 @@ The discipline that survived contact:
    Every single time we did this, the code was innocent.
 ```
 
-Rule 4 has now fired three times with a 100% false-positive rate on the code.
+Rule 4 has now fired four times with a 100% false-positive rate on the code.
 
 ---
 
@@ -448,11 +461,11 @@ cost is per-creation, which is the actionable part.
 
 ## Roadmap
 
-**A real bug first.** The Pi sends fine but fails partway through *receiving*
-109,615 files, with the SSH connection timing out — before and after a reboot,
-while healthy on every other metric. It is the only 3 GB host, and the receiver
-now spawns a worker pool. That correlation is strong enough that we would treat
-it as a memory-pressure defect in the apply path rather than a flaky machine.
+**The Pi "bug" was ours.** What looked like a receiver defect was a stale IP
+in the benchmark harness after a DHCP reassignment. With that fixed the Pi is
+the *fastest* receiver measured — 7.45 s from a 7950X sender, against 8.46 s
+for the 7950X itself. Nothing to fix in the tool; one lesson for the harness,
+which now resolves every host by name.
 
 **Attack the SSH ceiling.** 23% off the top, single-threaded cipher, and it is
 the largest identified unaddressed loss. Options: `ControlMaster` multiplexing,
