@@ -729,8 +729,22 @@ conclusion that flips is recorded in `docs/STREAMS.md` / `docs/OS.md`.
 
 Angles, cheapest first:
 
-- **Quantify the tax**: same host pair, same corpus streamed over raw `nc` vs
-  through `ssh cat`. One afternoon; bounds every other item.
+- **Quantify the tax** — *partly measured 2026-08-30, Mac → freya, 1 GbE USB
+  adapter:*
+
+  | path | throughput | of link |
+  |---|---:|---:|
+  | 1 GbE practical ceiling | ~112 MB/s | 100% |
+  | `dd \| ssh 'cat >/dev/null'` | **86.5 MB/s** | 77% |
+  | xsync, 3.94 GiB in 7 large files | **64.9 MB/s** | 58% |
+
+  So SSH costs ~23% and xsync a further ~25% on top of it. Raw TCP is still
+  unmeasured: `nc` is not installed on freya, and a Python sender caps at
+  74.4 MB/s on its own, under-measuring the link. A proper raw-TCP figure needs
+  a real load generator, and would separate the USB adapter from SSH crypto.
+
+  **The USB NIC is a suspect in its own right** — it may also explain the 5.3 ms
+  in-session round trip measured in 4.15, which is very high for a LAN.
 - **Why 5.3 ms**: sshd channel windowing, Nagle on the sshd side, or packet
   scheduling. If it's windowing, larger `MAX_PIPELINED_FRAMES` compensates
   (already done) but a root fix may lower it for everyone.
@@ -1626,7 +1640,13 @@ hardware constant, and it lands somewhat below that figure.
 | freya (different box, native Linux) | 66.79 s | 60.3 |
 
 **The OS penalty disappears entirely on large files.** Everything lands within
-7%, which is link-bound, not platform-bound. So the honest headline is
+7% — but **not because the link is saturated**, which is what this first said.
+Measured on the same pair: a plain `dd | ssh 'cat >/dev/null'` stream moves
+**86.5 MB/s** (2 GB verified), against xsync's **64.9 MB/s**. The link is 1 GbE
+(a USB adapter, `1000baseT`), practical ceiling ~112 MB/s. So the convergence
+sits at **58% of the link and 75% of a plain SSH pipe**: the common ceiling is
+xsync's own large-file path plus SSH, not the network. That is ~25% of headroom
+on large files that nothing platform-specific is protecting. So the honest headline is
 **"the OS costs 4.66× on small files and nothing on large ones"** — a much more
 precise and more useful claim than "the OS is worth ~6×", and one that matches
 the mechanism: the penalty is per-file metadata cost, and large files amortise
