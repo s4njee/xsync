@@ -372,6 +372,43 @@ impl Sink {
     ///
     /// Returns an error for a non-directory entry, unsafe path, or filesystem
     /// failure.
+    /// Apply permission bits to one already-published path.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when the path cannot be resolved or its
+    /// permissions cannot be set.
+    pub fn apply_file_mode(&self, relative: &WirePath, mode: u32) -> Result<(), SinkError> {
+        let path = self.path_for(relative.clone())?;
+        set_permissions(&path, mode)
+    }
+
+    /// Apply permission bits to entries whose content is already correct.
+    ///
+    /// A `chmod` on the source changes nothing a content comparison can see, so
+    /// this repairs the drift without moving any data.
+    ///
+    /// # Errors
+    /// Returns [`SinkError`] when a destination path cannot be resolved or its
+    /// permissions cannot be set.
+    pub fn repair_metadata(&self, entries: &[FileEntry]) -> Result<usize, SinkError> {
+        let mut repaired = 0;
+        for entry in entries {
+            let path = self.path_for(entry.path.clone())?;
+            set_permissions(&path, entry.mode)?;
+            repaired += 1;
+        }
+        Ok(repaired)
+    }
+
+    /// Create all directories, including empty ones and on-demand parents.
+    ///
+    /// Directory mode and mtime are intentionally deferred to
+    /// [`Self::finish_directories`] so child creation cannot disturb them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-directory entry, unsafe path, or filesystem
+    /// failure.
     pub fn create_directories(&self, entries: &[FileEntry]) -> Result<(), SinkError> {
         for entry in entries {
             require_kind(entry, EntryKind::Directory, "directory")?;

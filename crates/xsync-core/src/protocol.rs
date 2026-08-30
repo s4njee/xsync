@@ -61,6 +61,14 @@ pub const CAP_VERSION_NEGOTIATION: u32 = 1 << 3;
 /// files than the user asked for.
 pub const CAP_FILTER_RULES: u32 = 1 << 4;
 
+/// Peer's permission bits are real Unix modes, not a portable projection.
+///
+/// `permission_mode` invents `0o755`/`0o644` on hosts without Unix permissions,
+/// so comparing an invented mode against a real one would classify every file
+/// as permanently drifted. Mode drift is only repaired when **both** ends
+/// advertise this.
+pub const CAP_UNIX_MODES: u32 = 1 << 5;
+
 /// Capability bits with a defined meaning in the current contract.
 pub const KNOWN_CAPABILITIES: u32 =
     CAP_DATA_ONLY | CAP_ZSTD | CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;

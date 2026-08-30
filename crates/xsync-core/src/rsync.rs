@@ -688,6 +688,7 @@ fn emit_finished<F: FnMut(LocalEvent)>(report: &LocalSyncReport, emit: &mut F) {
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
+        metadata_repaired: report.metadata_repaired,
         failed_entries: 0,
         deleted_entries: 0,
         warnings: 0,

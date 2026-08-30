@@ -217,6 +217,9 @@ pub enum LocalEvent {
         transferred_bytes: u64,
         /// Number of unchanged files skipped.
         skipped_files: usize,
+        /// Number of entries whose permission bits were repaired without
+        /// moving any data.
+        metadata_repaired: usize,
         /// Number of entries that failed.
         failed_entries: usize,
         /// Number of extraneous entries deleted.
@@ -337,6 +340,8 @@ pub struct LocalSyncReport {
     pub wire_bytes: u64,
     /// Number of unchanged files skipped.
     pub skipped_files: usize,
+    /// Number of entries whose permission bits were repaired without moving data.
+    pub metadata_repaired: usize,
     /// Number of entries that failed.
     pub failed_entries: usize,
     /// Number of warnings emitted.
@@ -669,6 +674,20 @@ where
             name: "metadata",
             started: true,
         });
+        // Mode-only drift: content already matches, so nothing is retransferred.
+        // Files first, then directories, so a directory made read-only does not
+        // block repairs to its children.
+        for entries in [&plan.files.metadata, &plan.directories.metadata] {
+            match destination_sink.repair_metadata(entries) {
+                Ok(count) => report.metadata_repaired += count,
+                Err(error) => record_failure(
+                    &mut report,
+                    &mut emit,
+                    String::from("<metadata>"),
+                    error.to_string(),
+                ),
+            }
+        }
         if let Some(root_entry) = source_root_entry {
             if let Err(error) = destination_sink.finish_root_directory(&root_entry) {
                 record_failure(&mut report, &mut emit, String::from("."), error.to_string());
@@ -698,6 +717,7 @@ where
         file_clones: report.file_clones,
         byte_copies: report.byte_copies,
         skipped_files: report.skipped_files,
+        metadata_repaired: report.metadata_repaired,
         failed_entries: report.failed_entries,
         deleted_entries: report.deleted_entries,
         warnings: report.warnings,
@@ -954,6 +974,7 @@ fn try_directory_fast_path(
         file_clones: report.file_clones,
         byte_copies: report.byte_copies,
         skipped_files: report.skipped_files,
+        metadata_repaired: report.metadata_repaired,
         failed_entries: report.failed_entries,
         deleted_entries: report.deleted_entries,
         warnings: report.warnings,

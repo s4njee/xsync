@@ -825,27 +825,48 @@ down. Suspected gaps that turned out to be covered — CI (matrix exists in
 `ci.yml`), protocol fuzzing (`fuzz/fuzz_targets/protocol.rs`), read failures
 silently dropped (they emit `Failed` and count) — are deliberately absent.
 
-### 4.19 — A `chmod` never syncs: mode is not part of change detection
+### 4.19 — A `chmod` never syncs *(fixed 2026-08-30)*
 
-- [ ] **Correctness gap, reproduced.** `metadata_matches` (`planner.rs:697`)
-  compares kind, size, and mtime — never mode. Repro: sync a file, `chmod 600`
-  the source, preserve its mtime, sync again → destination stays 644 and the
-  run reports nothing to do. `rsync -a` repairs this; xsync's archive-like
-  defaults claim permission preservation and silently don't deliver it for
-  drift after the initial copy.
+- [x] `metadata_matches` compared kind, size and mtime, never mode. A `chmod` on
+  the source changed nothing a content comparison could see, so the destination
+  kept the old permissions forever and the run cheerfully reported "1 skipped".
 
-**AC**
+**Design.** The planner gained a `Difference` verdict — `None` / `ModeOnly` /
+`Content` — and a `Classification::MetadataOnly` feeding a new
+`EntryPlan::metadata` bucket. Mode-only drift is repaired with
+`MetadataOperation::SetFile`, which already existed on the wire and now carries
+the mode as well as the mtime, so **no content is retransferred**.
 
-- Mode-only drift is detected on Unix-to-Unix syncs and repaired with a
-  **metadata-only operation**, not a content retransfer.
-- Windows endpoints are exempt where modes are synthesized (`permission_mode`
-  invents 0o755/0o644): comparing a synthesized mode to a real one would make
-  every file perpetually "changed". The synthesized-mode case must classify
-  as unchanged.
-- `--checksum` mode gets the same repair — content hash match must not skip
-  the mode comparison.
-- Ownership drift is explicitly out of scope until 4.5 lands it in the index
-  encoding; the story is modes only.
+**The trap this had to avoid.** `permission_mode` invents `0o755`/`0o644` on
+hosts without Unix permissions. Comparing an invented mode against a real one
+would classify every file as permanently drifted and re-chmod the whole tree on
+every run — worse than the bug. A new `CAP_UNIX_MODES` capability gates the
+comparison: modes are compared only when the local host is Unix **and** the peer
+advertises real modes.
+
+**Verified**
+
+| case | result |
+|---|---|
+| local → local, file and directory | `600` / `700` applied, **0 bytes transferred**, 2 mode-repaired |
+| Mac → Linux over SSH | `600` / `700` applied, 0 bytes, 1 mode-repaired |
+| third run, both routes | clean no-op, 0 repaired |
+| Mac → **Windows**, three consecutive pushes | 0 mode-repaired every time — **no churn from synthesized modes** |
+
+Four planner tests pin the classification, including the synthesized-mode
+exemption, symlinks (whose permission bits are not portably settable, so drift
+there is unrepairable and reporting it would be noise), and the rule that a
+content change outranks a mode change.
+
+**Reported, not silent**: the summary line and the JSON `finished` event carry
+`metadata_repaired`.
+
+**Noticed in passing, not fixed.** Directory *sizes* differ across platforms
+(macOS reports 96 where Linux reports 4096), so on a cross-platform transfer
+directories always classify as `changed` rather than `unchanged`. Harmless today
+— the directory metadata sweep runs over every directory regardless — but it
+means the mode-repair count under-reports directories on cross-platform runs,
+and any future work that trusts `directories.unchanged` should know.
 
 ### 4.20 — Partial failure exits 0
 

@@ -40,7 +40,7 @@ use crate::protocol::{
     common_capabilities, encode_frame, encode_frame_with_compression, negotiate_compression,
     negotiate_protocol_version, ByteRange, CompressionMode, EntryRecord, FrameDecoder, Message,
     MetadataOperation, ProtocolError, Role, CAP_BROWSE_V2, CAP_FILTER_RULES,
-    CAP_VERSION_NEGOTIATION, CAP_ZSTD,
+    CAP_UNIX_MODES, CAP_VERSION_NEGOTIATION, CAP_ZSTD,
     DEFAULT_UNACKNOWLEDGED_WINDOW, MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
 };
 use crate::protocol_v2::{self, V2CodecError, V2Frame, V2Message};
@@ -1168,7 +1168,10 @@ impl Server {
             journal: None,
             compression: CompressionMode::None,
             compression_level: 3,
-            capabilities: CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES,
+            capabilities: CAP_ZSTD
+                | CAP_VERSION_NEGOTIATION
+                | CAP_FILTER_RULES
+                | if cfg!(unix) { CAP_UNIX_MODES } else { 0 },
         }
     }
 
@@ -2487,6 +2490,10 @@ impl Server {
                             let dest_file = sink.path_for(&rel_path)?;
                             let time = FileTime::from_system_time(nanos_to_system_time(mtime_ns));
                             set_file_mtime(&dest_file, time)?;
+                            // Carries the mode too, which is the whole point of
+                            // a metadata-only repair: a chmod on the source
+                            // changes nothing a content comparison can see.
+                            sink.apply_file_mode(&rel_path, mode)?;
                         }
                         MetadataOperation::SetDirectory => {
                             if rel_path.is_empty() {
@@ -3537,7 +3544,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     });
 
     // 1. Send Handshake (Client is Source).
-    let local_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES;
+    let local_capabilities = CAP_ZSTD
+        | CAP_VERSION_NEGOTIATION
+        | CAP_FILTER_RULES
+        | if cfg!(unix) { CAP_UNIX_MODES } else { 0 };
     let handshake = Message::Handshake {
         role: Role::Source,
         capabilities: local_capabilities,
@@ -3762,7 +3772,12 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         name: "plan",
         started: true,
     });
-    let plan = try_plan_with_fingerprint(mapped_source, dest_index, options.checksum)?;
+    let plan = try_plan_with_fingerprint(
+        mapped_source,
+        dest_index,
+        options.checksum,
+        modes_comparable(remote_capabilities),
+    )?;
     // The push source is local, so the same sparse inspection applies: a remote
     // destination will be asked to hold the apparent size, not the allocated one.
     let dropped;
@@ -4227,7 +4242,18 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             .iter()
             .chain(&plan.directories.changed)
             .chain(&plan.directories.unchanged)
+            .chain(&plan.directories.metadata)
             .collect();
+        report.metadata_repaired += send_metadata_repairs(
+            &mut writer,
+            &mut reader,
+            &mut decoder,
+            &plan.files.metadata,
+            &mut alloc_id,
+        )?;
+        // Drifted directories are repaired by the SetDirectory sweep below, but
+        // they are still repairs and belong in the count.
+        report.metadata_repaired += plan.directories.metadata.len();
         dirs_to_finish.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
         let mut pending = 0usize;
         for dir in dirs_to_finish {
@@ -4334,6 +4360,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
+        metadata_repaired: report.metadata_repaired,
         failed_entries: report.failed_entries,
         deleted_entries: report.deleted_entries,
         warnings: report.warnings,
@@ -4394,7 +4421,10 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     // 1. Send Handshake (Client is Sink).
     let job_id = session_job_id(src_path, dest_path.to_string_lossy().as_ref());
     let resume_journal = crate::journal::ResumeJournal::new(&job_id)?;
-    let local_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES;
+    let local_capabilities = CAP_ZSTD
+        | CAP_VERSION_NEGOTIATION
+        | CAP_FILTER_RULES
+        | if cfg!(unix) { CAP_UNIX_MODES } else { 0 };
     let handshake = Message::Handshake {
         role: Role::Sink,
         capabilities: local_capabilities,
@@ -4620,7 +4650,12 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         &mut emit,
     )
     .map_err(|error| ServerError::PathCollision(error.to_string()))?;
-    let mut plan = try_plan_with_fingerprint(mapped_source, dest_index, true)?;
+    let mut plan = try_plan_with_fingerprint(
+        mapped_source,
+        dest_index,
+        true,
+        modes_comparable(remote_capabilities),
+    )?;
     // A content-identical file at another destination path is a rename, not a
     // new transfer. Apply the local rename before the transfer phase and leave
     // the old name out of the destination tree without reading remote bytes.
@@ -5134,9 +5169,11 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
             .iter()
             .chain(&plan.directories.changed)
             .chain(&plan.directories.unchanged)
+            .chain(&plan.directories.metadata)
             .cloned()
             .collect();
         sink.finish_directories(&dirs_to_finish)?;
+        report.metadata_repaired += sink.repair_metadata(&plan.files.metadata)?;
 
         if let Some(ref root_entry) = source_root_entry {
             sink.finish_root_directory(root_entry)?;
@@ -5225,6 +5262,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
+        metadata_repaired: report.metadata_repaired,
         failed_entries: report.failed_entries,
         deleted_entries: report.deleted_entries,
         warnings: report.warnings,
@@ -5282,6 +5320,50 @@ fn filter_from_wire(
     crate::filter::from_exclude_patterns(&patterns).map_err(|error| {
         ServerError::FilterUnrepresentable(format!("peer sent an unusable exclude pattern: {error}"))
     })
+}
+
+/// Send mode-only repairs for files whose content already matches.
+///
+/// `SetFile` carries the mode, so no data moves. Repaired paths were never
+/// transferred, so they do not collide with the receiver's duplicate check.
+fn send_metadata_repairs<R: Read, W: Write>(
+    writer: &mut W,
+    reader: &mut R,
+    decoder: &mut FrameDecoder,
+    entries: &[FileEntry],
+    next_id: &mut dyn FnMut() -> u64,
+) -> Result<usize, ServerError> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut pending = 0usize;
+    for entry in entries {
+        let message = Message::Metadata {
+            operation: MetadataOperation::SetFile,
+            path: entry.path.as_bytes().to_vec(),
+            target: Vec::new(),
+            mode: entry.mode,
+            mtime_ns: system_time_to_nanos(entry.mtime),
+        };
+        let id = next_id();
+        writer.write_all(&encode_frame(id, &message)?)?;
+        pending += 1;
+        if pending >= MAX_PIPELINED_FRAMES {
+            writer.flush()?;
+            drain_acks(decoder, reader, &mut pending, MAX_PIPELINED_FRAMES / 2)?;
+        }
+    }
+    writer.flush()?;
+    drain_acks(decoder, reader, &mut pending, 0)?;
+    Ok(entries.len())
+}
+
+/// Whether permission bits may be compared against this peer.
+///
+/// Both ends must have real Unix modes. Either side synthesizing them makes
+/// every file look permanently drifted, so the comparison is simply skipped.
+const fn modes_comparable(remote_capabilities: u32) -> bool {
+    cfg!(unix) && (remote_capabilities & CAP_UNIX_MODES != 0)
 }
 
 /// The filter this client applies to its own scans.
@@ -5633,7 +5715,10 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
     // meant it negotiated no compression and could not represent filter rules,
     // which silently emptied the destination index whenever an include rule was
     // in play -- every file then looked new and was re-sent on every run.
-    let control_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES;
+    let control_capabilities = CAP_ZSTD
+        | CAP_VERSION_NEGOTIATION
+        | CAP_FILTER_RULES
+        | if cfg!(unix) { CAP_UNIX_MODES } else { 0 };
     write_frame(
         &mut cwriter,
         calloc(),
@@ -5788,7 +5873,12 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             mapped.push(entry);
         }
     }
-    let plan = try_plan_with_fingerprint(mapped, dest_index, options.checksum)?;
+    let plan = try_plan_with_fingerprint(
+        mapped,
+        dest_index,
+        options.checksum,
+        modes_comparable(control_remote_capabilities),
+    )?;
 
     let mut report = LocalSyncReport {
         local_workers: options.local_workers,
@@ -5852,6 +5942,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             transferred_files: 0,
             transferred_bytes: 0,
             skipped_files: report.skipped_files,
+            metadata_repaired: report.metadata_repaired,
             failed_entries: 0,
             deleted_entries: 0,
             warnings: 0,
@@ -6193,6 +6284,15 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             expect_ack(&mut cdec, &mut creader)?;
         }
 
+        report.metadata_repaired += send_metadata_repairs(
+            &mut cwriter,
+            &mut creader,
+            &mut cdec,
+            &plan.files.metadata,
+            &mut calloc,
+        )?;
+        report.metadata_repaired += plan.directories.metadata.len();
+
         // Finish directories deepest-first, then the root directory.
         let mut dirs: Vec<_> = plan
             .directories
@@ -6200,6 +6300,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             .iter()
             .chain(&plan.directories.changed)
             .chain(&plan.directories.unchanged)
+            .chain(&plan.directories.metadata)
             .collect();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.path.len()));
         // Pipelined for the same reason as the creation pass above: one ack per
@@ -6335,6 +6436,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
         skipped_files: report.skipped_files,
+        metadata_repaired: report.metadata_repaired,
         failed_entries: report.failed_entries,
         deleted_entries: report.deleted_entries,
         warnings: report.warnings,

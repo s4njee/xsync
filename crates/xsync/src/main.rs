@@ -1321,6 +1321,7 @@ impl ProgressRenderer {
         transferred_bytes: u64,
         wire_bytes: u64,
         skipped_files: usize,
+        metadata_repaired: usize,
         deleted_entries: usize,
         failed_entries: usize,
         partial_failure: bool,
@@ -1329,7 +1330,7 @@ impl ProgressRenderer {
             let elapsed = self.transfer_elapsed();
             let rate = transferred_bytes as f64 / elapsed / 1024.0 / 1024.0;
             println!(
-                "summary: {transferred_files} transferred, {skipped_files} skipped, {deleted_entries} deleted, {failed_entries} failed | {transferred_bytes} logical, {wire_bytes} wire bytes | elapsed: {:.2}s | throughput: {:.2} MiB/s | verification: {}",
+                "summary: {transferred_files} transferred, {skipped_files} skipped, {metadata_repaired} mode-repaired, {deleted_entries} deleted, {failed_entries} failed | {transferred_bytes} logical, {wire_bytes} wire bytes | elapsed: {:.2}s | throughput: {:.2} MiB/s | verification: {}",
                 elapsed,
                 rate,
                 if partial_failure {
@@ -1543,6 +1544,7 @@ fn render_event(
             transferred_bytes,
             wire_bytes,
             skipped_files,
+            metadata_repaired,
             failed_entries,
             partial_failure,
             ..
@@ -1553,6 +1555,7 @@ fn render_event(
                 *transferred_bytes,
                 *wire_bytes,
                 *skipped_files,
+                *metadata_repaired,
                 progress.deleted_entries,
                 *failed_entries,
                 *partial_failure,
@@ -1613,6 +1616,7 @@ fn render_event(
             physical_bytes,
             wire_bytes,
             skipped_files,
+            metadata_repaired,
             deleted_entries,
             failed_entries,
             local_workers,
@@ -1622,7 +1626,7 @@ fn render_event(
             checkpoint_bytes,
             ..
         } => println!(
-            "finished: {transferred_files} transferred ({transferred_bytes} logical, {physical_bytes} physical, {wire_bytes} wire bytes), {skipped_files} skipped, {deleted_entries} deleted, {failed_entries} failed, workers {local_workers}, resume: {restarted_files} restarted, {resumed_bytes} resumed, {checkpoint_bytes} checkpointed{}",
+            "finished: {transferred_files} transferred ({transferred_bytes} logical, {physical_bytes} physical, {wire_bytes} wire bytes), {skipped_files} skipped, {metadata_repaired} mode-repaired, {deleted_entries} deleted, {failed_entries} failed, workers {local_workers}, resume: {restarted_files} restarted, {resumed_bytes} resumed, {checkpoint_bytes} checkpointed{}",
             if partial_failure {
                 ", partial failure"
             } else {
@@ -1794,6 +1798,7 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             physical_bytes,
             wire_bytes,
             skipped_files,
+            metadata_repaired,
             failed_entries,
             deleted_entries,
             warnings,
@@ -1816,6 +1821,7 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "physical_bytes": physical_bytes,
             "wire_bytes": wire_bytes,
             "skipped_files": skipped_files,
+            "metadata_repaired": metadata_repaired,
             "failed_entries": failed_entries,
             "deleted_entries": deleted_entries,
             "warnings": warnings,

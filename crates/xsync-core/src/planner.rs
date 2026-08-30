@@ -465,7 +465,7 @@ pub fn try_plan(
     source_entries: impl IntoIterator<Item = FileEntry>,
     destination: DestinationIndex,
 ) -> Result<Plan, PlannerError> {
-    try_plan_with_fingerprint(source_entries, destination, false)
+    try_plan_with_fingerprint(source_entries, destination, false, cfg!(unix))
 }
 
 /// Classify entries using the content fingerprint when both sides provide one.
@@ -477,6 +477,7 @@ pub fn try_plan_with_fingerprint(
     source_entries: impl IntoIterator<Item = FileEntry>,
     destination: DestinationIndex,
     compare_fingerprint: bool,
+    compare_modes: bool,
 ) -> Result<Plan, PlannerError> {
     let config = destination.config();
     let mut source_spool = PlanningSpool::with_config(IndexConfig {
@@ -488,7 +489,7 @@ pub fn try_plan_with_fingerprint(
     for entry in source_entries {
         source_spool.push(entry)?;
     }
-    try_plan_spooled_with_fingerprint(source_spool, destination, compare_fingerprint)
+    try_plan_spooled_with_fingerprint(source_spool, destination, compare_fingerprint, compare_modes)
 }
 
 /// Classify a source spool after both source and destination discovery have
@@ -501,13 +502,14 @@ pub fn try_plan_spooled(
     source_spool: PlanningSpool,
     destination: DestinationIndex,
 ) -> Result<Plan, PlannerError> {
-    try_plan_spooled_with_fingerprint(source_spool, destination, false)
+    try_plan_spooled_with_fingerprint(source_spool, destination, false, cfg!(unix))
 }
 
 fn try_plan_spooled_with_fingerprint(
     source_spool: PlanningSpool,
     destination: DestinationIndex,
     compare_fingerprint: bool,
+    compare_modes: bool,
 ) -> Result<Plan, PlannerError> {
     let mut source = source_spool.finish()?;
     let mut destination = destination.finish()?;
@@ -516,6 +518,7 @@ fn try_plan_spooled_with_fingerprint(
         &mut source,
         &mut destination,
         compare_fingerprint,
+        compare_modes,
         |entry, action| {
             push_classification(&mut plan, entry, action);
             Ok(())
@@ -535,6 +538,7 @@ fn try_plan_spooled_with_fingerprint(
 pub fn classify_stream(
     source_entries: impl IntoIterator<Item = FileEntry>,
     destination: DestinationIndex,
+    compare_modes: bool,
     mut callback: impl FnMut(FileEntry, Classification) -> Result<(), PlannerError>,
 ) -> Result<(), PlannerError> {
     let config = destination.config();
@@ -549,7 +553,7 @@ pub fn classify_stream(
     }
     let mut source = source_spool.finish()?;
     let mut destination = destination.finish()?;
-    classify_cursors(&mut source, &mut destination, false, |entry, action| {
+    classify_cursors(&mut source, &mut destination, false, compare_modes, |entry, action| {
         callback(entry, action)
     })
 }
@@ -563,6 +567,9 @@ pub enum Classification {
     Changed,
     /// The source and destination metadata match.
     Unchanged,
+    /// Content matches, but the permission bits differ and can be repaired
+    /// without moving any data.
+    MetadataOnly,
     /// The destination entry has no source counterpart.
     Extraneous,
 }
@@ -588,6 +595,7 @@ fn classify_cursors(
     source: &mut PlanningSource,
     destination: &mut SortedEntries,
     compare_fingerprint: bool,
+    compare_modes: bool,
     mut emit: impl FnMut(FileEntry, Classification) -> Result<(), PlannerError>,
 ) -> Result<(), PlannerError> {
     let mut source_entry = next_unique(source)?;
@@ -632,14 +640,15 @@ fn classify_cursors(
                         let destination_value = destination_entry
                             .take()
                             .expect("destination entry was matched as present");
-                        let classification = if metadata_matches(
+                        let classification = match difference(
                             &source_value,
                             &destination_value,
                             compare_fingerprint,
+                            compare_modes,
                         ) {
-                            Classification::Unchanged
-                        } else {
-                            Classification::Changed
+                            Difference::None => Classification::Unchanged,
+                            Difference::ModeOnly => Classification::MetadataOnly,
+                            Difference::Content => Classification::Changed,
                         };
                         emit(source_value, classification)?;
                         source_entry = next_unique(source)?;
@@ -661,6 +670,7 @@ fn push_classification(plan: &mut Plan, entry: FileEntry, classification: Classi
         Classification::New => entries.new.push(entry),
         Classification::Changed => entries.changed.push(entry),
         Classification::Unchanged => entries.unchanged.push(entry),
+        Classification::MetadataOnly => entries.metadata.push(entry),
         Classification::Extraneous => entries.extraneous.push(entry),
     }
 }
@@ -699,6 +709,40 @@ fn whole_seconds(time: SystemTime) -> i128 {
     }
 }
 
+/// How a source entry differs from the destination entry with the same path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Difference {
+    /// Nothing to do.
+    None,
+    /// Content is identical; only the permission bits drifted.
+    ModeOnly,
+    /// Kind, size, time or content differs.
+    Content,
+}
+
+/// Compare one pair, including permissions when both ends can represent them.
+///
+/// `compare_modes` is false whenever either endpoint synthesizes its mode —
+/// `permission_mode` invents `0o755`/`0o644` on non-Unix hosts, and comparing an
+/// invented mode with a real one would classify every file as drifted forever.
+fn difference(
+    source: &FileEntry,
+    destination: &FileEntry,
+    compare_fingerprint: bool,
+    compare_modes: bool,
+) -> Difference {
+    if !metadata_matches(source, destination, compare_fingerprint) {
+        return Difference::Content;
+    }
+    // Symlink permission bits are not portably settable, so drift on them is
+    // not repairable and reporting it would only produce noise.
+    let mode_bearing = matches!(source.kind, EntryKind::File | EntryKind::Directory);
+    if compare_modes && mode_bearing && source.mode != destination.mode {
+        return Difference::ModeOnly;
+    }
+    Difference::None
+}
+
 fn metadata_matches(
     source: &FileEntry,
     destination: &FileEntry,
@@ -726,6 +770,10 @@ pub struct EntryPlan {
     pub changed: Vec<FileEntry>,
     /// Entries with matching type, size, and modification time.
     pub unchanged: Vec<FileEntry>,
+    /// Entries whose content matches but whose permission bits drifted.
+    ///
+    /// Repaired with a metadata-only operation; no content is retransferred.
+    pub metadata: Vec<FileEntry>,
     /// Destination entries absent from the source.
     pub extraneous: Vec<FileEntry>,
 }
@@ -1475,6 +1523,67 @@ mod tests {
                 assert_eq!(decoded.fingerprint.unix, unix, "unix {unix:?}");
             }
         }
+    }
+
+    /// A chmod changes nothing a content comparison can see, so before this the
+    /// destination kept the old mode forever and the run reported "skipped".
+    #[test]
+    fn a_mode_only_change_is_classified_for_metadata_repair() {
+        let source = entry("a.txt", EntryKind::File, 10, 5);
+        let mut destination = entry("a.txt", EntryKind::File, 10, 5);
+        destination.mode = 0o600;
+
+        assert_eq!(
+            difference(&source, &destination, false, true),
+            Difference::ModeOnly
+        );
+        // Content is identical, so this must never become a retransfer.
+        assert_ne!(
+            difference(&source, &destination, false, true),
+            Difference::Content
+        );
+    }
+
+    /// A peer that synthesizes modes would otherwise report every file as
+    /// permanently drifted, re-chmod-ing the whole tree on every run.
+    #[test]
+    fn mode_drift_is_ignored_when_the_peer_cannot_represent_modes() {
+        let source = entry("a.txt", EntryKind::File, 10, 5);
+        let mut destination = entry("a.txt", EntryKind::File, 10, 5);
+        destination.mode = 0o644 | 0o111;
+
+        assert_eq!(
+            difference(&source, &destination, false, false),
+            Difference::None
+        );
+    }
+
+    /// Symlink permission bits are not portably settable, so drift on them is
+    /// not repairable and reporting it would be noise.
+    #[test]
+    fn symlink_mode_drift_is_not_reported() {
+        let source = entry("l", EntryKind::Symlink, 0, 5);
+        let mut destination = entry("l", EntryKind::Symlink, 0, 5);
+        destination.mode = 0o777;
+
+        assert_eq!(
+            difference(&source, &destination, false, true),
+            Difference::None
+        );
+    }
+
+    /// Content differences still win: a mode change on top of a size change is
+    /// a transfer, not a metadata repair.
+    #[test]
+    fn a_content_change_outranks_a_mode_change() {
+        let source = entry("a.txt", EntryKind::File, 20, 5);
+        let mut destination = entry("a.txt", EntryKind::File, 10, 5);
+        destination.mode = 0o600;
+
+        assert_eq!(
+            difference(&source, &destination, false, true),
+            Difference::Content
+        );
     }
 
     fn disk_config(root: &Path, budget: usize) -> IndexConfig {
