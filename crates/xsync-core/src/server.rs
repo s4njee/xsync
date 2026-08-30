@@ -2292,6 +2292,27 @@ impl Server {
     }
 
     /// Write an acknowledgement frame, flushing after use.
+    /// Acknowledge without flushing.
+    ///
+    /// Used where the caller controls the flush point — the apply pool
+    /// acknowledges in bursts, and flushing each one would restore the
+    /// per-file write syscall the pool exists to amortise.
+    fn ack_buffered<W: Write>(
+        &mut self,
+        writer: &mut W,
+        id: u64,
+        ack_type: u8,
+    ) -> Result<(), ServerError> {
+        let ack = Message::Ack {
+            acknowledged_id: id,
+            acknowledged_type: ack_type,
+        };
+        let msg_id = self.next_id();
+        let bytes = encode_frame(msg_id, &ack)?;
+        writer.write_all(&bytes)?;
+        Ok(())
+    }
+
     fn ack<W: Write>(&mut self, writer: &mut W, id: u64, ack_type: u8) -> Result<(), ServerError> {
         let ack = Message::Ack {
             acknowledged_id: id,
@@ -2396,8 +2417,14 @@ impl Server {
             }
         }
 
-        // Initialize sink.
-        let sink = Sink::new(&self.root)?;
+        // Initialize sink. Shared with the apply pool, which publishes files
+        // off the decode thread.
+        let sink = Arc::new(Sink::new(&self.root)?);
+        let mut apply = ApplyPool::new(&sink, paranoid, apply_worker_count());
+        // Acks are written buffered and flushed before this thread can block on
+        // input. The sender drains to zero at every batch boundary, so an
+        // unflushed acknowledgement there would deadlock both sides.
+        let mut acks_unflushed = false;
 
         // Map of upcoming file_id -> EntryRecord for small/medium and large files.
         let mut active_files: HashMap<u64, EntryRecord> = HashMap::new();
@@ -2407,6 +2434,10 @@ impl Server {
 
         // Process incoming transfer operations.
         loop {
+            if acks_unflushed {
+                writer.flush()?;
+                acks_unflushed = false;
+            }
             let frame = match self.decoder.read(reader) {
                 Ok(frame) => frame,
                 Err(ProtocolError::Read(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
@@ -2608,32 +2639,30 @@ impl Server {
                             &file_entry.path,
                             &mut self.seen_destinations,
                         )?;
-                        let hash = blake3::Hash::from_bytes(digest);
-                        sink.write_file_with_retry(
-                            &file_entry,
-                            &hash,
-                            |_attempt| Ok(data.clone()),
-                        )?;
-
-                        if paranoid {
-                            let committed_path = sink.path_for(&file_entry.path)?;
-                            let readback = fs::read(&committed_path)?;
-                            if blake3::hash(&readback) != hash {
-                                return Err(ServerError::Sink(SinkError::VerificationFailed {
-                                    path: file_entry.path.to_string(),
-                                    attempts: 2,
-                                }));
-                            }
-                        }
-
-                        let ack = Message::Ack {
-                            acknowledged_id: frame.message_id,
-                            acknowledged_type: 4, // FileSegment
+                        // Publishing is independent per file, so it happens on
+                        // the pool while this thread keeps decoding. The ack
+                        // still follows the commit, so the durability contract
+                        // is unchanged.
+                        apply.submit(ApplyJob {
+                            message_id: frame.message_id,
+                            entry: file_entry,
+                            hash: blake3::Hash::from_bytes(digest),
+                            data,
+                        })?;
+                        // Inside a batch, publishing overlaps decoding. At the
+                        // batch boundary it must not: the sender drains to zero
+                        // there, so anything still in flight would be an
+                        // acknowledgement it waits for and never receives.
+                        // `active_files` empties exactly when the batch is done.
+                        let limit = if active_files.is_empty() {
+                            0
+                        } else {
+                            apply.capacity()
                         };
-                        let msg_id = self.next_id();
-                        let bytes = encode_frame(msg_id, &ack)?;
-                        writer.write_all(&bytes)?;
-                        writer.flush()?;
+                        apply.collect(limit, |id| {
+                            acks_unflushed = true;
+                            self.ack_buffered(writer, id, 4)
+                        })?;
                     } else if let Some(file_entry) = large_files.get(&file_id) {
                         let hash = blake3::Hash::from_bytes(digest);
                         let length = data.len() as u64;
@@ -2875,6 +2904,13 @@ impl Server {
                     warnings,
                     failed,
                 } => {
+                    // Every file must be published before the counts are
+                    // reported, or the client is told about work still in
+                    // flight.
+                    apply.collect(0, |id| {
+                        acks_unflushed = true;
+                        self.ack_buffered(writer, id, 4)
+                    })?;
                     let ack = Message::Ack {
                         acknowledged_id: frame.message_id,
                         acknowledged_type: 10, // Stats
@@ -2906,6 +2942,12 @@ impl Server {
             }
         }
 
+        // Publish anything still in flight, then stop the workers.
+        apply.finish(|id| {
+            acks_unflushed = true;
+            self.ack_buffered(writer, id, 4)
+        })?;
+        writer.flush()?;
         Ok(())
     }
 
@@ -7255,6 +7297,140 @@ impl Drop for ConnectionPermit {
         *available += 1;
         self.gate.released.notify_one();
     }
+}
+
+/// How many threads publish received small files.
+///
+/// The receive loop must stay single-threaded — it decodes an ordered stream —
+/// but publishing a file (write temp, verify, set metadata, rename) is
+/// independent per file and was the serialized half of the transfer. Before
+/// this, a Raspberry Pi 5 received within 7% of a 7950X, which is what a
+/// one-thread apply path looks like.
+fn apply_worker_count() -> usize {
+    if let Ok(value) = std::env::var("XSYNC_APPLY_WORKERS") {
+        if let Ok(parsed) = value.parse::<usize>() {
+            return parsed.max(1);
+        }
+    }
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(8)
+}
+
+/// One received small file, ready to publish.
+struct ApplyJob {
+    message_id: u64,
+    entry: FileEntry,
+    hash: blake3::Hash,
+    data: Vec<u8>,
+}
+
+/// Publishes received files across a pool, preserving the ack-on-commit
+/// contract: a file is acknowledged only once it is durably renamed into place.
+///
+/// Acks may leave in a different order than the segments arrived. That is
+/// already safe — the sender's `drain_acks` counts acknowledgements and never
+/// matches them to ids.
+struct ApplyPool {
+    work: crossbeam_channel::Sender<ApplyJob>,
+    done: crossbeam_channel::Receiver<Result<u64, ServerError>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    in_flight: usize,
+    capacity: usize,
+}
+
+impl ApplyPool {
+    fn new(sink: &Arc<Sink>, paranoid: bool, workers: usize) -> Self {
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<ApplyJob>(workers * 4);
+        let (done_tx, done_rx) = crossbeam_channel::unbounded();
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let rx = work_rx.clone();
+            let tx = done_tx.clone();
+            let sink = Arc::clone(sink);
+            handles.push(std::thread::spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let outcome = publish_received_file(&sink, &job, paranoid);
+                    if tx.send(outcome.map(|()| job.message_id)).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        Self {
+            work: work_tx,
+            done: done_rx,
+            handles,
+            in_flight: 0,
+            capacity: workers * 8,
+        }
+    }
+
+    /// Hand a file to the pool, blocking if the queue is full.
+    fn submit(&mut self, job: ApplyJob) -> Result<(), ServerError> {
+        self.work.send(job).map_err(|_| {
+            ServerError::UnexpectedMessage("apply worker pool stopped early".to_owned())
+        })?;
+        self.in_flight += 1;
+        Ok(())
+    }
+
+    /// Collect finished files, blocking only when too many are outstanding.
+    fn collect<F>(&mut self, block_until: usize, mut ack: F) -> Result<(), ServerError>
+    where
+        F: FnMut(u64) -> Result<(), ServerError>,
+    {
+        while self.in_flight > block_until {
+            let done = self.done.recv().map_err(|_| {
+                ServerError::UnexpectedMessage("apply worker pool stopped early".to_owned())
+            })?;
+            self.in_flight -= 1;
+            ack(done?)?;
+        }
+        while let Ok(done) = self.done.try_recv() {
+            self.in_flight -= 1;
+            ack(done?)?;
+        }
+        Ok(())
+    }
+
+    /// Bound on outstanding work before `collect` blocks.
+    const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Drain everything and stop the workers.
+    fn finish<F>(mut self, ack: F) -> Result<(), ServerError>
+    where
+        F: FnMut(u64) -> Result<(), ServerError>,
+    {
+        self.collect(0, ack)?;
+        drop(self.work);
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+        Ok(())
+    }
+}
+
+/// Write, verify and publish one received file.
+fn publish_received_file(
+    sink: &Sink,
+    job: &ApplyJob,
+    paranoid: bool,
+) -> Result<(), ServerError> {
+    sink.write_file_with_retry(&job.entry, &job.hash, |_attempt| Ok(job.data.clone()))?;
+    if paranoid {
+        let committed = sink.path_for(&job.entry.path)?;
+        let readback = fs::read(&committed)?;
+        if blake3::hash(&readback) != job.hash {
+            return Err(ServerError::Sink(SinkError::VerificationFailed {
+                path: job.entry.path.to_string(),
+                attempts: 2,
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn spawn_server_child(

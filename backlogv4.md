@@ -1026,21 +1026,48 @@ harmful even at the connection level — stay harmful? Interlocks with the 4.14
 heuristic: if this works, the byte-share gate becomes wrong, and the heuristic
 should choose streams for small-file corpora too.
 
-### 4.26 — Receiver-side parallel apply
+### 4.26 — Receiver-side parallel apply *(done 2026-08-30)*
 
-- [ ] The server's receive loop decodes and applies **inline on one thread**:
-  verify hash, write temp, set metadata, rename, ack, next frame. During the
-  4.15 investigation the server sat at ~48% CPU while receiving — and a Pi 5
-  matched a 7950X, which is what a serialized apply path looks like. The
-  local path already has a pool; the server path does not.
+- [x] The receive loop decoded **and applied** on one thread. Decoding must stay
+  serial — it is an ordered stream — but publishing a file (write temp, verify,
+  set metadata, rename) is independent per file, and was the serialized half.
 
-**Research questions**: decode thread feeding a bounded worker pool of
-appliers — how do acks work when application is out of order (ack on verify
-vs ack on commit changes crash semantics)? What does the journal require?
-Measured ceiling of a single applier thread per filesystem (ext4 vs APFS vs
-NTFS — NTFS's 3.5× write-cost asymmetry makes this the most Windows-relevant
-performance story in the backlog). This is the other half of 4.15: sender
-overlap fixes the client, this fixes the server, and the two multiply.
+**Design.** An `ApplyPool` of `min(cores, 8)` threads shares the `Sink` behind an
+`Arc`; the decode thread does only the cheap, `&mut self` parts (batch-record
+lookup, path-uniqueness validation) and hands the rest to the pool.
+`XSYNC_APPLY_WORKERS` overrides the count for measurement.
+
+**The ack contract is unchanged, which is what makes it safe.** A file is still
+acknowledged only after it is durably renamed into place. Acks now leave out of
+order, and that was already safe: the sender's `drain_acks` counts
+acknowledgements and never matches them to ids.
+
+**The deadlock this had to avoid, found by a hanging test.** The sender drains
+to *zero* at every batch boundary. If the receiver blocks on the next read while
+files are still in flight, it is holding acknowledgements the sender is waiting
+for, and both sides stop. `active_files` empties exactly when a batch completes,
+so the receiver drains the pool fully at that point and overlaps freely within
+the batch. Acks are written buffered and flushed before the decode thread can
+ever block on input.
+
+**Measured — client held constant, server binary alternated, every run verified**
+
+| server | reps (s) | median | files/s | gain |
+|---|---|---:|---:|---|
+| freya, before | 14.17, 12.30, 12.36 | 12.36 | 8,867 | — |
+| freya, after | 8.69, 8.46, 8.33 | **8.46** | 12,961 | **1.46×** |
+| Windows, before | 90.25, 90.34 | 90.30 | 1,215 | — |
+| Windows, after | 55.75, 55.91 | **55.83** | 1,964 | **1.62×** |
+
+**Windows gains more, as the story predicted** — it is the receiver-bound
+platform, and unblocking the receiver is worth more there than on Linux.
+
+**4.15 and 4.26 multiply, as claimed.** congress-100k to freya has gone
+26.30 s → 12.80 s (4.15) → **8.46 s** (4.26): **3.11× end to end**.
+
+**Not addressed**: the same pool is not applied to `run_data_sink`, the
+multi-stream data path. Small files never travel that route (they ride the
+control session — see 4.25), so it moves no needle today.
 
 ### 4.27 — Syscall-level batching: io_uring and its cousins
 
