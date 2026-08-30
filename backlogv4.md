@@ -20,7 +20,7 @@ not by value. Anything marked *unverified* has been built but not proven.
 | Not yet measured | Anything above ~1 GbE; any x86 that is not Zen 4; XFS and btrfs; WiFi; BSD. See 4.18. WSL2 is enabled but has no distro — 4.47 |
 | Known-unverified code | None. Phase 2 is complete: 4.4 verified V3.22 on the wire, 4.5, 4.6 and 4.7 are landed and measured |
 | Recently invalidated | The v1 wire is not frozen. `wire_bytes` is not the bytes on the wire (4.44). The preflight's "frozen wire" comment blamed the wrong encoding (4.5). The ~1.3 s sequential-spawn cost did not reproduce (4.7) |
-| Measured but not yet trustworthy | 4.15's 1.86× on freya was taken under ~950% competing CPU. The ratio reproduced five times; the absolute figures did not match an idle run of equivalent code. See 4.49 |
+| Measured but not yet trustworthy | Nothing outstanding. 4.49 settled 4.15 at **2.15× idle**. Absolute figures on freya drift between sessions by ~1.7× for reasons not identified — compare only within a session, with alternating arms |
 
 **The result the next few phases exist to act on.** Small-file network sync is
 bound by neither endpoint: both sit near 50% CPU, and a Pi 5 receives within 7%
@@ -1565,61 +1565,75 @@ Setting `RUSTC` matters as much as calling `cargo.exe` by path: cargo finds
 `fsutil behavior set SymlinkEvaluation R2L:1`, is a system security setting and
 belongs to the operator.
 
-### 4.48 — Decompose the OS penalty on identical hardware
+### 4.48 — The OS penalty on identical hardware *(measured 2026-08-30; NTFS decomposition dropped)*
 
-- [ ] Answer the question `docs/OS.md` raises and cannot settle: **is Windows
-  slow because of NTFS metadata, or the Win32 layer, or both?**
+- [x] congress-100k pushed from the same Mac, same source tree, same binary, to
+  three destinations on **one machine** (7900X, one NVMe, one link):
 
-WSL supplies three paths that differ in exactly one thing at a time:
+| destination | userspace + filesystem | files/s | vs native Windows |
+|---|---|---:|---|
+| native Windows | Win32 + NTFS | 1,150 | — |
+| WSL2 | Linux + ext4 in a VHDX on the same NVMe | **5,565** | **4.84× faster** |
+| WSL2 `/mnt/c` | Linux + NTFS through the 9p bridge | ~32–37 | **~32× slower** |
 
-| path | userspace | filesystem | isolates |
+**Row 2 is the result worth keeping.** Every prior OS comparison in this project
+crossed machines, filesystems and kernels at once. This one holds CPU, disk,
+network and source constant and still finds **4.84×**, which is the first
+defensible version of `docs/OS.md`'s "the OS is worth ~6×".
+
+**Row 3 did not do what it was designed to do, as the original AC anticipated.**
+`/mnt/c` is 9p — a per-operation RPC protocol, not a filesystem driver — so at
+~32 files/s it measures the bridge and **cannot separate NTFS from the Win32
+layer**. It survives as practical guidance (*never sync into `/mnt/c`*; it is
+30× worse than doing the same work natively on Windows) and as nothing else.
+The full run was abandoned after two independent rate samples agreed (37.5 and
+31.6 files/s, ETA ~58 min): more precision on a number whose only use is "don't"
+was not worth an idle-host window on freya.
+
+**The NTFS-vs-Win32 decomposition is deliberately not pursued.** Holding
+userspace constant and varying the filesystem would need a Dev Drive (ReFS),
+which is confounded by Defender's performance-mode default on Dev Drives — a
+poor isolation. More decisively, nothing depends on the answer: the one story
+that might consume it, 4.26, is better served by implementing receiver-side
+parallel apply and measuring it on Windows directly than by inferring a
+mechanism first.
+
+**Still open**: medians rather than single runs for rows 1 and 2, and cb7 as a
+second corpus shape (congress is one file per directory, cb7 is 7.2, and
+directory-metadata cost is the suspected mechanism).
+
+### 4.49 — Re-measure 4.15 idle *(done 2026-08-30 — the stated hypothesis was wrong)*
+
+- [x] Idle freya (load 0.51, `xc` finished), congress-100k, alternating arms:
+
+| | rep 1 | rep 2 | files/s |
 |---|---|---|---|
-| native Windows | Win32 | NTFS | today's baseline |
-| WSL `~/` | Linux | ext4 in a VHDX on the same NVMe | Linux syscalls + Linux FS |
-| WSL `/mnt/c/` | Linux | NTFS via drvfs | Linux syscalls, Windows FS |
+| before 4.15 | 24.89 s | 24.69 s | 4,422 |
+| after 4.15 | 11.53 s | 11.54 s | **9,504** |
 
-**The third row is the decisive one.** If WSL-ext4 lands near native Linux and
-WSL-drvfs near native Windows, the penalty is the filesystem. If both WSL paths
-are fast, it is the Win32 layer. If drvfs is worse than native Windows, the
-bridge dominates and the row says nothing about NTFS — which is itself worth
-knowing before anyone quotes it.
+**4.15 is 2.15× on an idle host**, tighter than the 1.86× measured under load.
+The loaded figure *understated* the gain.
 
-**AC**
+**The hypothesis this story was filed on is false.** It assumed contention had
+inflated the *before* arm. It had not: idle `before` is 24.79 s against 24.88 s
+loaded — indistinguishable. So the 14.4 s recorded earlier in the cycle for
+"equivalent code" had some other cause.
 
-- congress-100k over SSH to all three paths, plus the existing native-Windows
-  and native-Linux numbers, medians with MAD, bracketed controls.
-- cb7 as a second shape, since congress is one file per directory and cb7 is
-  7.2 — directory-metadata cost is the suspected mechanism and the two corpora
-  disagree on it.
-- `docs/OS.md` gains the decomposition and either keeps or retires "the OS is
-  worth ~6×" with the mechanism named.
-- drvfs is reported as the bridge it is, not as "NTFS from Linux".
+**Chased and settled: the code is exonerated.** Building `bb5d6a06` — the exact
+pre-4.5 commit that produced 14.4 s — for **both** client and server and
+re-running gives **24.98 / 24.46 s**. 4.5, 4.6 and 4.7 therefore introduced no
+regression; the same commit is simply slower on this host today than it was this
+morning. ZFS fragmentation is ruled out (`FRAG 12%`, `CAP 7%`, unchanged), as is
+load. **The cause is unidentified and the 14.4 s figure is not reproducible by
+any version, including its own.** It should not be cited.
 
-**Consumers.** 4.26 (receiver-side parallel apply) wants NTFS-vs-ext4 write cost
-on one disk. 4.27 (io_uring) becomes testable on this hardware for the first
-time, since the WSL2 kernel supports it. 4.12 (Defender) gets a cleaner
-isolation, as Defender treats the VHDX and `/mnt/c` differently. 4.18 fills a
-matrix cell.
-
-### 4.49 — Re-measure 4.15 and the freya baseline on an idle host
-
-- [ ] The 4.15 A/B was run while freya was executing an unrelated job at ~950%
-  CPU. Five paired runs agreed, so the **1.86× ratio is reproducible**, but the
-  absolute figures are not the platform's: equivalent code measured 14.4 s on an
-  idle freya earlier in the cycle against 24.88 s under load.
-
-Until this is redone, **1.86× must not be quoted as the platform number** — the
-honest statement today is "1.86× under contention, 1.15× on an idle Windows
-receiver, unmeasured idle on Linux".
-
-**AC**
-
-- congress-100k, Mac → freya, both arms, alternating, with the host confirmed
-  idle (`uptime` and top process recorded alongside the numbers).
-- If the idle ratio differs materially from 1.86×, `BENCHMARKv2.md` and the
-  4.15 entry are corrected rather than annotated.
-- Load state is recorded for every future cross-host benchmark, since this is
-  the second measurement this cycle contaminated by something outside the tool.
+**The methodology lesson, which is the durable part.** A single-arm number from
+hours earlier was treated as a baseline and produced a false regression scare.
+Only the interleaved A/B — same session, alternating arms — survived contact
+with the host's own drift. 4.21's harness must make bracketed controls the
+default rather than something remembered, and cross-session absolute
+comparisons should be refused outright unless the host state is captured
+alongside them.
 
 ## Phase 4 — Carried forward
 
