@@ -1735,6 +1735,56 @@ default rather than something remembered, and cross-session absolute
 comparisons should be refused outright unless the host state is captured
 alongside them.
 
+### 4.50 — A 2.5 GbE point-to-point link, and what it is for
+
+- [ ] Every cross-host number in this project was taken over a 1 GbE link
+  reached through a **USB dongle on the Mac**, and nothing currently gets near
+  even that ceiling.
+
+| transport | throughput | of 1 GbE |
+|---|---:|---:|
+| 1 GbE practical ceiling | ~112 MB/s | 100% |
+| `dd \| ssh 'cat >/dev/null'` | 86.5 MB/s | 77% |
+| Wi-Fi 6 (5 GHz, 80 MHz), same test | 72.3 MB/s | 65% |
+| xsync, 3.94 GiB in 7 large files | 64.9 MB/s | 58% |
+
+**The point is not bandwidth.** It is that two ceilings already sit below the
+wire — SSH costs ~23%, xsync a further ~25% — and they cannot be told apart
+while the link is close enough to matter. More headroom turns "everything
+converges at 64.9 MB/s" into a decomposable measurement.
+
+**Why 2.5 and not 10.** The Windows box already has a *Realtek PCIe 2.5GbE*
+controller, auto-negotiated down to 1 Gbps only because the other end is
+gigabit. The missing piece is a USB-C 2.5GbE adapter on the Mac and a direct
+cable — **no switch, static addresses, ~280 MB/s**, roughly 3.3× the current
+SSH ceiling. 10 GbE needs a PCIe card *and* a Thunderbolt adapter, and while
+`ssh` itself tops out at 86.5 MB/s it would largely measure OpenSSH.
+
+**Thunderbolt peer-to-peer was investigated and ruled out.** The Mac has
+Thunderbolt Bridge (`bridge0`, `en1`–`en3`, 40 Gb/s buses), but the Gigabyte
+X870 exposes only a Microsoft generic USB4 host router with no `Net`-class
+device. IP-over-Thunderbolt on Windows is an Intel-driver feature; a USB-C
+cable between these two enumerates without producing an IP link.
+
+**Latency may matter more than bandwidth here.** The in-session SSH round trip
+measured in 4.15 was **5.3 ms**, absurd for a LAN, and it is why widening the
+pipeline window was worth 1.26×. The USB dongle is the prime suspect. Small-file
+sync — where every interesting result in this project lives — is latency-bound,
+not bandwidth-bound, so the adapter change may pay off there first.
+
+**AC**
+
+- Direct 2.5 GbE link with static addresses, plus `dd | ssh cat` and raw-TCP
+  baselines on it, so 4.17's transport table has a second link to compare.
+- The 5.3 ms round trip is re-measured. If it drops materially, the pipeline
+  window knee (2048, chosen at 5.3 ms) is re-derived, since it was tuned to a
+  latency that may be an artifact of the dongle.
+- congress-100k and the large-file corpus re-run on the faster link. The
+  question is which ceilings move and which do not: a fixed per-operation cost
+  will not scale with bandwidth, and that is how SSH crypto and xsync's chunked
+  path get told apart.
+- The 1 GbE figures are kept, not replaced. They are what most users have.
+
 ## Phase 4 — Carried forward
 
 Not ordered against each other; pulled from `backlogv3.md` because they are still
