@@ -3197,7 +3197,7 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
     let stdout = io::stdout();
     let mut server = Server::new(root);
     let reader = BufReader::new(stdin);
-    let mut writer = BufWriter::new(stdout);
+    let mut writer = BufWriter::with_capacity(TRANSPORT_WRITE_BUFFER, stdout);
     server_log("waiting for client handshake");
     let result = server.run(reader, &mut writer);
     match &result {
@@ -3214,7 +3214,15 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
 /// against it. An acknowledgement frame is 41 bytes, so this window keeps the
 /// peer's pending replies near 10 KiB — comfortably inside an ordinary pipe or
 /// SSH channel buffer — while still removing the per-file round trip.
-pub const MAX_PIPELINED_FRAMES: usize = 256;
+pub const MAX_PIPELINED_FRAMES: usize = 2048;
+
+/// Write buffer for transport streams.
+///
+/// `BufWriter::new` defaults to 8 KB, which on a small-file corpus holds barely
+/// one frame — congress averages 5,327 bytes per file — so the pipelining above
+/// could never actually coalesce: the buffer filled and flushed every frame or
+/// two regardless. A megabyte holds roughly 190 congress frames.
+const TRANSPORT_WRITE_BUFFER: usize = 1024 * 1024;
 
 /// Read acknowledgements until at most `limit` frames remain outstanding.
 /// Send small files as coalesced, pipelined batches.
@@ -3322,12 +3330,12 @@ fn send_small_files_batched<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 data,
             };
             let msg_id = next_id();
-            let wire_bytes = write_data_frame(writer, msg_id, &seg_msg, compress, level)?;
+            let wire_bytes = write_data_frame_buffered(writer, msg_id, &seg_msg, compress, level)?;
             report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
             outstanding += 1;
             if outstanding >= MAX_PIPELINED_FRAMES {
                 writer.flush()?;
-                drain_acks(decoder, reader, &mut outstanding, MAX_PIPELINED_FRAMES / 2)?;
+                drain_acks(decoder, reader, &mut outstanding, MAX_PIPELINED_FRAMES * 3 / 4)?;
             }
         }
         writer.flush()?;
@@ -5290,6 +5298,33 @@ fn write_data_frame<W: Write>(
     Ok(bytes.len())
 }
 
+/// Encode and write a data frame **without flushing**.
+///
+/// `write_data_frame` flushes every frame, which defeats the caller's buffering:
+/// the batched small-file sender accumulates up to `MAX_PIPELINED_FRAMES` before
+/// draining acks, but a per-frame flush turns that into one small write to the
+/// SSH pipe per file. On congress-100k that is 109,615 flushes and the transfer
+/// runs at 4.6% of the link.
+///
+/// Callers must flush before waiting on anything the peer sends, or the peer
+/// will not have seen the frames it is being asked to acknowledge.
+fn write_data_frame_buffered<W: Write>(
+    writer: &mut W,
+    id: u64,
+    msg: &Message,
+    compress: bool,
+    level: i32,
+) -> Result<usize, ServerError> {
+    let mode = if compress {
+        CompressionMode::Zstd
+    } else {
+        CompressionMode::None
+    };
+    let bytes = encode_frame_with_compression(id, msg, mode, level)?;
+    writer.write_all(&bytes)?;
+    Ok(bytes.len())
+}
+
 /// Read and verify one `Ack` frame.
 ///
 /// # Errors
@@ -5397,7 +5432,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             stream: 0,
             message: "failed to open control stdout".to_owned(),
         })?;
-    let mut cwriter = BufWriter::new(cstdin);
+    let mut cwriter = BufWriter::with_capacity(TRANSPORT_WRITE_BUFFER, cstdin);
     let mut creader = BufReader::new(cstdout);
     let mut cdec = FrameDecoder::new();
     let mut cid = 1u64;
@@ -6178,7 +6213,7 @@ fn run_data_inner(
     compress: bool,
     compression_level: i32,
 ) -> Result<DataThreadResult, ServerError> {
-    let mut writer = BufWriter::new(stdin);
+    let mut writer = BufWriter::with_capacity(TRANSPORT_WRITE_BUFFER, stdin);
     let mut reader = BufReader::new(stdout);
     let mut decoder = FrameDecoder::new();
     let mut id = 1u64;
@@ -6947,7 +6982,7 @@ where
         inner: stdout,
         bytes: std::sync::Arc::clone(&bytes_from_remote),
     });
-    let mut writer = BufWriter::new(stdin);
+    let mut writer = BufWriter::with_capacity(TRANSPORT_WRITE_BUFFER, stdin);
     let mut f = f;
     let result = f(&mut reader, &mut writer);
 
