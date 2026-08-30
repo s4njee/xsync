@@ -618,13 +618,13 @@
 <a class="outline-link" href="#what-actually-makes-file-sync-slow" data-slug="what-actually-makes-file-sync-slow" style="padding-left: 8px; font-weight: 600;">What actually makes file sync slow</a>
 <a class="outline-link" href="#the-combinatorial-problem" data-slug="the-combinatorial-problem" style="padding-left: 12px; ">The combinatorial problem</a>
 <a class="outline-link" href="#controlling-for-the-hardware" data-slug="controlling-for-the-hardware" style="padding-left: 12px; ">Controlling for the hardware</a>
-<a class="outline-link" href="#the-hypothesis-i-had-to-reject-antivirus" data-slug="the-hypothesis-i-had-to-reject-antivirus" style="padding-left: 12px; ">The hypothesis I had to reject: antivirus</a>
-<a class="outline-link" href="#the-result-that-surprised-me-most-a-raspberry-pi-keeps-up" data-slug="the-result-that-surprised-me-most-a-raspberry-pi-keeps-up" style="padding-left: 12px; ">The result that surprised me most: a Raspberry Pi keeps up</a>
+<a class="outline-link" href="#the-hypothesis-we-had-to-reject-antivirus" data-slug="the-hypothesis-we-had-to-reject-antivirus" style="padding-left: 12px; ">The hypothesis we had to reject: antivirus</a>
+<a class="outline-link" href="#the-result-that-surprised-us-most-a-raspberry-pi-keeps-up" data-slug="the-result-that-surprised-us-most-a-raspberry-pi-keeps-up" style="padding-left: 12px; ">The result that surprised us most: a Raspberry Pi keeps up</a>
 <a class="outline-link" href="#how-fast-can-a-gigabit-cable-actually-go" data-slug="how-fast-can-a-gigabit-cable-actually-go" style="padding-left: 12px; ">How fast can a gigabit cable actually go?</a>
 <a class="outline-link" href="#small-files-and-large-files-are-different-problems" data-slug="small-files-and-large-files-are-different-problems" style="padding-left: 12px; ">Small files and large files are different problems</a>
 <a class="outline-link" href="#so-is-it-cpu-bound-link-bound-or-os-bound" data-slug="so-is-it-cpu-bound-link-bound-or-os-bound" style="padding-left: 12px; ">So is it CPU-bound, link-bound, or OS-bound?</a>
 <a class="outline-link" href="#why-is-windows-slower-an-honest-guess" data-slug="why-is-windows-slower-an-honest-guess" style="padding-left: 12px; ">Why is Windows slower? An honest guess</a>
-<a class="outline-link" href="#what-i-would-do-next" data-slug="what-i-would-do-next" style="padding-left: 12px; ">What I would do next</a>
+<a class="outline-link" href="#what-we-would-do-next" data-slug="what-we-would-do-next" style="padding-left: 12px; ">What we would do next</a>
 <a class="outline-link" href="#the-three-lessons-that-generalise" data-slug="the-three-lessons-that-generalise" style="padding-left: 12px; ">The three lessons that generalise</a>
         </div>
       </nav>
@@ -634,8 +634,8 @@
         <article class="prose" id="prose">
 <h1 id="what-actually-makes-file-sync-slow">What actually makes file sync slow</h1>
 <p><em>Notes from a week of measuring xsync — a file-sync tool — across four machines, three operating systems and three very different piles of files.</em></p>
-<p>I set out to answer what sounds like a simple question: <strong>when copying a lot of files over a network, what is the slow part?</strong> The CPU? The disk? The network? The operating system?</p>
-<p>The answer turned out to be &quot;it depends, and the thing it depends on is the average file size&quot; — but getting there meant discarding a lot of measurements, including several I had already written down as facts.</p>
+<p>We set out to answer what sounds like a simple question: <strong>when copying a lot of files over a network, what is the slow part?</strong> The CPU? The disk? The network? The operating system?</p>
+<p>The answer turned out to be &quot;it depends, and the thing it depends on is the average file size&quot; — but getting there meant discarding a lot of measurements, including several we had already written down as facts.</p>
 <hr>
 <h2 id="the-combinatorial-problem">The combinatorial problem</h2>
 <p>Here is the trouble with benchmarking a tool that copies files from one computer to another. Every run has, at minimum:</p>
@@ -649,19 +649,19 @@
 <li>and the <strong>tool&#x27;s own settings</strong> — parallelism, compression, buffer sizes</li>
 </ul>
 <p>Four machines, three operating systems, three corpora and a handful of tuning knobs is already thousands of combinations. You cannot run them all, and if you run a scattered handful you will get a scattered handful of numbers that disagree with each other for reasons you cannot name.</p>
-<p>Worse, the confounds are invisible. During this work I recorded, and later had to throw away:</p>
+<p>Worse, the confounds are invisible. During this work we recorded, and later had to throw away:</p>
 <ul>
 <li>a receiver that was &quot;2.5× faster&quot; — the runs had <strong>silently failed</strong>, and the tool printed a plausible time anyway</li>
 <li>a whole benchmark matrix taken while the <strong>house network had degraded</strong> to 2% of its normal speed</li>
-<li>a baseline that was 1.8× faster than anything I could reproduce afterwards, on the same machine with the same code</li>
+<li>a baseline that was 1.8× faster than anything we could reproduce afterwards, on the same machine with the same code</li>
 </ul>
-<p>Every one of those looked like a real result at the time. Two of them looked specifically like <em>my code had gotten slower</em>, which is the most expensive kind of false alarm because it sends you hunting through a diff.</p>
+<p>Every one of those looked like a real result at the time. Two of them looked specifically like <em>our code had gotten slower</em>, which is the most expensive kind of false alarm because it sends you hunting through a diff.</p>
 <p>What eventually worked was boring discipline:</p>
 <ol>
 <li><strong>Verify every run.</strong> Check the exit status <em>and</em> count the files that actually arrived. If the count is wrong, it is not a slow run, it is a failed run, and it must never be reported as a time.</li>
-<li><strong>Throw away the first run.</strong> The first copy into a fresh destination is systematically slower — I measured 23 s cold against 12 s settled for the same work.</li>
+<li><strong>Throw away the first run.</strong> The first copy into a fresh destination is systematically slower — we measured 23 s cold against 12 s settled for the same work.</li>
 <li><strong>Alternate arms in one sitting.</strong> Never compare today&#x27;s number against one from yesterday. Run A, B, A, B in the same session.</li>
-<li><strong>When something looks like a regression, build both versions and race them.</strong> Every single time I did this, the code was innocent and the environment had changed.</li>
+<li><strong>When something looks like a regression, build both versions and race them.</strong> Every single time we did this, the code was innocent and the environment had changed.</li>
 </ol>
 <hr>
 <h2 id="controlling-for-the-hardware">Controlling for the hardware</h2>
@@ -680,9 +680,9 @@
 }</script></figure>
 <p>Same hardware. <strong>3.3× slower on Windows.</strong> Nothing about the CPU, the disk or the network can explain it, because none of them changed.</p>
 <hr>
-<h2 id="the-hypothesis-i-had-to-reject-antivirus">The hypothesis I had to reject: antivirus</h2>
+<h2 id="the-hypothesis-we-had-to-reject-antivirus">The hypothesis we had to reject: antivirus</h2>
 <p>The obvious explanation is Windows Defender. It inspects every file as it is written, and we are writing a hundred thousand of them. Surely that is the whole story.</p>
-<p>It is not. I measured it directly — same disk, two folders, one of them added to Defender&#x27;s exclusion list, runs alternated:</p>
+<p>It is not. We measured it directly — same disk, two folders, one of them added to Defender&#x27;s exclusion list, runs alternated:</p>
 <figure class="h7-chart"><figcaption class="h7-chart-cap">Windows Defender: real, but not the explanation</figcaption><div class="h7-chart-body"></div><script class="h7-chart-spec" type="application/json">{
   "type": "hbar",
   "title": "Windows Defender: real, but not the explanation",
@@ -696,11 +696,11 @@
 }</script></figure>
 <p>Defender costs <strong>1.22×</strong> — about 144 microseconds per file, or 18% of the time a Windows user actually experiences. That is a real cost and worth knowing.</p>
 <p>But look at the gap it needs to explain. Turning Defender off entirely closes roughly <strong>20% of the distance</strong> to Linux. The remaining <strong>3.8×</strong> is still there, on the same machine, with scanning disabled.</p>
-<p>There is a second, cleaner proof. Defender&#x27;s cost is <em>per file</em>, not per byte. When I ran the same test with a handful of very large files instead of many small ones, the scanned and excluded runs became indistinguishable — 62.7 s against 66.0 s, within noise, and in the wrong direction. Scanning seven files costs a millisecond.</p>
+<p>There is a second, cleaner proof. Defender&#x27;s cost is <em>per file</em>, not per byte. When we ran the same test with a handful of very large files instead of many small ones, the scanned and excluded runs became indistinguishable — 62.7 s against 66.0 s, within noise, and in the wrong direction. Scanning seven files costs a millisecond.</p>
 <p>So: antivirus is a genuine tax, and it is not why Windows is slow.</p>
 <hr>
-<h2 id="the-result-that-surprised-me-most-a-raspberry-pi-keeps-up">The result that surprised me most: a Raspberry Pi keeps up</h2>
-<p>This one I re-ran several times because I did not believe it.</p>
+<h2 id="the-result-that-surprised-us-most-a-raspberry-pi-keeps-up">The result that surprised us most: a Raspberry Pi keeps up</h2>
+<p>This one we re-ran several times because we did not believe it.</p>
 <p>Sending 109,615 small files to four different receivers:</p>
 <figure class="h7-chart"><figcaption class="h7-chart-cap">Files received per second — the hardware barely matters</figcaption><div class="h7-chart-body"></div><script class="h7-chart-spec" type="application/json">{
   "type": "hbar",
@@ -717,7 +717,7 @@
 <p>A <strong>Raspberry Pi 5</strong> lands within 9% of a 32-thread Ryzen 9 7950X. It beats the same-class desktop CPU running Windows by <strong>six times</strong>.</p>
 <p>A £60 computer with four small cores and 3 GB of memory keeps pace with a desktop that costs twenty times as much — and the <em>only</em> thing that separates the two bottom rows is which operating system booted.</p>
 <p>If small-file sync were limited by processing power, this chart would be impossible. It is telling you, loudly, that the work is somewhere else.</p>
-<p>I later varied the <strong>sending</strong> machine too, and got the same message from the other direction. Sending the same files from a Pi 5, an M1 Max laptop and a 32-thread desktop:</p>
+<p>We later varied the <strong>sending</strong> machine too, and got the same message from the other direction. Sending the same files from a Pi 5, an M1 Max laptop and a 32-thread desktop:</p>
 <figure class="h7-chart"><figcaption class="h7-chart-cap">Sender barely matters for small files (109,615 files, to WSL2)</figcaption><div class="h7-chart-body"></div><script class="h7-chart-spec" type="application/json">{
   "type": "hbar",
   "title": "Sender barely matters for small files (109,615 files, to WSL2)",
@@ -792,7 +792,7 @@
 <p><strong>Large files: link-bound</strong>, but not by the cable. Every platform converges around 62–66 s for the same 3.9 GB, within 7% of each other. That is not the network&#x27;s 112 MB/s ceiling; it is SSH&#x27;s 86.5 MB/s, and then the tool&#x27;s own overhead on top. Windows, Linux and macOS are indistinguishable here because none of them is the limit.</p>
 <p><strong>Small files: not CPU-bound.</strong> The Pi 5 result settles it. Four small cores keep pace with thirty-two large ones.</p>
 <p><strong>Small files: not link-bound either.</strong> A small-file transfer runs at roughly half the wire speed and is unaffected by having more of it.</p>
-<p><strong>Small files: OS-bound, and tool-bound.</strong> This is the honest answer, and the second half of it is uncomfortable. Some of what I first measured as &quot;the operating system&#x27;s fault&quot; turned out to be <em>my own tool serialising work</em>.</p>
+<p><strong>Small files: OS-bound, and tool-bound.</strong> This is the honest answer, and the second half of it is uncomfortable. Some of what we first measured as &quot;the operating system&#x27;s fault&quot; turned out to be <em>our own tool serialising work</em>.</p>
 <p>Two changes fixed that:</p>
 <figure class="h7-chart"><figcaption class="h7-chart-cap">Removing serialisation, one end at a time</figcaption><div class="h7-chart-body"></div><script class="h7-chart-spec" type="application/json">{
   "type": "hbar",
@@ -807,10 +807,10 @@
 }</script></figure>
 <p>The sender used to read up to 8,192 files with the network sitting idle, then compress and send them with the disk sitting idle — one thread alternating between two resources, using neither well. The receiver, meanwhile, decoded <em>and</em> wrote every file on a single thread.</p>
 <p>Fixing both took the same transfer from 26.3 s to 8.5 s — <strong>3.1× faster</strong> — with no change to the hardware, the network or the operating system.</p>
-<p>And here is the uncomfortable part: <strong>the measured OS penalty shrank when I fixed my own code.</strong> It read 4.7× before the receiver fix and 3.3× after. An operating-system comparison run through a serialised tool is partly a measurement of the tool. I had published the larger number first.</p>
+<p>And here is the uncomfortable part: <strong>the measured OS penalty shrank when we fixed our own code.</strong> It read 4.7× before the receiver fix and 3.3× after. An operating-system comparison run through a serialised tool is partly a measurement of the tool. We had published the larger number first.</p>
 <hr>
 <h2 id="why-is-windows-slower-an-honest-guess">Why is Windows slower? An honest guess</h2>
-<p>I want to be clear that this section is speculation. I measured <em>that</em> Windows charges a large fixed cost per file creation; I did not prove <em>why</em>.</p>
+<p>we want to be clear that this section is speculation. We measured <em>that</em> Windows charges a large fixed cost per file creation; we did not prove <em>why</em>.</p>
 <p>What the evidence constrains:</p>
 <ul>
 <li>It is <strong>per file, not per byte</strong> — it vanishes on large files.</li>
@@ -831,19 +831,19 @@
 }</script></figure>
 <p>On Linux, four connections cut the time by a quarter. On Windows, two connections make it 12% <em>worse</em> and four make it 17% worse.</p>
 <p>That pattern — a fixed per-creation cost that gets worse rather than better under concurrency — is what you would expect from <strong>serialisation inside the filesystem layer itself</strong>. Some resource is being taken exclusively per file creation, so adding writers adds contention instead of throughput. Plausible candidates include NTFS&#x27;s master file table, the directory entry structures, or the stack of filter drivers every file operation traverses on Windows (antivirus is only one such filter; there are usually several).</p>
-<p>A reasonable next experiment would compare NTFS against ReFS on the same Windows machine, which would separate &quot;the filesystem&quot; from &quot;the Windows I/O stack&quot;. I have deliberately not done it: ReFS volumes get different antivirus treatment by default, which would reintroduce the confound I just spent effort eliminating, and no decision currently depends on the answer.</p>
+<p>A reasonable next experiment would compare NTFS against ReFS on the same Windows machine, which would separate &quot;the filesystem&quot; from &quot;the Windows I/O stack&quot;. We have deliberately not done it: ReFS volumes get different antivirus treatment by default, which would reintroduce the confound we just spent effort eliminating, and no decision currently depends on the answer.</p>
 <hr>
-<h2 id="what-i-would-do-next">What I would do next</h2>
+<h2 id="what-we-would-do-next">What we would do next</h2>
 <p><strong>Investigate a real bug first.</strong> The Raspberry Pi copies files <em>out</em> perfectly but fails partway through receiving 109,615 of them, with the connection timing out. It is the only machine here with 3 GB of memory, and the receiver now starts a pool of worker threads. That smells like a genuine defect rather than a flaky machine, and it is the only outright failure in the whole matrix.</p>
 <p><strong>Get a faster link — but only afterwards.</strong> The tool runs at 58% of a gigabit cable, so a faster network would mostly measure SSH. The interesting version of this experiment is not &quot;is it faster&quot; but &quot;which ceilings move&quot; — a fixed per-operation cost will not improve with bandwidth, which is exactly how you tell the two apart. The desktop already has a 2.5 Gb port, so this costs about £25 and a cable rather than a new network.</p>
 <p><strong>Look at the encryption cost.</strong> SSH takes 23% off the top, and a single connection is a single-threaded cipher. That is the largest identified, unaddressed loss in the whole stack.</p>
-<p><strong>Widen the corpus.</strong> Everything here rests on three collections of files. The size ladder is a strong result precisely because it spans five orders of magnitude, but I would like to know what happens with incompressible data, or with the deep, wide directory trees that a <code>node_modules</code> folder produces.</p>
-<p><strong>Test on a slow CPU, and on Wi-Fi.</strong> Every x86 machine measured is a recent high-end Ryzen. &quot;Processing power does not matter&quot; is a claim I can only defend on fast processors, which is a suspicious place to be making it.</p>
+<p><strong>Widen the corpus.</strong> Everything here rests on three collections of files. The size ladder is a strong result precisely because it spans five orders of magnitude, but we would like to know what happens with incompressible data, or with the deep, wide directory trees that a <code>node_modules</code> folder produces.</p>
+<p><strong>Test on a slow CPU, and on Wi-Fi.</strong> Every x86 machine measured is a recent high-end Ryzen. &quot;Processing power does not matter&quot; is a claim we can only defend on fast processors, which is a suspicious place to be making it.</p>
 <hr>
 <h2 id="the-three-lessons-that-generalise">The three lessons that generalise</h2>
-<p><strong>Measure the thing you are actually changing.</strong> Most of my early numbers varied several things at once. WSL was valuable precisely because it holds everything constant except the one variable in question.</p>
-<p><strong>A plausible number is not a result.</strong> The single most useful change I made was refusing to record any run that did not verify its own output. Failures print plausible times. Degraded networks print plausible times. Only the file count tells the truth.</p>
-<p><strong>Your own tool is part of the measurement.</strong> The OS penalty I confidently reported dropped by a third once I stopped serialising work inside the program. Before attributing a slow result to somebody else&#x27;s software, it is worth checking how much of it belongs to yours.</p>
+<p><strong>Measure the thing you are actually changing.</strong> Most of our early numbers varied several things at once. WSL was valuable precisely because it holds everything constant except the one variable in question.</p>
+<p><strong>A plausible number is not a result.</strong> The single most useful change we made was refusing to record any run that did not verify its own output. Failures print plausible times. Degraded networks print plausible times. Only the file count tells the truth.</p>
+<p><strong>Your own tool is part of the measurement.</strong> The OS penalty we confidently reported dropped by a third once we stopped serialising work inside the program. Before attributing a slow result to somebody else&#x27;s software, it is worth checking how much of it belongs to yours.</p>
         </article>
       </main>
     </div>
@@ -864,13 +864,13 @@
 *Notes from a week of measuring xsync — a file-sync tool — across four machines,
 three operating systems and three very different piles of files.*
 
-I set out to answer what sounds like a simple question: **when copying a lot of
+We set out to answer what sounds like a simple question: **when copying a lot of
 files over a network, what is the slow part?** The CPU? The disk? The network?
 The operating system?
 
 The answer turned out to be &quot;it depends, and the thing it depends on is the
 average file size&quot; — but getting there meant discarding a lot of measurements,
-including several I had already written down as facts.
+including several we had already written down as facts.
 
 ---
 
@@ -892,18 +892,18 @@ knobs is already thousands of combinations. You cannot run them all, and if you
 run a scattered handful you will get a scattered handful of numbers that
 disagree with each other for reasons you cannot name.
 
-Worse, the confounds are invisible. During this work I recorded, and later had
+Worse, the confounds are invisible. During this work we recorded, and later had
 to throw away:
 
 - a receiver that was &quot;2.5× faster&quot; — the runs had **silently failed**, and the
   tool printed a plausible time anyway
 - a whole benchmark matrix taken while the **house network had degraded** to 2%
   of its normal speed
-- a baseline that was 1.8× faster than anything I could reproduce afterwards,
+- a baseline that was 1.8× faster than anything we could reproduce afterwards,
   on the same machine with the same code
 
 Every one of those looked like a real result at the time. Two of them looked
-specifically like *my code had gotten slower*, which is the most expensive kind
+specifically like *our code had gotten slower*, which is the most expensive kind
 of false alarm because it sends you hunting through a diff.
 
 What eventually worked was boring discipline:
@@ -912,12 +912,12 @@ What eventually worked was boring discipline:
    actually arrived. If the count is wrong, it is not a slow run, it is a failed
    run, and it must never be reported as a time.
 2. **Throw away the first run.** The first copy into a fresh destination is
-   systematically slower — I measured 23 s cold against 12 s settled for the
+   systematically slower — we measured 23 s cold against 12 s settled for the
    same work.
 3. **Alternate arms in one sitting.** Never compare today&#x27;s number against one
    from yesterday. Run A, B, A, B in the same session.
 4. **When something looks like a regression, build both versions and race
-   them.** Every single time I did this, the code was innocent and the
+   them.** Every single time we did this, the code was innocent and the
    environment had changed.
 
 ---
@@ -955,13 +955,13 @@ the network can explain it, because none of them changed.
 
 ---
 
-## The hypothesis I had to reject: antivirus
+## The hypothesis we had to reject: antivirus
 
 The obvious explanation is Windows Defender. It inspects every file as it is
 written, and we are writing a hundred thousand of them. Surely that is the
 whole story.
 
-It is not. I measured it directly — same disk, two folders, one of them added to
+It is not. We measured it directly — same disk, two folders, one of them added to
 Defender&#x27;s exclusion list, runs alternated:
 
 ```chart
@@ -986,7 +986,7 @@ roughly **20% of the distance** to Linux. The remaining **3.8×** is still there
 on the same machine, with scanning disabled.
 
 There is a second, cleaner proof. Defender&#x27;s cost is *per file*, not per byte.
-When I ran the same test with a handful of very large files instead of many
+When we ran the same test with a handful of very large files instead of many
 small ones, the scanned and excluded runs became indistinguishable — 62.7 s
 against 66.0 s, within noise, and in the wrong direction. Scanning seven files
 costs a millisecond.
@@ -995,9 +995,9 @@ So: antivirus is a genuine tax, and it is not why Windows is slow.
 
 ---
 
-## The result that surprised me most: a Raspberry Pi keeps up
+## The result that surprised us most: a Raspberry Pi keeps up
 
-This one I re-ran several times because I did not believe it.
+This one we re-ran several times because we did not believe it.
 
 Sending 109,615 small files to four different receivers:
 
@@ -1026,7 +1026,7 @@ the two bottom rows is which operating system booted.
 If small-file sync were limited by processing power, this chart would be
 impossible. It is telling you, loudly, that the work is somewhere else.
 
-I later varied the **sending** machine too, and got the same message from the
+We later varied the **sending** machine too, and got the same message from the
 other direction. Sending the same files from a Pi 5, an M1 Max laptop and a
 32-thread desktop:
 
@@ -1167,8 +1167,8 @@ keep pace with thirty-two large ones.
 half the wire speed and is unaffected by having more of it.
 
 **Small files: OS-bound, and tool-bound.** This is the honest answer, and the
-second half of it is uncomfortable. Some of what I first measured as &quot;the
-operating system&#x27;s fault&quot; turned out to be *my own tool serialising work*.
+second half of it is uncomfortable. Some of what we first measured as &quot;the
+operating system&#x27;s fault&quot; turned out to be *our own tool serialising work*.
 
 Two changes fixed that:
 
@@ -1194,17 +1194,17 @@ between two resources, using neither well. The receiver, meanwhile, decoded
 Fixing both took the same transfer from 26.3 s to 8.5 s — **3.1× faster** — with
 no change to the hardware, the network or the operating system.
 
-And here is the uncomfortable part: **the measured OS penalty shrank when I
-fixed my own code.** It read 4.7× before the receiver fix and 3.3× after. An
+And here is the uncomfortable part: **the measured OS penalty shrank when we
+fixed our own code.** It read 4.7× before the receiver fix and 3.3× after. An
 operating-system comparison run through a serialised tool is partly a
-measurement of the tool. I had published the larger number first.
+measurement of the tool. We had published the larger number first.
 
 ---
 
 ## Why is Windows slower? An honest guess
 
-I want to be clear that this section is speculation. I measured *that* Windows
-charges a large fixed cost per file creation; I did not prove *why*.
+we want to be clear that this section is speculation. We measured *that* Windows
+charges a large fixed cost per file creation; we did not prove *why*.
 
 What the evidence constrains:
 
@@ -1240,14 +1240,14 @@ the stack of filter drivers every file operation traverses on Windows (antivirus
 is only one such filter; there are usually several).
 
 A reasonable next experiment would compare NTFS against ReFS on the same Windows
-machine, which would separate &quot;the filesystem&quot; from &quot;the Windows I/O stack&quot;. I
+machine, which would separate &quot;the filesystem&quot; from &quot;the Windows I/O stack&quot;. We
 have deliberately not done it: ReFS volumes get different antivirus treatment by
-default, which would reintroduce the confound I just spent effort eliminating,
+default, which would reintroduce the confound we just spent effort eliminating,
 and no decision currently depends on the answer.
 
 ---
 
-## What I would do next
+## What we would do next
 
 **Investigate a real bug first.** The Raspberry Pi copies files *out* perfectly
 but fails partway through receiving 109,615 of them, with the connection timing
@@ -1268,28 +1268,28 @@ unaddressed loss in the whole stack.
 
 **Widen the corpus.** Everything here rests on three collections of files. The
 size ladder is a strong result precisely because it spans five orders of
-magnitude, but I would like to know what happens with incompressible data, or
+magnitude, but we would like to know what happens with incompressible data, or
 with the deep, wide directory trees that a `node_modules` folder produces.
 
 **Test on a slow CPU, and on Wi-Fi.** Every x86 machine measured is a recent
-high-end Ryzen. &quot;Processing power does not matter&quot; is a claim I can only
+high-end Ryzen. &quot;Processing power does not matter&quot; is a claim we can only
 defend on fast processors, which is a suspicious place to be making it.
 
 ---
 
 ## The three lessons that generalise
 
-**Measure the thing you are actually changing.** Most of my early numbers varied
+**Measure the thing you are actually changing.** Most of our early numbers varied
 several things at once. WSL was valuable precisely because it holds everything
 constant except the one variable in question.
 
-**A plausible number is not a result.** The single most useful change I made was
+**A plausible number is not a result.** The single most useful change we made was
 refusing to record any run that did not verify its own output. Failures print
 plausible times. Degraded networks print plausible times. Only the file count
 tells the truth.
 
-**Your own tool is part of the measurement.** The OS penalty I confidently
-reported dropped by a third once I stopped serialising work inside the program.
+**Your own tool is part of the measurement.** The OS penalty we confidently
+reported dropped by a third once we stopped serialising work inside the program.
 Before attributing a slow result to somebody else&#x27;s software, it is worth
 checking how much of it belongs to yours.
 </script>
