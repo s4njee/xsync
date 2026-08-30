@@ -1,10 +1,10 @@
-# Benchmarks v3 — the picture after 4.15
+# Benchmarks v3 — the picture after 4.15 and 4.26
 
 Measured 2026-08-30, in one session, on one client, with every run verified.
 Supersedes nothing in `BENCHMARKv2.md`; that file keeps the tuning history and
-the long tail of experiments. This one answers a narrower question: **now that
-the small-file sender overlap (4.15) has landed, what is actually slow, and
-why?**
+the long tail of experiments. This one answers a narrower question: **now that both
+halves of the small-file path have been unserialized — the sender (4.15) and
+the receiver (4.26) — what is actually slow, and why?**
 
 ---
 
@@ -149,9 +149,11 @@ Monotonic collapse across five orders of magnitude. Windows is not "slower at
 I/O" — it charges a fixed cost per file creation, and once files are large
 enough to amortise it, the difference disappears entirely.
 
-The honest headline is therefore **"the OS costs ~4.7× on small files and
+The honest headline is therefore **"the OS costs ~3.6× on small files and
 nothing on large ones"**, which is both more precise and more useful than
-`docs/OS.md`'s standing claim that the OS is worth ~6×.
+`docs/OS.md`'s standing claim that the OS is worth ~6×. Note that this figure
+moved once already, when 4.26 removed serialization on our side: an OS penalty
+measured through a serialized tool is partly a measurement of the tool.
 
 ### Defender is real, but it is not the explanation
 
@@ -171,7 +173,7 @@ Windows-versus-Linux gap**; with scanning removed entirely Windows is still
 are indistinguishable (62.65 s vs 65.98 s, within noise) — confirming the cost
 is per-file, not per-byte.
 
-### A Raspberry Pi 5 ties a 7950X, and beats a 7900X sevenfold
+### A Raspberry Pi 5 ties a 7950X, and beats a 7900X sixfold
 
 On congress, orion (4 cores, 3 GB) lands at 9.23 s against freya's 8.46 s —
 **within 9% of a 32-thread 7950X** — and against the *same class* of CPU running
