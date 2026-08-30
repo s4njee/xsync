@@ -108,18 +108,60 @@ after the batching fix). A macOS number completes that comparison.
 requirement, so "the wire cannot change" stops being a valid reason. Ordered so
 that the cheapest verification comes first and the largest change last.
 
-### 4.4 — Verify V3.22 metadata compression against a live peer
+### 4.4 — Verify V3.22 metadata compression against a live peer *(done 2026-08-30)*
 
-- [ ] **Do this before anything else in Phase 2.** The code is committed
-  (`44b5f0cf`) and untested on the wire.
+- [x] Verified against the Windows host (`sanjee@192.168.1.120`, MSVC build
+  carrying `encode_meta_frame`) on congress-100k — 109,615 files, 583,940,018
+  logical bytes.
 
-**AC**
-- A real transfer to a real remote decodes compressed `FileBatch` and `Scan`
-  frames correctly, in both push and pull directions.
-- `wire_bytes` from the `finished` event is compared before and after on the same
-  corpus and host. congress-100k is the natural target; the path analysis
-  predicts roughly 45 MB saved per congress-1m transfer.
-- `--no-compress` still produces no compression, metadata included.
+**AC1 — compressed `FileBatch`/`Scan` decode in both directions: PASS**
+
+- Push Mac → Windows: 109,615 transferred, 0 failed. The Windows peer decoded
+  compressed metadata frames.
+- Pull Windows → Mac: 109,615 transferred, 0 failed, 0 warnings. This is the
+  stronger half — the **Windows** binary encoded the compressed frames and the
+  Mac decoded them.
+- Independent round-trip content digest (sorted per-file SHA-256 over the whole
+  tree) identical to the original source: `b6114e969f2f7997…`.
+
+**AC2 — `wire_bytes` before/after: THE AC WAS NOT SATISFIABLE. Measured directly instead.**
+
+`wire_bytes` **excludes metadata frames entirely.** Only `write_data_frame*`
+and `decoder.last_wire_bytes()` feed `report.wire_bytes`; all four
+`encode_meta_frame` call sites do a bare `writer.write_all(&bytes)` and never
+add to it. An A/B of two purpose-built binaries — one with `encode_meta_frame`
+forced to `CompressionMode::None` — returned **byte-identical** `wire_bytes` of
+139,736,860 on both arms, which measures the metric's blindness, not the
+feature. Filed as 4.29.
+
+Measured by instrumenting `encode_meta_frame` to encode both ways and report
+the sizes (throwaway build, not committed):
+
+| | congress-100k push |
+|---|---:|
+| Metadata frames | 19 |
+| Uncompressed | 9,957,243 B |
+| Compressed (sent) | 1,255,326 B |
+| **Ratio / saved** | **7.93× / 8.70 MB** |
+| Data frames (`wire_bytes`) | 139,736,860 B |
+| Share of total wire traffic saved | 5.8% |
+
+**The commit's own predictions were both wrong, in opposite directions.** It
+claimed 15.5× and ~45 MB per congress-1m; actual ratio is **7.93×** (about
+half), while the volume extrapolates to **~87 MB** per 1m files (about double).
+The 15.5× figure came from a path-only sample; real frames carry sizes, modes,
+and mtimes that compress far less well than shared path prefixes.
+
+**No measurable time effect**: 97.8 s (on) vs 98.2 s (off). Expected — 8.7 MB
+against 140 MB on a link that 4.15 established is sender-bound, not
+bandwidth-bound. This feature is a bandwidth win, not a latency one, and should
+be described that way.
+
+**AC3 — `--no-compress` suppresses metadata compression too: PASS**
+
+- Metadata sent = 9,957,243 B, exactly the uncompressed size.
+- Data `wire_bytes` = 593,147,678 vs 583,940,018 logical — framing overhead
+  only, no compression.
 
 ### 4.5 — Carry ownership and link count in the index encoding *(unblocks V3.3)*
 
@@ -474,6 +516,758 @@ symlink.
 **Only take this on if** a real workload is known to depend on it. The
 cost-benefit is poor otherwise: an `unsafe` exemption is permanent, and the
 current reporting already prevents the silent-loss failure mode.
+
+## Phase 6 — The small-file sender
+
+### 4.15 — Overlap read and send in the small-file batch loop
+
+- [ ] The small-file network bottleneck is identified: the sender's batch
+  builder in `send_small_files_batched` (`server.rs:3258`) is **serial and
+  phase-separated**. Phase A issues up to 8,192 blocking reads with the network
+  idle; Phase B hashes, compresses, and frames with the disk idle. One thread,
+  two resources, never used at the same time.
+
+**How the alternatives were eliminated** (Mac → target, congress-100k):
+
+| Hypothesis | Test | Verdict |
+|---|---|---|
+| Per-frame `flush()` | non-flushing `write_data_frame_buffered` | no median change |
+| 8 KB `BufWriter` default | raised to 1 MB | 19.4–19.7 s, no help alone |
+| per-file `fsync` | read the commit path | `sync_data` is chunked-path only |
+| receiver too slow | Pi 5 vs 7950X as destination | 7,047 vs 7,583 files/s — **7% apart** |
+| endpoint CPU-bound | `ps` both ends mid-run | client 51%, server 48% — neither saturated |
+
+A Pi 5 and a 7950X receiving at the same rate ends every "other end" story. The
+ceiling (~133 µs/file) is the sender thread waiting on disk half the time and on
+CPU the other half. Locally the same corpus does 20,388 files/s because the
+local path has a worker pool; the network path does not.
+
+**What already landed on the way** (uncommitted, in this tree):
+
+- `MAX_PIPELINED_FRAMES` 256 → 2048 and drain to ¾ instead of ½. The old
+  half-drain stalled the pipeline ~856 times per 100k files at the measured
+  5.3 ms in-session SSH RTT. **18.1 s → 15.5 s** (1.26×), variance <1%,
+  flat at 8192 and 16384 so 2048 is the knee.
+- 1 MB transport write buffers + non-flushing data frames. Measured no effect
+  in isolation, but with the wider window the flush now happens only at drain
+  points, so the buffer is what lets ~190 frames coalesce per syscall. The
+  1.26× is the combination; it could not be decomposed further.
+
+**AC**
+
+- Read-ahead: the next batch is loaded by worker threads while the current one
+  is hashed, compressed, and written to the wire. Same pool discipline as the
+  local path (`MACOS_WORKER_CAP` applies).
+- Measured on congress-100k against at least two targets (one Unix, one
+  Windows). Success is closing a real part of the 7,500 → 20,388 files/s gap;
+  both endpoints sitting near-idle says most of it is recoverable.
+- Large-file and `--streams` paths unregressed (Manga spot check).
+- Ordering stays deterministic: batches still ship in plan order even when
+  loaded out of order.
+
+## Phase 7 — Research program
+
+Three research stories. None block Phase 6; each exists because current
+conclusions rest on a narrower evidence base than the writeups imply.
+
+### 4.16 — Corpus diversity: do the conclusions survive other data shapes?
+
+- [ ] Every tuning decision so far rests on three corpora: congress (many small
+  compressible JSON/text), cb7 (mixed + 3,310 symlinks), Manga (118 large
+  files). That is three points in a much larger space, and congress compresses
+  4.2× — wire-throughput numbers are flattered by it.
+
+Gaps worth a corpus each:
+
+- **Incompressible small files** (thumbnails, compressed images) — strips the
+  zstd advantage and stresses the frame path per byte.
+- **node_modules-shape** — hundreds of thousands of tiny files in deep trees;
+  stresses metadata pipelining and directory creation more than data.
+- **Git working trees** — mixed sizes, many dirs, hardlink-adjacent patterns;
+  the shape most developer users will actually sync.
+- **Pathological names** — long paths, unicode, spaces; correctness sweep more
+  than performance, but cheap to add to the same harness.
+
+**AC**: corpora are reproducibly generated (script in `benches/`) or pinned
+public downloads; the streams byte-share rule (4.14), the pipeline window
+(2048), and the worker-count findings are re-tested against them; any
+conclusion that flips is recorded in `docs/STREAMS.md` / `docs/OS.md`.
+
+### 4.17 — SSH transport: how much is the tunnel costing?
+
+- [ ] Measured but unexplained: **5.3 ms in-session round trip** through an SSH
+  pipe on a LAN where raw RTT should be sub-millisecond, **195 ms** per session
+  setup, and **~1.3 s** to spawn 4–8 stream connections sequentially.
+
+Angles, cheapest first:
+
+- **Quantify the tax**: same host pair, same corpus streamed over raw `nc` vs
+  through `ssh cat`. One afternoon; bounds every other item.
+- **Why 5.3 ms**: sshd channel windowing, Nagle on the sshd side, or packet
+  scheduling. If it's windowing, larger `MAX_PIPELINED_FRAMES` compensates
+  (already done) but a root fix may lower it for everyone.
+- **Per-stream setup**: `ControlMaster`-style multiplexing or parallel spawn
+  instead of the sequential `spawn_server_child` loop (ties into 4.7/V3.18).
+- **Cipher choice**: aes-gcm vs chacha20-poly1305 on hosts with and without
+  hardware AES (Pi 5 has none). Only matters if the raw-vs-ssh delta is large.
+- **Out of scope for v1**: QUIC or a native TLS daemon transport — that is the
+  v2 daemon conversation, and this story's numbers are its justification.
+
+**AC**: a table in `docs/` giving files/s and MB/s for raw-TCP vs SSH on the
+same pair, the explanation for the 5.3 ms RTT, and a go/no-go on multiplexed
+stream setup with measured setup times.
+
+### 4.18 — Platform and hardware matrix: where is the map blank?
+
+- [ ] Current coverage is deep but narrow: macOS on Apple Silicon, Linux on two
+  Zen 4 desktops and a Pi 5, Windows on one Zen 4 desktop, all on a ~1 GbE LAN.
+  The OS conclusions in `docs/OS.md` (OS worth ~6×, CPU ~0%) are strong on this
+  hardware and untested off it.
+
+Blank areas, in priority order:
+
+1. **Faster links** — at 2.5/10 GbE does the sender bottleneck (4.15) simply
+   dominate everything, or do new ceilings appear? Cheapest decisive test of
+   whether tuning generalizes.
+2. **Slower/older x86** — everything x86 measured is Zen 4. A ~2015 laptop
+   would say whether "CPU ~0%" holds when the CPU is actually slow.
+3. **Filesystems** — ext4 and APFS are characterized; ZFS was abandoned for
+   variance; XFS and btrfs (CoW!) are unmeasured on identical hardware.
+4. **WiFi** — high-RTT, lossy links exercise the pipeline window in the
+   opposite direction from the LAN; the 2048 knee was measured at 5.3 ms RTT
+   and may be wrong at 30 ms.
+5. **BSD** — correctness first (does the suite pass on FreeBSD?), performance
+   second.
+
+**AC**: not exhaustive coverage — a prioritized matrix in `docs/OS.md` marking
+each cell measured / inferred / unknown, plus measurements for (1) and (2),
+which are the two most likely to change engineering decisions.
+
+## Phase 8 — Gaps found in review (2026-08-29)
+
+Each of these was checked against the code or reproduced before being written
+down. Suspected gaps that turned out to be covered — CI (matrix exists in
+`ci.yml`), protocol fuzzing (`fuzz/fuzz_targets/protocol.rs`), read failures
+silently dropped (they emit `Failed` and count) — are deliberately absent.
+
+### 4.19 — A `chmod` never syncs: mode is not part of change detection
+
+- [ ] **Correctness gap, reproduced.** `metadata_matches` (`planner.rs:697`)
+  compares kind, size, and mtime — never mode. Repro: sync a file, `chmod 600`
+  the source, preserve its mtime, sync again → destination stays 644 and the
+  run reports nothing to do. `rsync -a` repairs this; xsync's archive-like
+  defaults claim permission preservation and silently don't deliver it for
+  drift after the initial copy.
+
+**AC**
+
+- Mode-only drift is detected on Unix-to-Unix syncs and repaired with a
+  **metadata-only operation**, not a content retransfer.
+- Windows endpoints are exempt where modes are synthesized (`permission_mode`
+  invents 0o755/0o644): comparing a synthesized mode to a real one would make
+  every file perpetually "changed". The synthesized-mode case must classify
+  as unchanged.
+- `--checksum` mode gets the same repair — content hash match must not skip
+  the mode comparison.
+- Ownership drift is explicitly out of scope until 4.5 lands it in the index
+  encoding; the story is modes only.
+
+### 4.20 — Partial failure exits 0
+
+- [ ] `failed_entries` is counted, shown in the summary line and the JSON
+  `finished` event — and never consulted by `main`'s exit path. A run that
+  failed to read 10,000 of 100,000 files prints "10000 failed" and exits
+  success. Any script or cron job wrapping xsync currently cannot tell.
+
+**AC**: nonzero exit (distinct from usage=2 and hard-failure=1, in the spirit
+of rsync's 23 "partial transfer") whenever `failed_entries > 0`; documented in
+`--help` and the man page; a test locks each exit code in.
+
+### 4.21 — A benchmark harness, because hand-rolled loops keep lying
+
+- [ ] Three separate harness bugs corrupted measurements this cycle: the
+  PowerShell "median" that returned the maximum, the zsh word-split that passed
+  `--streams 2` as one token (bogus 0.03 s runs), and an unresolved hostname
+  that measured three failed connects as 2.2M files/s. None were xsync bugs;
+  all cost real time and one poisoned recorded numbers.
+
+**AC**: a single harness in `benches/` that (1) **validates the transfer landed**
+— file count and byte total at the destination, nonzero-exit runs discarded
+loudly, (2) computes median and MAD correctly with the raw samples always
+printed, (3) applies the per-platform cache drop and knows Windows has none,
+(4) brackets controls (same arm first and last), and (5) emits the results as
+JSON so writeups stop transcribing terminal scrollback. Every ad-hoc loop in
+`benches/scripts/` migrates or dies.
+
+### 4.22 — Phase timings are only knowable by patching the source
+
+- [ ] Answering "exactly what is the bottleneck" (4.15) required adding
+  instrumentation by hand to get scan/plan/transfer/metadata wall times. That
+  breakdown plus wire-vs-logical bytes already exists internally; it just
+  isn't surfaced.
+
+**AC**: per-phase wall time in the summary under a `--timings` flag and always
+in the JSON `finished` event; zero cost when off beyond reading clocks at
+phase boundaries.
+
+### 4.23 — Nobody has measured memory at 1M files
+
+- [ ] The planner holds both trees' `FileEntry` vectors in memory, plus up to
+  32 MB of loaded batch data, plus the pipeline. The 1M-file congress corpus
+  ran on freya without incident, but peak RSS was never recorded on either
+  end — "it didn't OOM" is the entire current knowledge.
+
+**AC**: peak RSS measured on client and server for congress-1m on Linux and
+the Mac, recorded in `docs/OS.md`; a back-of-envelope bytes-per-entry figure
+derived from it; a streaming-plan story gets filed **only if** the number is
+alarming. Measurement first, architecture second.
+
+### 4.24 — Version skew wastes an afternoon; `--version` lies
+
+- [ ] Two related hygiene failures, both hit this cycle. A stale binary on
+  freya produced `version mismatch: local v1 / remote v2`, which read as a
+  protocol bug until the remote's mtime was checked. Separately `build.rs`
+  caches `BUILD_COMMIT`, so a fresh build after new commits reports a stale
+  commit — the exact tool for diagnosing skew is itself untrustworthy.
+
+**AC**: the mismatch error names both versions *and* both binaries' commits
+and suggests the D5.2 bootstrap path to update the remote; `build.rs` re-runs
+when HEAD moves (`rerun-if-changed` on `.git/HEAD` and the ref it points at);
+a stale-commit repro test if practical.
+
+### 4.29 — `wire_bytes` is not the bytes on the wire
+
+- [ ] **Found while verifying 4.4.** `wire_bytes` counts data frames only. Every
+  `encode_meta_frame` call site writes to the transport without adding to
+  `report.wire_bytes`, so the figure reported in the summary line, the
+  `finished` event, and every benchmark writeup understates real traffic.
+
+Measured on congress-100k push: 1,255,326 B of metadata unreported (0.9% of
+the total), rising to 9,957,243 B (1.7%) under `--no-compress`. Small here
+because congress is 109,615 tiny files with 4.2× compressible payloads; a
+corpus with more metadata per byte would skew further.
+
+The practical damage is that `wire_bytes` cannot be used to evaluate any
+metadata-path change — 4.4 had to build custom binaries and instrument the
+encoder because the metric was blind to the exact feature it was meant to
+measure.
+
+**AC**
+
+- Metadata frame bytes are added to `report.wire_bytes` at all four
+  `encode_meta_frame` sites, in both push and pull paths.
+- Either the total covers **all** bytes handed to the transport, or the
+  `finished` event reports `data_wire_bytes` and `meta_wire_bytes` separately
+  and the docs say which is which. Prefer the split — it keeps 4.4's
+  measurement reproducible without a custom build.
+- A test asserts that a transfer's reported wire bytes match the actual bytes
+  written to a counting transport, so this cannot silently regress.
+- `BENCHMARKv2.md` and `docs/` numbers derived from `wire_bytes` get a note
+  that pre-fix figures exclude metadata.
+
+## Phase 9 — Parallelization research
+
+What exists today: `--streams` parallelizes **connections**; within a single
+large file, chunks stripe across those connections; between files, only files
+**larger than `MAX_DATA_SEGMENT`** are distributed — small files ride the
+control session single-file (see 4.14); locally, a worker pool covers
+everything. 4.15 adds sender-side read/send overlap. These stories are the
+axes not yet explored.
+
+### 4.25 — Stripe small-file batches across data streams
+
+- [ ] The multi-stream partition sends every file ≤8 MB through the control
+  session. For congress that is 100% of the corpus: **`--streams N` buys zero
+  parallelism on exactly the workload that is slowest**. The batches are
+  already self-contained (disjoint files, own frames, own acks), so they are
+  in principle distributable across the data connections the user already
+  paid ~1.3 s each to open.
+
+**Research questions**: does a second stream of batches scale small-file
+throughput on Linux, or does the receiver serialize anyway (see 4.26)? Where
+does it cross the connection-setup cost? Does Windows — where streams were
+harmful even at the connection level — stay harmful? Interlocks with the 4.14
+heuristic: if this works, the byte-share gate becomes wrong, and the heuristic
+should choose streams for small-file corpora too.
+
+### 4.26 — Receiver-side parallel apply
+
+- [ ] The server's receive loop decodes and applies **inline on one thread**:
+  verify hash, write temp, set metadata, rename, ack, next frame. During the
+  4.15 investigation the server sat at ~48% CPU while receiving — and a Pi 5
+  matched a 7950X, which is what a serialized apply path looks like. The
+  local path already has a pool; the server path does not.
+
+**Research questions**: decode thread feeding a bounded worker pool of
+appliers — how do acks work when application is out of order (ack on verify
+vs ack on commit changes crash semantics)? What does the journal require?
+Measured ceiling of a single applier thread per filesystem (ext4 vs APFS vs
+NTFS — NTFS's 3.5× write-cost asymmetry makes this the most Windows-relevant
+performance story in the backlog). This is the other half of 4.15: sender
+overlap fixes the client, this fixes the server, and the two multiply.
+
+### 4.27 — Syscall-level batching: io_uring and its cousins
+
+- [ ] Per small file the receiver pays open/write/fsync-free
+  close/utimes/chmod/rename — six-ish syscalls, each a round trip into the
+  kernel. The T1 syscall-attribution work (`benches/results/tuning/T1/`)
+  already measures where that time goes. io_uring can batch and overlap them
+  on Linux; macOS and Windows have no equivalent, which makes this a
+  Linux-only fast path behind a runtime probe.
+
+**Research questions**: what share of receiver wall time is syscall overhead
+at 100k files (T1 data may already answer this)? Does a registered-buffers
+io_uring writer beat the 4.26 thread pool, complement it, or duplicate it?
+Cost: an `unsafe`-free crate exists (`io-uring` is unsafe; `tokio-uring`
+pulls a runtime) — if every option needs `unsafe`, the 4.11 precedent
+applies: one exemption exists, a second needs a measured win to justify it.
+
+### 4.28 — Parallelism topologies not yet tried
+
+- [ ] A survey story: cheap experiments, each answerable in a day, none
+  worth a full story until one shows a pulse.
+
+- **One connection, multiplexed logical streams** — N SSH connections cost
+  ~1.3 s serial setup and N sshd processes; rsync-style logical channels over
+  one connection would make stream count free. Overlaps 4.17's ControlMaster
+  question; this is the protocol-level version.
+- **Scan/transfer overlap** — the plan streams, but transfer start is gated
+  on plan completeness per kind. Measure the gap between first-byte time and
+  scan-complete time at 1M files; if it is seconds, pipeline planning.
+- **Parallel compression** — zstd on the sender is single-threaded per batch.
+  With 4.15's worker pool, compressing batch N+1 while batch N ships may come
+  free; alternatively `zstd::stream` multithreading. Only matters once the
+  sender is CPU-bound — re-measure after 4.15.
+- **Hash parallelism** — blake3 has rayon multithreading for large inputs;
+  confirm it is actually enabled on the ≥8 MB chunk path and measure whether
+  it moves Manga-class transfers at all.
+- **Deliberately not pursuing**: multi-process sharding (NUMA-scale problems
+  we do not have) and GPU hashing (PCIe round trip dwarfs the hash).
+
+## Phase 10 — Benchmarkability
+
+Written 2026-08-29, after asking where this cycle's knowledge actually came
+from. Two regimes exist. Regime A is the gate-able harness — `xsync-bench`
+(corpus / manifest / report / gate / schedule) plus `release-bench.py`, with
+rotation, paired `rsync -a` baselines, median/MAD, drift detection, and an
+independent oracle. Regime B is hand-run shell loops timed with
+`$EPOCHREALTIME`. Nearly everything in `BENCHMARKv2.md`, `docs/OS.md` and
+`docs/STREAMS.md` — the stream sweeps, the worker curves, the OS-worth-6×
+result — came from Regime B, and all three harness lies recorded in 4.21
+happened there. Meanwhile every deep answer required going *around* the tool:
+T1's syscall attribution needed a hand-written `LD_PRELOAD` interposer, T1.8
+needed a source patch, T7.1 was blocked until `--local-workers` existed, and
+phase timings had to be filed as 4.22 at all.
+
+The definition this phase works toward: **every question the project has
+actually asked this cycle should be answerable by the harness, from the
+shipped binary, with no source patch, no interposer, and no hand loop.** Each
+story either moves a measurement into the binary (the code), controls or
+records a machine-level confounder (the operating system), or makes a
+parallelism × corpus question sweepable (Phases 6, 7 and 9 are the consumers).
+
+Prior art: the sibling project ran exactly this program for compression
+(`../xc/backlog.md`, B1–B24); several stories here are its counterparts,
+adapted to a tool whose runs span two machines. Relationship to existing
+stories: 4.29 subsumes 4.22; 4.38 and 4.41 finish what 4.21 started; V3.33's
+latency budget becomes reportable once 4.29/4.30 land; V3.40's gate policy is
+wired in 4.43; T0.6's blocked cold-cache work is restated as 4.36 with a
+different approach — measure residency instead of trusting eviction.
+
+Suggested first slice: 4.29 + 4.33 + 4.34. After those, a repetition is
+self-timing, self-describing, and repeatable, which upgrades every harness
+cell that already exists.
+
+**The code — 4.29 to 4.34.**
+
+### 4.29 — An in-binary measurement core *(subsumes 4.22)*
+
+- [ ] The engine takes **zero clock readings**: the only `Instant::now` in
+  `xsync-core` is inside a test (`server.rs:7288`). The `finished` event
+  carries 40+ counters and not one duration.
+
+All timing lives in the CLI renderer, and it is measurement-hostile three
+ways: the elapsed/throughput summary is printed only `if self.terminal`
+(`main.rs:1334`) — piping stdout, which is what a harness does, loses it; the
+clock starts on the `Planned` event (`main.rs:1351`), so scan time is
+excluded from throughput; and `timestamp_unix_nanos` is stamped at render
+time (`main.rs:1514`), not at event creation, so under `--progress-json` the
+phase boundaries absorb the renderer's own I/O latency. The external harness
+compensates with `os.wait4` — which a Windows port (4.37) cannot use.
+
+**AC**
+- Durations are carried *in* the events — per-phase and total, measured at
+  the phase boundary, not reconstructed by consumers diffing render-time
+  timestamps.
+- `finished` carries wall, user CPU, sys CPU, and peak RSS for **both
+  endpoints** — the server reports its rusage in the finish barrier, since
+  half of every remote transfer's cost is invisible from the client.
+  `ru_maxrss` is bytes on macOS and kilobytes on Linux; the unit trap is
+  handled once, in code, with a test.
+- A `--timings` flag prints the human version (4.22's AC), no longer
+  TTY-gated.
+- Zero measurable cost when off; the clocks at phase boundaries are the
+  entire overhead.
+
+### 4.30 — Make the phase stream tell the truth
+
+- [ ] Phase events exist on three of four routes and are wrong on all three;
+  the fourth has none.
+
+Measured against the code: push and pull emit an **empty `metadata` phase**
+(`server.rs:4173/4177`, `5068/5072`) — metadata is actually applied inside
+`transfer`, so the phase that motivated the batching fix reads as free. The
+local route buries the destination walk and index build inside `scan`
+(`local.rs:1138–1155`), so scan throughput is not comparable to `find`. The
+clone fast path emits `Started` and `Planned` *after* `transfer` opened
+(`local.rs:884–914`), which is why the renderer's clock misses the clone.
+And multi-stream push (`server.rs:5398+`) emits **no phase events at all** —
+the last `Phase` emission in the file is line 5072 — so the route where
+attribution matters most produces a stream with zero boundaries. Envelope
+defects while in there: the terminal event is `"event":"finished"` but
+`"type":"done"` (`main.rs:1819` vs `1659`), and `transport-selected`,
+`negotiated`, `protocol-negotiated`, `filter-decision` are emitted without
+`schema_version` or timestamp and are absent from `progress-json-v1.md`.
+
+**AC**
+- Every route, multi-stream included, emits the same phase vocabulary, and
+  each phase covers what its name claims.
+- A per-route test asserts phase coverage: T0.4's `unaccounted` convention,
+  enforced — phases must account for ≥95% of wall time or the gap is named.
+- `progress-json-v1.md` documents every emitted event; the `done`/`finished`
+  naming is reconciled (schema bump if needed — the wire is not frozen, and
+  neither is this).
+
+### 4.31 — One definition of `wire_bytes`, and the cost of deciding to compress
+
+- [ ] `wire_bytes` currently has four meanings: local is always 0 (nothing
+  ever sets it — `local.rs:696` copies a field no code increments), push
+  counts only data frames (`server.rs:3334`, `3885`, `4001`), pull counts
+  every frame through the decoder (`server.rs:4709`), and multi-stream omits
+  the control session entirely (`server.rs:5908`) — the session that carries
+  100% of a small-file corpus.
+
+Cross-route wire comparisons are therefore not comparisons. Related and
+uninstrumented: compression is decided **per frame** by trial-compressing a
+sample (`protocol.rs:583–594`, `compression.rs:39–62`), so every accepted
+frame is zstd'd twice; nobody knows what that costs. The `metrics` event's
+`compression_algorithm`/`compression_level` are hardcoded `None` at both
+emit sites (`local.rs:857`, `1140`).
+
+**AC**
+- Bytes counted at the transport boundary, both directions, all sessions,
+  all frame classes — one definition, asserted equal-by-construction across
+  routes, documented in `progress-json-v1.md`.
+- Split by frame class (data / metadata / ack), so metadata overhead — the
+  V3.22 question — is readable from any run without an interposer.
+- The double-compression cost is measured; then either the decision is
+  cached per batch or the cost is recorded as acceptable, with the number.
+- `--no-compress` provably produces zero compressed frames (ties to 4.4).
+
+### 4.32 — Every knob a sweep needs, without recompiling
+
+- [ ] The pipeline-window knee (2048) was found by recompiling; T7.1's
+  recorded blocker was literally that a flag didn't exist. The tuning
+  surface is still almost entirely compile-time.
+
+Compile-time only today: `MAX_PIPELINED_FRAMES` (`server.rs:3217`) and its
+**three inconsistent drain thresholds** (¾ at `server.rs:3338`, ½ at `3786`
+and `5704`); `TRANSPORT_WRITE_BUFFER` (`server.rs:3225`); every `strategy.rs`
+constant — where `StrategyConfig` is injectable with validation
+(`strategy.rs:32–86`) and **nothing ever constructs a non-default one**; the
+scanner's thread count (`scanner.rs:324` never calls `.threads()`, so the
+`ignore` crate's `min(cores, 12)` default applies, unaffected by
+`--local-workers`); `DEFAULT_LOCAL_QUEUE_CAPACITY = 2` (`local.rs:36`); and
+the planner index budget — 64 MiB local (`planner.rs:21`) but a *different*
+hardcoded 32 MiB on the multi-stream path (`server.rs:5528`), so the two
+routes spill at different tree sizes. `SessionConfig` re-states
+`batch_bytes`/`chunk_bytes` as bare literals (`server.rs:3494`), so even a
+recompile can half-apply.
+
+**AC**
+- A hidden `--tune name=value` (repeatable) covering a documented allowlist
+  of the constants above. Unknown names are refused, not ignored.
+- Every tuned value is echoed in the `finished` event — a result that
+  doesn't record its knobs is scrollback.
+- The duplicated literals are routed through one constants table first, so a
+  tune cannot apply to one code path and not another.
+- Defaults bit-identical when the flag is absent; this is a measurement
+  surface, not a config surface, and the help text says so.
+
+### 4.33 — Report what the run did, not what was asked
+
+- [ ] `--streams 8` on a pull runs 1 stream and **reports 8**:
+  `sync_pull_server` (`server.rs:6346`) never consults `options.streams`,
+  yet `Started` (`server.rs:4267`) and `Finished` (`5120`) echo the
+  requested value. The local route does the same ("retained only for event
+  reporting", `local.rs:261`). A streams sweep over pull would produce N
+  identical arms with N different labels — the exact shape of lie that 4.21
+  exists to prevent, emitted by the tool itself.
+
+Same family: `queue_high_water` is capped by the 1024-slot channel
+(`scanner.rs:24`), so it saturates on any tree over ~1k entries and stops
+discriminating; `DispatchStats` (`strategy.rs:121`) is collected and has
+zero consumers — dead instrumentation that looks like coverage.
+
+**AC**
+- `finished` reports **effective** values — streams actually used, workers
+  actually spawned, scanner threads — alongside requested ones; requesting
+  an option a route ignores produces a warning event.
+- `DispatchStats` is surfaced in `finished` or deleted.
+- The harness cross-checks label against effective values and voids
+  mismatched cells, so this class of error dies at both ends.
+
+### 4.34 — Hermetic runs: make the reset expressible
+
+- [ ] A clean-slate second run currently requires out-of-band surgery
+  against paths the tool never prints: `rm ${TMPDIR}/xsync-resume-*`
+  (journal, keyed by `blake3(src\0dest)` — `journal.rs:107` — so repeated
+  runs of the same command *share* state, and an interrupted rep silently
+  contaminates the next one's `resumed_bytes`); `rm ${TMPDIR}/.xsync-planner-*`
+  (spill files, `planner.rs:25`); and deleting `hashes.redb` under
+  `XDG_CACHE_HOME` with a `HOME` fallback (`hash_cache.rs:184`) — there is
+  no `--no-hash-cache`, so run 1 hashes everything and run 2 hashes nothing,
+  worth seconds (`hash_cache.rs:15–20`).
+
+Also per-run destination pollution: the reflink probe writes and deletes two
+files at the destination root every run (`clone.rs:372`), and on Linux it
+spawns `cp --reflink=always` to do it (`clone.rs:391`).
+
+**AC**
+- The binary can print its state paths (journal dir, planner spill dir, hash
+  cache file) — `--print-state-paths` or equivalent.
+- `--no-hash-cache` and `--fresh` (ignore any existing journal) exist and
+  are honored on every route.
+- `benches/README.md` documents the full reset recipe; the harness performs
+  it between arms.
+- A locked-in test: two identical runs after a reset report
+  `resumed_bytes = 0` and identical checksum-cache miss counts.
+
+**The operating system — 4.35 to 4.38.**
+
+### 4.35 — Standing OS counters, replacing the interposer one-offs
+
+- [ ] Answering "how many syscalls per file" took a hand-written
+  `LD_PRELOAD` interposer because SIP blocks `dtruss` even with Full Disk
+  Access, plus non-default build flags for the backtraces (T1.6). The
+  finding — 25.1 → 14.1 syscalls/entry, against rsync's 6.4 — is the most
+  consequential number in the tuning program, and the T1.3 budget (unmet at
+  0.515 paired ratio) has **no standing measurement**: nobody notices if it
+  regresses.
+
+The cheap standing sources were never wired up: `getrusage` gives faults and
+voluntary/involuntary context switches beyond what 4.29 takes; Linux
+`/proc/self/io` gives `syscr`/`syscw`/`read_bytes`/`write_bytes` — a
+per-run syscall-rate proxy for free; macOS has `proc_pid_rusage`.
+
+**AC**
+- A per-endpoint OS-counter block in `finished`: faults, context switches,
+  and on Linux the `/proc/self/io` set; per-entry rates derived in the
+  report.
+- Per-platform availability documented; an absent counter is reported
+  absent, never zero — macOS has no `syscr`, and the report must not
+  pretend otherwise.
+- The T1.3 syscall budget becomes a gate-able assertion on Linux
+  (`(syscr+syscw)/entry` against a stated bound), so the interposer is
+  needed for *attribution* only, never for *detection*.
+
+### 4.36 — Cache state as a measured fact, not a label
+
+- [ ] The schema constrains cache labels to
+  `first_pass`/`warm`/`cold_evicted`, but eviction is *trusted*, not
+  verified: `purge` fails with `Operation not permitted` in this checkout,
+  `drop_caches` needs root freya doesn't grant, every Windows number ever
+  recorded is warm, and SSH cold runs are **refused** because the remote's
+  cache state is unknowable (T0.6, blocked). The whole warm/cold discipline
+  rests on assuming a command worked.
+
+Measure residency instead: `mincore(2)` exists on both Linux and macOS. A
+bounded sample of the corpus's pages, probed immediately before the rep,
+turns "we ran purge" into "0.4% of source pages were resident".
+
+**AC**
+- A residency probe (in `xsync-bench`, not the binary) samples the corpus
+  and records **percent-resident** with every repetition; cache labels are
+  *derived* from the measurement, with thresholds stated in the schema.
+- Remote residency runs through the staged `xs` agent — it is already on
+  every bench host via `ensure-linux-agent.sh` — which unblocks honestly
+  labeled SSH cold runs, currently refused by design.
+- Where no probe exists (Windows), the label says `inferred` and the
+  corpus-larger-than-RAM strategy is the documented cold path (4.10's AC).
+- Probe cost is bounded, measured, and excluded from the timed region.
+
+### 4.37 — Port the gate-able harness to Windows
+
+- [ ] The platform with the headline finding — 5.8× slower than Linux on
+  identical silicon — is the one platform the harness cannot run on.
+  `release-bench.py` is POSIX to the bone: `os.wait4`, `pgrep`, `df`,
+  `purge`/`drop_caches`. Every Windows figure in `BENCHMARKv2.md` was
+  produced by hand-rolled PowerShell, which is how the median-that-was-
+  actually-the-maximum happened (4.21).
+
+4.29 shrinks this port deliberately: once wall/CPU/RSS come from inside the
+binary on both ends, the harness needs only orchestration, staging, oracle
+verification, and reporting — all portable Python plus `xsync-bench`, which
+is Rust and already compiles for Windows.
+
+**AC**
+- The full pipeline — corpus staging, rotation, oracle verify, report — runs
+  on the Windows box for congress-100k, using 4.29's in-binary accounting
+  (or Job Objects where external accounting is still needed).
+- Cache labels honest per 4.36: warm-only until a residency story exists,
+  and the report says so.
+- The 4.12 Defender A/B is expressible as two harness arms, so that story
+  stops waiting on hand-run sessions.
+- The PowerShell loops die, the same way 4.21 killed the zsh ones.
+
+### 4.38 — A watchdog for the confounders the harness has already met
+
+- [ ] Every voided session this cycle was voided by the *machine*, not the
+  tool: 641 GiB written to a 256 GB drive killed the first Manga sweep and
+  its baselines (4.1); the Kingston SLC cliff produced a 1.6× drift caught
+  only because a bracket arm happened to run; the Pi's thermal drift (18.13
+  → 27.11 s) invalidated its streams numbers; and enclosure temperature
+  cannot even be logged, because `smartctl` can't pass SMART through the USB
+  bridge. 4.1's redesign prescribes budgets, brackets, and between-arm `dd`
+  checks — as *operator discipline*. Discipline doesn't survive contact
+  with a long session; harness features do.
+
+**AC**
+- A session declares its target device and capacity; the harness tracks
+  cumulative bytes written and **refuses to start an arm** that would
+  exceed the declared budget, rather than warning afterwards.
+- Between-arm device probe: a bounded `dd` to scratch, compared against the
+  session's opening baseline; degradation past a threshold pauses the
+  session instead of poisoning the next arm.
+- Bracket arms (identical first and last) are scheduled automatically,
+  their drift computed, and the session stamped **voided** past a stated
+  threshold — the 4.1 postmortem, as a feature.
+- Thermal and frequency state logged where readable (Linux
+  `/sys/class/thermal` and cpufreq; macOS thermal pressure); where not
+  readable, the absence is recorded, per the V3.21 precedent of settling
+  thermal questions by design when they can't be settled by measurement.
+
+**Parallelization × corpus — 4.39 to 4.43.**
+
+### 4.39 — Corpus shape vectors: heuristics as functions of shape, not names
+
+- [ ] Every corpus-dependent conclusion is currently indexed by a *name*
+  (congress, cb7, Manga) instead of by the properties that caused it. The
+  4.14 streams rule needs share-of-bytes above `MAX_DATA_SEGMENT`; V3.20
+  showed core count fails to predict the worker optimum; cb7 only earned
+  its place because someone noticed it is 82.6% small by count but 68%
+  large by bytes. And shape governs what an experiment *can* test:
+  congress-10k has 11,288 directories for 11,280 files, which silently made
+  T7's directory-affine dispatch untestable. The registry pins digests and
+  file counts — never shape.
+
+**AC**
+- `xsync-bench corpus describe` emits a shape manifest: entries by kind,
+  total bytes, size percentiles (p50/p90/p99/max), **share of bytes above
+  8 MiB** (the 4.14 signal), directories-per-file, depth distribution,
+  symlink count, and sampled compressibility (bounded sample, zstd-3, the
+  same bucket scheme as `compression::decide`).
+- Stored beside the pinned digests, embedded in every report — a result
+  names its workload's shape, not just its name.
+- 4.14's stream heuristic and V3.20's worker probe take shape-vector
+  inputs, so their rules are stated as thresholds on measured properties
+  and are testable on any future corpus, including 4.16's.
+
+### 4.40 — Synthetic twins for the private corpora
+
+- [ ] No third party can reproduce a single real-corpus cell. `corpora/` is
+  gitignored and machine-pinned: Manga is copyrighted media, cb7 is a
+  personal project tree, congress is a local copy of *public* govinfo/
+  voteview data with no provisioning script, and docker-raw is registered
+  in `real_corpora()` with **no pinned digest and an empty directory** —
+  Corpus D is documented in `TUNING.md` and cannot actually run.
+
+`xsync-bench corpus` already generates seven deterministic seeded classes.
+What's missing is the bridge: generators parameterized by 4.39's shape
+vectors, so `cb7-twin` has cb7's measured size distribution, depth, and
+compressibility rather than a guess.
+
+**AC**
+- `congress-twin`, `cb7-twin`, `manga-twin`: deterministic from a seed,
+  fitted from the shape manifests, digest-pinned in the registry exactly
+  like the real corpora.
+- A same-host calibration run records the twin-vs-real delta per headline
+  metric. A conclusion that holds on the real corpus and not its twin is
+  flagged — the delta is itself a finding about *which shape features
+  matter*, which is 4.16's question asked cheaply.
+- congress additionally gets a provisioning script from the public source,
+  since it needs no twin at all.
+- docker-raw is either provisioned and pinned, or removed from the
+  registry; a registered corpus that cannot run is a trap.
+
+### 4.41 — A parallelism sweep is a harness mode, not a shell loop
+
+- [ ] Every parallelism sweep this cycle — workers, streams, pipeline
+  window — was a hand loop, and all three of 4.21's recorded harness lies
+  happened inside hand loops. `release-bench.py` sweeps *methods and
+  routes*; nothing sweeps *knob values*. The axes the research program
+  needs are exactly `--local-workers` × `--streams` × `--compress-level` ×
+  the 4.32 tune surface × corpus.
+
+**AC**
+- Sweeps are declared as axes; the harness prints run count, estimated
+  duration, and **estimated bytes written** before starting, checked
+  against 4.38's device budget — the first Manga sweep would have been
+  refused at the plan stage.
+- Arms are interleaved/rotated through the existing `schedule` machinery
+  (which already rejects orderings that never cross over), so thermal
+  drift spreads across configs instead of penalizing whatever ran last.
+- Every cell inherits the full Regime-A policy: paired baseline, ≥5 reps,
+  median/MAD, oracle verification, drift detection.
+- Axes a route ignores are refused up front (per 4.33's effective-value
+  reporting) — no burning 5 reps × N arms on a pull-streams sweep that
+  runs the same configuration N times.
+- Output is the existing `xsync.bench.report.v1` schema, so `report`,
+  `gate`, and the comparison tooling read sweep results unchanged.
+
+### 4.42 — Regime maps: RTT and bandwidth as swept variables
+
+- [ ] The pipeline-window knee (2048, chosen in 4.15) was measured at
+  exactly one RTT — the 5.3 ms in-session figure — and 4.18 already flags
+  that it may be wrong at WiFi RTTs. T8.1's compression crossover table is
+  blocked entirely. Both are blocked on the same thing: link shaping is
+  macOS-only `dnctl`, three fixed rates, ssh-route-only — and fails with
+  `Operation not permitted` anyway.
+
+Linux `tc`/netem does both delay and rate, is available with root on hosts
+the project already controls (mars, freya), and shapes *any* route.
+
+**AC**
+- netem shaping on a Linux pair with RTT (≈1/5/15/30/60 ms) and bandwidth
+  (50/100/1000 Mbit) as sweep axes under 4.41.
+- Shaping is **verified, not trusted**: measured RTT and throughput through
+  the shaped path recorded before each arm — the same principle as 4.36.
+- The pipeline-window knee re-measured as a function of RTT via 4.32's tune
+  surface; the drain rule confirmed, or replaced with an RTT-aware one and
+  the change recorded in `docs/STREAMS.md`.
+- T8.1's crossover table — the link speed below which compression wins —
+  produced for at least congress and Manga, closing the oldest blocked
+  T-task.
+
+### 4.43 — Wire the gate: a baseline in the tree, a job in CI
+
+- [ ] `xsync-bench gate` is fully implemented — ≥5 reps, 15% dispersion
+  ceiling, 15% tolerance, paired ratios only, environment/digest matching —
+  and is invoked by **zero scripts and zero workflows**. No baseline report
+  is checked in to gate against. `tasks.md:1511` lists "benchmark strict
+  gate all pass" as a release criterion that nothing enforces. This is
+  V3.40, reduced from design work to wiring.
+
+**AC**
+- A CI job runs one small synthetic-corpus cell (sized to CI time) on a
+  pinned runner class and gates on paired ratios, per the existing policy:
+  noisy rows neither pass nor fail, and say so.
+- A baseline report is nominated, checked in with its environment block,
+  and the comparison refuses across mismatched environments — the gate's
+  existing rule, finally exercised.
+- Thresholds are set for large regressions only, with the shared-runner
+  noise caveat documented rather than implied.
+- The release checklist item points at the workflow that enforces it.
 
 ## Phase 4 — Carried forward
 
