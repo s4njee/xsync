@@ -140,6 +140,77 @@ Nothing is silently unpreserved on any platform: what cannot be detected is
 named as unchecked in the run summary and in the `finished` event, so silence
 never means "your source had none".
 
+## What the data supports about hardware versus OS
+
+### For small-file sync, the operating system is worth ~6x and the CPU almost nothing
+
+All three measured as network targets from the same Mac, over the same gigabit
+link, with the same corpus:
+
+| Target | CPU | RAM | congress-100k | Files/s |
+|---|---|---:|---:|---:|
+| mars (Arch Linux) | Ryzen 9 7900X, 24T | 31 GB | 17.3 s | 6,336 |
+| orion (Linux, Pi 5) | Cortex-A76, **4 cores** | **3 GB** | 18.1 s | 6,046 |
+| 7900x (Windows 11) | Ryzen 9 7900X, 24T | 31 GB | 99.8 s | 1,099 |
+
+- **Pi 5 versus the same 7900X under Windows: 5.5x faster.**
+- **7900X Linux versus 7900X Windows: 5.8x** — identical silicon, only the booted
+  OS differs.
+- **Pi 5 versus 7900X, both on Linux: 1.05x** — near parity.
+
+A Raspberry Pi with four ARM cores and 3 GB of RAM is indistinguishable from a
+24-thread desktop at this workload, and beats that same desktop running Windows
+by more than 5x. The Pi also has the *slowest* storage of the three (PCIe 2.0 x1,
+~470 MB/s), which strengthens the conclusion rather than weakening it: it won
+while carrying a hardware disadvantage.
+
+The reason is that small-file sync is bound by **per-file work** — syscalls,
+metadata operations, round trips — not by compute or bandwidth. Adding cores or
+clock speed does not move a workload that is waiting.
+
+### For large files, hardware reasserts itself
+
+The same comparison on a bandwidth-bound corpus:
+
+| Target | Manga, 1,383 MB |
+|---|---:|
+| mars (Linux) | 96 MB/s — near the 106 MB/s wire ceiling |
+| 7900x (Windows) | 68 MB/s |
+
+The gap collapses from 5.8x to 1.4x. Once bytes rather than files dominate, the
+link and the drive set the pace and the OS difference mostly disappears.
+
+**So the honest generalisation is workload-shaped, not platform-shaped:** choose
+hardware for large-file throughput, choose the operating system for small-file
+throughput.
+
+### On Windows specifically, the cost is on the write path
+
+Same host, same corpus, opposite directions:
+
+| Direction | Time | Files/s |
+|---|---:|---:|
+| Push — Windows **writes** | 99.8 s | 1,099 |
+| Pull — Windows **reads** | 28.4 s | 3,860 |
+
+**3.5x.** Windows reads at a perfectly respectable rate; it is writing that is
+expensive. That is precisely where Defender's real-time scanning applies, and
+Defender was the top CPU consumer throughout at 4.5x the next process — but the
+contribution remains **unmeasured** (backlog 4.12), so this is a strong
+hypothesis rather than a demonstrated cause.
+
+### What these comparisons do not control
+
+- **Storage differs per host.** Windows and Arch are on different NVMe drives in
+  the same machine. The Pi's storage is slower than both.
+- **Windows figures are warm-cache only.** There is no `drop_caches` or `purge`
+  equivalent, while the Linux and macOS cold figures exist.
+- **Defender is on** in every Windows figure. That is the realistic default and
+  the honest number to publish, but it means "Windows" here includes its
+  antivirus rather than isolating the OS.
+- **macOS was an active workstation**, so its absolute figures are not comparable
+  to the dedicated hosts, only its scaling shapes.
+
 ## Bugs that only Windows exposed
 
 Each was invisible on macOS and Linux because `cfg(unix)` compiled the broken
