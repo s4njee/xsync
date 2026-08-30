@@ -1461,9 +1461,17 @@ networkingMode=mirrored
 memory=16GB
 processors=16
 swap=0
-autoMemoryReclaim=disabled
 vmIdleTimeout=-1
+
+[experimental]
+autoMemoryReclaim=disabled
+hostAddressLoopback=true
 ```
+
+`autoMemoryReclaim` belongs under `[experimental]`, not `[wsl2]` — WSL logs
+`Unknown key 'wsl2.autoMemoryReclaim'` and carries on, so a typo here is silent
+except for one line at boot. `hostAddressLoopback` lets the host reach the VM by
+its own address.
 
 `mirrored` gives WSL the host's IP, so it is reachable at `192.168.1.120`
 without `netsh portproxy`. The rest is not convenience: **dynamic memory
@@ -1501,6 +1509,35 @@ chmod 600 ~/.ssh/authorized_keys
 
 WSL's sshd is an ordinary Linux sshd, so the per-user path applies there and no
 `Match Group` block is involved.
+
+**Two blockers that are not obvious from the logs.** Both were hit on the first
+attempt, with sshd reporting `active` and listening on `0.0.0.0:2222` the whole
+time.
+
+*`wsl --shutdown` leaves nothing running.* The VM does not come back until
+something launches it, so sshd is not merely unreachable, it does not exist.
+Start it with `wsl` after any shutdown. Running `wsl.exe` over SSH also needs
+`--cd /`: it tries to translate the session's working directory and fails with
+"The system cannot find the path specified".
+
+*WSL's Hyper-V firewall blocks inbound by default.* With mirrored networking the
+VM holds the host's address (`eth0` shows `192.168.1.120/24`), but
+`Get-NetFirewallHyperVVMSetting` reports `DefaultInboundAction: Block` for VM
+`{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}`, so even `127.0.0.1:2222` from the host
+itself refuses. The pre-existing "OpenSSH Server (sshd)" allow rule covers port
+22 only. Elevated, and scoped to the one port rather than flipping the default
+inbound action, which would expose every port in the VM:
+
+```
+New-NetFirewallHyperVRule -Name "WSL-SSH-2222" -DisplayName "WSL SSH 2222" `
+  -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' `
+  -Protocol TCP -LocalPorts 2222 -Action Allow
+New-NetFirewallRule -DisplayName "WSL SSH 2222" -Direction Inbound `
+  -Protocol TCP -LocalPort 2222 -Action Allow
+```
+
+The first admits traffic to the VM, the second admits it to the host from the
+LAN. Both are firewall changes and belong to the operator.
 
 **AC**
 
