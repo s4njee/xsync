@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::{Builder, TempDir};
 
 use crate::path::WirePath;
-use crate::scanner::{EntryKind, FileEntry, FileIdentity, SourceFingerprint};
+use crate::scanner::{EntryKind, FileEntry, FileIdentity, SourceFingerprint, UnixMetadata};
 
 /// The default amount of memory reserved for the destination index.
 pub const DEFAULT_INDEX_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
@@ -25,9 +25,14 @@ pub const MAX_STORED_PATH_BYTES: usize = 1024 * 1024;
 const STORE_PREFIX: &str = ".xsync-planner-";
 const STORE_MARKER: &[u8] = b"xsync-planner-store\n";
 const STORE_SCHEMA_VERSION: u32 = 2;
-const RECORD_FIXED_BYTES: usize = 46;
+// Path length, kind, size, mtime, mode, identity, and the two presence flags
+// for the optional change-time and Unix blocks.
+const RECORD_FIXED_BYTES: usize = 47;
 const CTIME_BYTES: usize = 12;
-const MAX_RECORD_BYTES: usize = RECORD_FIXED_BYTES + CTIME_BYTES + MAX_STORED_PATH_BYTES;
+/// uid, gid, and link count, written only when the source host has them.
+const UNIX_BYTES: usize = 16;
+const MAX_RECORD_BYTES: usize =
+    RECORD_FIXED_BYTES + CTIME_BYTES + UNIX_BYTES + MAX_STORED_PATH_BYTES;
 const DEFAULT_SOURCE_SORT_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 const MERGE_FAN_IN: usize = 32;
 
@@ -1135,14 +1140,10 @@ fn write_entry(writer: &mut impl Write, entry: &FileEntry) -> Result<(), Planner
     }
     let (mtime_seconds, mtime_nanos) = encode_mtime(entry.mtime)?;
     let ctime = entry.fingerprint.ctime.map(encode_mtime).transpose()?;
+    let unix = entry.fingerprint.unix;
     let body_len = RECORD_FIXED_BYTES
         .checked_add(path.len())
-        .and_then(|length| {
-            ctime
-                .is_some()
-                .then_some(length + CTIME_BYTES)
-                .or(Some(length))
-        })
+        .and_then(|length| length.checked_add(optional_bytes(ctime.is_some(), unix.is_some())))
         .ok_or(PlannerError::TimestampOutOfRange)?;
     let body_len_u32 =
         u32::try_from(body_len).map_err(|_| PlannerError::PathTooLong(entry.path.to_string()))?;
@@ -1165,10 +1166,23 @@ fn write_entry(writer: &mut impl Write, entry: &FileEntry) -> Result<(), Planner
     } else {
         body.push(0);
     }
+    if let Some(unix) = unix {
+        body.push(1);
+        body.extend_from_slice(&unix.uid.to_le_bytes());
+        body.extend_from_slice(&unix.gid.to_le_bytes());
+        body.extend_from_slice(&unix.nlink.to_le_bytes());
+    } else {
+        body.push(0);
+    }
     writer
         .write_all(&body_len_u32.to_le_bytes())
         .and_then(|()| writer.write_all(&body))
         .map_err(|source| io_error("write planning record", "<open store>", source))
+}
+
+/// Bytes the optional trailing blocks add to a record.
+const fn optional_bytes(has_ctime: bool, has_unix: bool) -> usize {
+    (if has_ctime { CTIME_BYTES } else { 0 }) + (if has_unix { UNIX_BYTES } else { 0 })
 }
 
 fn read_entry(
@@ -1216,7 +1230,7 @@ fn decode_entry(body: &[u8], path: &Path) -> Result<FileEntry, PlannerError> {
     let path_len = read_u32(&mut cursor, path)? as usize;
     if path_len > MAX_STORED_PATH_BYTES
         || body.len() < RECORD_FIXED_BYTES + path_len
-        || body.len() > RECORD_FIXED_BYTES + path_len + CTIME_BYTES
+        || body.len() > RECORD_FIXED_BYTES + path_len + CTIME_BYTES + UNIX_BYTES
     {
         return Err(corrupt(path, "path length does not match record length"));
     }
@@ -1243,19 +1257,23 @@ fn decode_entry(body: &[u8], path: &Path) -> Result<FileEntry, PlannerError> {
         )?),
         _ => return Err(corrupt(path, "invalid change-time marker")),
     };
+    let unix = match read_u8(&mut cursor, path)? {
+        0 => None,
+        1 => Some(UnixMetadata {
+            uid: read_u32(&mut cursor, path)?,
+            gid: read_u32(&mut cursor, path)?,
+            nlink: read_u64(&mut cursor, path)?,
+        }),
+        _ => return Err(corrupt(path, "invalid unix-metadata marker")),
+    };
     let expected_body_len = RECORD_FIXED_BYTES
         .checked_add(path_len)
-        .and_then(|length| {
-            ctime
-                .is_some()
-                .then_some(length + CTIME_BYTES)
-                .or(Some(length))
-        })
+        .and_then(|length| length.checked_add(optional_bytes(ctime.is_some(), unix.is_some())))
         .ok_or_else(|| corrupt(path, "record length overflow"))?;
     if expected_body_len != body.len() {
         return Err(corrupt(
             path,
-            "change-time fields do not match record length",
+            "optional trailing fields do not match record length",
         ));
     }
     let mtime = decode_mtime(mtime_seconds, mtime_nanos)?;
@@ -1271,6 +1289,7 @@ fn decode_entry(body: &[u8], path: &Path) -> Result<FileEntry, PlannerError> {
             size,
             mtime,
             ctime,
+            unix,
         },
     })
 }
@@ -1404,6 +1423,57 @@ mod tests {
                 size,
                 UNIX_EPOCH + Duration::from_secs(mtime_seconds),
             ),
+        }
+    }
+
+    /// The planning spool spills to disk, so anything the record encoding drops
+    /// vanishes for large trees while surviving for small ones — a silent,
+    /// size-dependent bug. An earlier attempt to carry these fields was
+    /// reverted for exactly that reason, so pin the round trip.
+    #[test]
+    fn unix_ownership_and_link_count_survive_the_record_encoding() {
+        let mut source = entry("a.txt", EntryKind::File, 10, 5);
+        source.fingerprint.unix = Some(UnixMetadata {
+            uid: 501,
+            gid: 20,
+            nlink: 3,
+        });
+        source.fingerprint.ctime = Some(UNIX_EPOCH + Duration::from_secs(7));
+
+        let mut buffer = Vec::new();
+        write_entry(&mut buffer, &source).unwrap();
+        // `write_entry` frames the body with a length prefix; decode the body.
+        let decoded = decode_entry(&buffer[4..], Path::new("<test>")).unwrap();
+
+        assert_eq!(decoded.fingerprint.unix, source.fingerprint.unix);
+        assert_eq!(decoded.fingerprint.ctime, source.fingerprint.ctime);
+        assert_eq!(decoded.fingerprint.identity, source.fingerprint.identity);
+    }
+
+    /// The two optional blocks are independent; every combination must frame to
+    /// the exact record length or decoding rejects it as corrupt.
+    #[test]
+    fn every_combination_of_optional_blocks_round_trips() {
+        for ctime in [None, Some(UNIX_EPOCH + Duration::from_secs(9))] {
+            for unix in [
+                None,
+                Some(UnixMetadata {
+                    uid: 0,
+                    gid: 0,
+                    nlink: 1,
+                }),
+            ] {
+                let mut source = entry("b.txt", EntryKind::File, 3, 4);
+                source.fingerprint.ctime = ctime;
+                source.fingerprint.unix = unix;
+
+                let mut buffer = Vec::new();
+                write_entry(&mut buffer, &source).unwrap();
+                let decoded = decode_entry(&buffer[4..], Path::new("<test>")).unwrap();
+
+                assert_eq!(decoded.fingerprint.ctime, ctime, "ctime {ctime:?}");
+                assert_eq!(decoded.fingerprint.unix, unix, "unix {unix:?}");
+            }
         }
     }
 

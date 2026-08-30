@@ -163,19 +163,57 @@ be described that way.
 - Data `wire_bytes` = 593,147,678 vs 583,940,018 logical — framing overhead
   only, no compression.
 
-### 4.5 — Carry ownership and link count in the index encoding *(unblocks V3.3)*
+### 4.5 — Carry ownership and link count in the index encoding *(done 2026-08-30)*
 
-- [ ] The dropped-metadata preflight re-`stat`s every file solely because
-  `uid`/`gid`/`nlink` do not survive the encoding.
+- [x] `SourceFingerprint` now carries an optional `UnixMetadata { uid, gid,
+  nlink }`, populated from the scan's own `stat`, and the preflight reads it
+  instead of re-`stat`ing every planned file.
 
-Cost measured at ~6% of a 100k-file copy before the pass was parallelised; the
-parallelisation hid it rather than removing it, and it is still real work.
+**Why the earlier attempt failed.** Source entries pass through
+`PlanningSpool`, which spills to disk past an 8 MB budget. Fields added to the
+fingerprint but not to the record encoding therefore survive for small trees
+and vanish for large ones — a silent, size-dependent bug. The fix extends
+`write_entry`/`decode_entry`: `RECORD_FIXED_BYTES` 46 → 47 for a second
+presence flag, plus a 16-byte block written only when present. Two tests pin
+it, one of them over every combination of the two independent optional blocks,
+because a mismatch between the written length and the expected length is
+rejected as store corruption rather than ignored.
 
-**AC**
-- `SourceFingerprint` carries the fields and they survive encode/decode. An
-  earlier attempt was reverted precisely because they did not.
-- The preflight's extra `symlink_metadata` is gone, and the syscall reduction is
-  measured rather than assumed.
+**Scope.** The wire is not involved. The push source is always local, and pull
+does not run the preflight, so only the on-disk planning record needed the
+fields. Entries rebuilt from a peer's index carry `None`, which is correct —
+those uids describe another host. Any entry arriving without the block still
+falls back to a `stat` rather than silently reporting nothing.
+
+**AC1 — fields survive encode/decode: PASS.** Unit round trip, plus end-to-end
+on a 40,000-file tree with deliberately long paths (~14.5 MB of records against
+the 8 MB budget, so the spool genuinely spilled). Hardlink reporting is
+byte-identical to the pre-change binary: `100 hardlinked file(s) become
+independent copies, adding 3.1 KiB`.
+
+**AC2 — syscall reduction measured, not assumed: PASS.** Two independent
+methods agree exactly. In-process counters on congress-100k:
+`entries=109615 fallback_stats=0 sparse_probe_stats=6`. `strace -f -c` on freya,
+same corpus, before and after builds differing only in these four files:
+
+| stat-family syscalls | before | after |
+|---|---:|---:|
+| `statx` | 516,060 | 406,445 |
+| `newfstatat` | 161,339 | 161,339 |
+| **total** | **677,399** | **567,784** |
+
+The delta is **109,615** — exactly the file count. 16.2% fewer stat-family
+syscalls overall. Both builds printed the identical six sparse warnings,
+matching the six sparse probes the in-process counter recorded.
+
+**Still spent per run**: one `symlink_metadata` for files at or above
+`SPARSE_PROBE_MIN_BYTES` (6 files here), and `xattr::list` per entry, which is
+not in the fingerprint. The strace timings are not a wall-clock claim —
+tracing inflates syscall cost by roughly an order of magnitude.
+
+**Follow-up not taken**: the Windows arm of `note_dropped_metadata` still stats
+every file for `FILE_ATTRIBUTE_SPARSE_FILE`. The same treatment would need
+`file_attributes` carried in the record. Filed as 4.30.
 
 ### 4.6 — Carry filter rules on the wire *(unblocks V3.10)*
 
@@ -764,6 +802,22 @@ measure.
   written to a counting transport, so this cannot silently regress.
 - `BENCHMARKv2.md` and `docs/` numbers derived from `wire_bytes` get a note
   that pre-fix figures exclude metadata.
+
+### 4.30 — Windows preflight still stats every file
+
+- [ ] 4.5 removed the per-file `stat` from the Unix preflight by carrying
+  ownership and link count in the planning record. The Windows arm of
+  `note_dropped_metadata` still calls `symlink_metadata` on every planned file,
+  solely to read `FILE_ATTRIBUTE_SPARSE_FILE`.
+
+Windows is the platform that can least afford it: its metadata operations are
+the measured reason a 7900X under Windows reaches 1,099 files/s against the
+same box's 6,046 on Linux.
+
+**AC**: `file_attributes` rides in the record the way `UnixMetadata` now does
+— one more optional block, or a widening of that one — with the same
+round-trip test and the same before/after syscall measurement, taken on the
+Windows host rather than inferred from the Unix result.
 
 ## Phase 9 — Parallelization research
 

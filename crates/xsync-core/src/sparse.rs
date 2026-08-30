@@ -1,7 +1,9 @@
 //! Preflight inspection: what a transfer will cost, and what it will not preserve.
 //!
-//! Both questions are answered from one `symlink_metadata` per planned file, so
-//! adding the second cost nothing beyond the first.
+//! Ownership and link count come from the scan's own `stat`, carried through
+//! the planning record, so the common case costs no extra syscall per file. A
+//! `symlink_metadata` is still spent on files large enough to be worth a sparse
+//! probe, and on the rare entry that reaches here without a local stat.
 //!
 //! # Sparse sources
 //!
@@ -20,7 +22,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::path::WirePath;
-use crate::scanner::{EntryKind, FileEntry};
+use crate::scanner::{EntryKind, FileEntry, FileIdentity, UnixMetadata};
 
 /// Metadata that xsync v1 does not carry to the destination.
 ///
@@ -372,25 +374,41 @@ fn note_dropped_metadata(
     path: &Path,
     owner: Option<Owner>,
 ) {
-    use std::os::unix::fs::MetadataExt;
+    // The scan already stat'd this file, and the planning record now carries
+    // ownership and link count through the spool, so no second stat is needed.
+    // Entries that predate a local stat — synthetic ones, or any rebuilt from a
+    // peer's index — still fall back to one rather than silently reporting
+    // nothing.
+    let (unix, identity) = if let Some(unix) = entry.fingerprint.unix {
+        (unix, entry.fingerprint.identity)
+    } else {
+        use std::os::unix::fs::MetadataExt;
 
-    // The scan's own stat cannot be reused here: plan entries reach this point
-    // reconstructed from the index encoding, which carries identity, size and
-    // times but not ownership or link count, and that encoding is shared with
-    // the frozen v1 wire format.
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        // A vanished or unreadable entry is the transfer's problem to report;
-        // guessing about it here would only add noise.
-        return;
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            // A vanished or unreadable entry is the transfer's problem to
+            // report; guessing about it here would only add noise.
+            return;
+        };
+        (
+            UnixMetadata {
+                uid: metadata.uid(),
+                gid: metadata.gid(),
+                nlink: metadata.nlink(),
+            },
+            FileIdentity {
+                device: metadata.dev(),
+                file: metadata.ino(),
+            },
+        )
     };
 
-    if entry.kind == EntryKind::File && metadata.nlink() > 1 {
+    if entry.kind == EntryKind::File && unix.nlink > 1 {
         partial
             .links
-            .push((metadata.dev(), metadata.ino(), entry.size));
+            .push((identity.device, identity.file, entry.size));
     }
     if let Some(owner) = owner {
-        if metadata.uid() != owner.uid || metadata.gid() != owner.gid {
+        if unix.uid != owner.uid || unix.gid != owner.gid {
             partial.foreign_owner += 1;
         }
     }

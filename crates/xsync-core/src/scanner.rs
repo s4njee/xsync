@@ -59,6 +59,29 @@ pub struct SourceFingerprint {
     pub mtime: SystemTime,
     /// Change time where the platform exposes one.
     pub ctime: Option<SystemTime>,
+    /// Unix ownership and link count where the platform exposes them.
+    pub unix: Option<UnixMetadata>,
+}
+
+/// Unix ownership and link count, taken from the scan's own `stat`.
+///
+/// Carried so the dropped-metadata preflight can answer "is this hardlinked?"
+/// and "does someone else own this?" without a second `stat` per planned file.
+/// Plan entries reach the preflight through the planning spool, which spills to
+/// disk, so anything not in the record encoding does not survive the round trip
+/// — which is why an earlier attempt to answer those questions from the
+/// fingerprint had to be reverted.
+///
+/// `None` on platforms without Unix ownership, and on entries reconstructed
+/// from a peer's index, where the numbers would describe the wrong host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnixMetadata {
+    /// Owning user id.
+    pub uid: u32,
+    /// Owning group id.
+    pub gid: u32,
+    /// Number of names referring to this inode.
+    pub nlink: u64,
 }
 
 impl SourceFingerprint {
@@ -71,6 +94,7 @@ impl SourceFingerprint {
             size,
             mtime,
             ctime: None,
+            unix: None,
         }
     }
 }
@@ -463,7 +487,27 @@ pub(crate) fn fingerprint_from_metadata(
         size: metadata.len(),
         mtime,
         ctime: change_time(metadata)?,
+        unix: unix_metadata(metadata),
     })
+}
+
+#[cfg(unix)]
+// The non-Unix arm has nothing to report, so the `Option` is load-bearing there
+// even though this arm always fills it.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn unix_metadata(metadata: &fs::Metadata) -> Option<UnixMetadata> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(UnixMetadata {
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        nlink: metadata.nlink(),
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn unix_metadata(_metadata: &fs::Metadata) -> Option<UnixMetadata> {
+    None
 }
 
 #[cfg(unix)]

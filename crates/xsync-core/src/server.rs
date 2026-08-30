@@ -924,6 +924,7 @@ pub fn file_entry_from_entry_record(record: &EntryRecord) -> Result<FileEntry, S
             size: record.size,
             mtime,
             ctime: None,
+            unix: None,
         },
     })
 }
@@ -1695,6 +1696,9 @@ impl Server {
                 size: content_size,
                 mtime: nanos_to_system_time(mtime_ns),
                 ctime: None,
+                // A real local file with its metadata already in hand, so the
+                // ownership and link count describe this host correctly.
+                unix: crate::scanner::unix_metadata(&metadata),
             },
         };
         match Sink::new(&self.root)
@@ -2239,6 +2243,7 @@ impl Server {
                             size,
                             mtime,
                             ctime: None,
+                            unix: None,
                         },
                     };
                     // Idempotent prepare: preserves a matching-size stage the
@@ -2681,6 +2686,7 @@ impl Server {
                             size,
                             mtime,
                             ctime: None,
+                            unix: None,
                         },
                     };
 
@@ -3035,6 +3041,7 @@ impl Server {
                             size,
                             mtime: nanos_to_system_time(mtime_ns),
                             ctime: None,
+                            unix: None,
                         },
                     };
                     large_source_files.insert(file_id, entry);
