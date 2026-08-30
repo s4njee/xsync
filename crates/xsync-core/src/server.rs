@@ -3266,6 +3266,94 @@ const TRANSPORT_WRITE_BUFFER: usize = 1024 * 1024;
 /// Returns a transport or remote error; individual file read failures are
 /// reported through `emit` and counted, not propagated.
 #[allow(clippy::too_many_arguments)]
+/// Split the small files into batches without reading any of them.
+///
+/// Boundaries come from the recorded sizes alone so the loader can run ahead of
+/// the writer. The previous inline version accumulated only successfully read
+/// files, so a read failure could shift a boundary; batching is a performance
+/// detail and the transferred set is identical either way.
+fn plan_small_file_batches(small_files: &[FileEntry]) -> Vec<std::ops::Range<usize>> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0u64;
+    for (index, file) in small_files.iter().enumerate() {
+        let count = index - start;
+        if count > 0
+            && (count >= MAX_BATCH_FILES
+                || bytes.saturating_add(file.size) > BATCH_TARGET_SIZE)
+        {
+            batches.push(start..index);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(file.size);
+    }
+    if start < small_files.len() {
+        batches.push(start..small_files.len());
+    }
+    batches
+}
+
+/// Read one file, with the scan prefix stripped back off its path.
+fn read_small_file(
+    source_reader: &SourceReader,
+    file: &FileEntry,
+    prefix: &str,
+) -> Result<Vec<u8>, String> {
+    let mut file_to_read = file.clone();
+    if !prefix.is_empty() {
+        file_to_read.path = file
+            .path
+            .strip_prefix(format!("{prefix}/"))
+            .unwrap_or_else(|| file.path.clone())
+            .clone();
+    }
+    source_reader
+        .read(&file_to_read)
+        .map(|stable| stable.bytes)
+        .map_err(|error| error.to_string())
+}
+
+/// Read one batch across `workers` threads, preserving plan order.
+///
+/// Results stay index-aligned with `files`, so the caller sees failures and
+/// successes in exactly the order a serial read would have produced.
+fn load_small_file_batch(
+    source_reader: &SourceReader,
+    files: &[FileEntry],
+    prefix: &str,
+    workers: usize,
+) -> Vec<Result<Vec<u8>, String>> {
+    let mut loaded: Vec<Result<Vec<u8>, String>> =
+        files.iter().map(|_| Ok(Vec::new())).collect();
+    if workers <= 1 || files.len() <= 1 {
+        for (slot, file) in loaded.iter_mut().zip(files) {
+            *slot = read_small_file(source_reader, file, prefix);
+        }
+        return loaded;
+    }
+    let chunk = files.len().div_ceil(workers).max(1);
+    std::thread::scope(|scope| {
+        for (files_chunk, out_chunk) in files.chunks(chunk).zip(loaded.chunks_mut(chunk)) {
+            scope.spawn(move || {
+                for (file, slot) in files_chunk.iter().zip(out_chunk.iter_mut()) {
+                    *slot = read_small_file(source_reader, file, prefix);
+                }
+            });
+        }
+    });
+    loaded
+}
+
+/// Send the small files as pipelined batches, loading the next batch while the
+/// current one is hashed, compressed, and written.
+///
+/// The loop used to be serial and phase-separated: it issued up to
+/// `MAX_BATCH_FILES` blocking reads with the network idle, then hashed,
+/// compressed, and framed with the disk idle. One thread alternating between
+/// two resources put both endpoints near 50% CPU and made a Pi 5 receive within
+/// 7% of a 7950X. A loader thread now runs one batch ahead over a bounded
+/// channel, so at most two batches are resident.
 fn send_small_files_batched<R: Read, W: Write, F: FnMut(LocalEvent)>(
     writer: &mut W,
     reader: &mut R,
@@ -3275,111 +3363,115 @@ fn send_small_files_batched<R: Read, W: Write, F: FnMut(LocalEvent)>(
     prefix: &str,
     compress: bool,
     level: i32,
+    workers: usize,
     next_id: &mut dyn FnMut() -> u64,
     report: &mut LocalSyncReport,
     emit: &mut F,
 ) -> Result<(), ServerError> {
-    let mut cursor = 0usize;
-    while cursor < small_files.len() {
-        let mut loaded: Vec<(&FileEntry, Vec<u8>)> = Vec::new();
-        let mut batch_bytes = 0u64;
-        while cursor < small_files.len()
-            && loaded.len() < MAX_BATCH_FILES
-            && (loaded.is_empty()
-                || batch_bytes.saturating_add(small_files[cursor].size) <= BATCH_TARGET_SIZE)
-        {
-            let file = &small_files[cursor];
-            cursor += 1;
-            let mut file_to_read = file.clone();
-            if !prefix.is_empty() {
-                file_to_read.path = file
-                    .path
-                    .strip_prefix(format!("{prefix}/"))
-                    .unwrap_or_else(|| file.path.clone())
-                    .clone();
-            }
-            // Read before the file is announced, so a read failure never leaves
-            // the receiver waiting for a segment that never arrives.
-            match source_reader.read(&file_to_read) {
-                Ok(stable) => {
-                    batch_bytes = batch_bytes.saturating_add(file.size);
-                    loaded.push((file, stable.bytes));
-                }
-                Err(err) => {
-                    emit(LocalEvent::Failed {
-                        path: file.path.to_string(),
-                        message: err.to_string(),
-                    });
-                    report.failed_entries = report.failed_entries.saturating_add(1);
-                }
-            }
-        }
-        if loaded.is_empty() {
-            continue;
-        }
-
-        let transferred: Vec<(String, u64)> = loaded
-            .iter()
-            .map(|(file, _)| (file.path.to_string(), file.size))
-            .collect();
-        let entries = loaded
-            .iter()
-            .map(|(file, _)| {
-                let mut rec = entry_record_from_file_entry(file);
-                rec.path = file.path.as_bytes().to_vec();
-                rec
-            })
-            .collect();
-
-        let batch_id = next_id();
-        let bytes = encode_meta_frame(
-            batch_id,
-            &Message::FileBatch {
-                batch_id: 1,
-                entries,
-            },
-            compress,
-            level,
-        )?;
-        writer.write_all(&bytes)?;
-        let mut outstanding = 1usize;
-
-        for (index, (_, data)) in loaded.into_iter().enumerate() {
-            // The receiver derives the same identity from the batch frame's
-            // message ID and the entry's position within it.
-            let file_id = (batch_id << 16) | index as u64;
-            let seg_msg = Message::FileSegment {
-                file_id,
-                offset: 0,
-                digest: *blake3::hash(&data).as_bytes(),
-                data,
-            };
-            let msg_id = next_id();
-            let wire_bytes = write_data_frame_buffered(writer, msg_id, &seg_msg, compress, level)?;
-            report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
-            outstanding += 1;
-            if outstanding >= MAX_PIPELINED_FRAMES {
-                writer.flush()?;
-                drain_acks(decoder, reader, &mut outstanding, MAX_PIPELINED_FRAMES * 3 / 4)?;
-            }
-        }
-        writer.flush()?;
-        drain_acks(decoder, reader, &mut outstanding, 0)?;
-
-        for (path, size) in transferred {
-            report.transferred_files = report.transferred_files.saturating_add(1);
-            report.transferred_bytes = report.transferred_bytes.saturating_add(size);
-            report.physical_bytes = report.physical_bytes.saturating_add(size);
-            report.byte_copies = report.byte_copies.saturating_add(1);
-            emit(LocalEvent::Transferred {
-                path,
-                bytes: size,
-                physical_bytes: size,
-                method: TransferMethod::ByteCopy,
-            });
-        }
+    let batches = plan_small_file_batches(small_files);
+    if batches.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    std::thread::scope(|scope| -> Result<(), ServerError> {
+        // One batch in flight plus one being built: enough to keep the disk and
+        // the wire both busy without holding the corpus in memory.
+        let (sender, receiver) =
+            std::sync::mpsc::sync_channel::<Vec<Result<Vec<u8>, String>>>(1);
+        let batch_ranges = &batches;
+        scope.spawn(move || {
+            for range in batch_ranges.clone() {
+                let loaded =
+                    load_small_file_batch(source_reader, &small_files[range], prefix, workers);
+                // A send failure means the writer stopped early; so should this.
+                if sender.send(loaded).is_err() {
+                    return;
+                }
+            }
+        });
+
+        for (range, results) in batches.iter().cloned().zip(receiver) {
+            let files = &small_files[range];
+            let mut loaded: Vec<(&FileEntry, Vec<u8>)> = Vec::with_capacity(files.len());
+            for (file, result) in files.iter().zip(results) {
+                match result {
+                    Ok(data) => loaded.push((file, data)),
+                    Err(message) => {
+                        emit(LocalEvent::Failed {
+                            path: file.path.to_string(),
+                            message,
+                        });
+                        report.failed_entries = report.failed_entries.saturating_add(1);
+                    }
+                }
+            }
+            if loaded.is_empty() {
+                continue;
+            }
+
+            let transferred: Vec<(String, u64)> = loaded
+                .iter()
+                .map(|(file, _)| (file.path.to_string(), file.size))
+                .collect();
+            let entries = loaded
+                .iter()
+                .map(|(file, _)| {
+                    let mut rec = entry_record_from_file_entry(file);
+                    rec.path = file.path.as_bytes().to_vec();
+                    rec
+                })
+                .collect();
+
+            let batch_id = next_id();
+            let bytes = encode_meta_frame(
+                batch_id,
+                &Message::FileBatch {
+                    batch_id: 1,
+                    entries,
+                },
+                compress,
+                level,
+            )?;
+            writer.write_all(&bytes)?;
+            let mut outstanding = 1usize;
+
+            for (index, (_, data)) in loaded.into_iter().enumerate() {
+                // The receiver derives the same identity from the batch frame's
+                // message ID and the entry's position within it.
+                let file_id = (batch_id << 16) | index as u64;
+                let seg_msg = Message::FileSegment {
+                    file_id,
+                    offset: 0,
+                    digest: *blake3::hash(&data).as_bytes(),
+                    data,
+                };
+                let msg_id = next_id();
+                let wire_bytes =
+                    write_data_frame_buffered(writer, msg_id, &seg_msg, compress, level)?;
+                report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
+                outstanding += 1;
+                if outstanding >= MAX_PIPELINED_FRAMES {
+                    writer.flush()?;
+                    drain_acks(decoder, reader, &mut outstanding, MAX_PIPELINED_FRAMES * 3 / 4)?;
+                }
+            }
+            writer.flush()?;
+            drain_acks(decoder, reader, &mut outstanding, 0)?;
+
+            for (path, size) in transferred {
+                report.transferred_files = report.transferred_files.saturating_add(1);
+                report.transferred_bytes = report.transferred_bytes.saturating_add(size);
+                report.physical_bytes = report.physical_bytes.saturating_add(size);
+                report.byte_copies = report.byte_copies.saturating_add(1);
+                emit(LocalEvent::Transferred {
+                    path,
+                    bytes: size,
+                    physical_bytes: size,
+                    method: TransferMethod::ByteCopy,
+                });
+            }
+        }
+        Ok(())
+    })
 }
 
 fn drain_acks<R: Read>(
@@ -3835,6 +3927,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             &prefix,
             negotiated_compression == CompressionMode::Zstd,
             negotiated_level,
+            options.local_workers,
             &mut alloc_id,
             &mut report,
             &mut emit,
@@ -5925,6 +6018,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         &prefix,
         control_compress,
         options.compress_level,
+        options.local_workers,
         &mut calloc,
         &mut report,
         &mut emit,

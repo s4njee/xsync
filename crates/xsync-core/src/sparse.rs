@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::path::WirePath;
-use crate::scanner::{EntryKind, FileEntry, FileIdentity, UnixMetadata};
+use crate::scanner::{EntryKind, FileEntry};
 
 /// Metadata that xsync v1 does not carry to the destination.
 ///
@@ -379,6 +379,8 @@ fn note_dropped_metadata(
     // Entries that predate a local stat — synthetic ones, or any rebuilt from a
     // peer's index — still fall back to one rather than silently reporting
     // nothing.
+    use crate::scanner::{FileIdentity, UnixMetadata};
+
     let (unix, identity) = if let Some(unix) = entry.fingerprint.unix {
         (unix, entry.fingerprint.identity)
     } else {

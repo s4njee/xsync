@@ -644,51 +644,46 @@ current reporting already prevents the silent-loss failure mode.
 
 ## Phase 6 — The small-file sender
 
-### 4.15 — Overlap read and send in the small-file batch loop
+### 4.15 — Overlap read and send in the small-file batch loop *(done 2026-08-30)*
 
-- [ ] The small-file network bottleneck is identified: the sender's batch
-  builder in `send_small_files_batched` (`server.rs:3258`) is **serial and
-  phase-separated**. Phase A issues up to 8,192 blocking reads with the network
-  idle; Phase B hashes, compresses, and frames with the disk idle. One thread,
-  two resources, never used at the same time.
+- [x] The batch builder was serial and phase-separated: it issued up to 8,192
+  blocking reads with the network idle, then hashed, compressed and framed with
+  the disk idle. A loader thread now runs one batch ahead over a bounded
+  channel, reading each batch across `options.local_workers` threads.
 
-**How the alternatives were eliminated** (Mac → target, congress-100k):
+**A/B, congress-100k, alternating arms, same binaries throughout.**
 
-| Hypothesis | Test | Verdict |
-|---|---|---|
-| Per-frame `flush()` | non-flushing `write_data_frame_buffered` | no median change |
-| 8 KB `BufWriter` default | raised to 1 MB | 19.4–19.7 s, no help alone |
-| per-file `fsync` | read the commit path | `sync_data` is chunked-path only |
-| receiver too slow | Pi 5 vs 7950X as destination | 7,047 vs 7,583 files/s — **7% apart** |
-| endpoint CPU-bound | `ps` both ends mid-run | client 51%, server 48% — neither saturated |
+| target | before | after | gain |
+|---|---|---|---|
+| freya (7950X, Linux) | 24.58, 24.75, 24.88, 25.22, 30.06 → **24.88 s** | 11.88, 11.89, 13.36, 13.46, 15.11 → **13.36 s** | **1.86×** |
+| Windows 11 (7900X, NTFS) | 97.45, 97.04 → **97.2 s** | 84.53, 83.92 → **84.2 s** | **1.15×** |
 
-A Pi 5 and a 7950X receiving at the same rate ends every "other end" story. The
-ceiling (~133 µs/file) is the sender thread waiting on disk half the time and on
-CPU the other half. Locally the same corpus does 20,388 files/s because the
-local path has a worker pool; the network path does not.
+**The two numbers disagree for a reason.** Windows is receiver-bound — its
+metadata path caps it near 1,300 files/s — so unblocking the sender can only
+recover the sender's share. freya has headroom, so it recovers much more. That
+is the shape 4.26 predicts: the sender fix and the receiver fix multiply, and
+Windows will not move much until the receiver-side work lands.
 
-**What already landed on the way** (uncommitted, in this tree):
+**Caveat on the freya numbers, stated rather than hidden.** freya was running
+`xc` at ~950% CPU throughout, so both arms were measured under heavy load. The
+ratio is reproducible (five paired runs, the after arm landing 11.88/11.89 back
+to back) but the absolute figures are inflated: equivalent code measured 14.4 s
+on an idle freya earlier in the cycle. **Re-measure on an idle host before
+quoting 1.86× as the platform number.**
 
-- `MAX_PIPELINED_FRAMES` 256 → 2048 and drain to ¾ instead of ½. The old
-  half-drain stalled the pipeline ~856 times per 100k files at the measured
-  5.3 ms in-session SSH RTT. **18.1 s → 15.5 s** (1.26×), variance <1%,
-  flat at 8192 and 16384 so 2048 is the knee.
-- 1 MB transport write buffers + non-flushing data frames. Measured no effect
-  in isolation, but with the wider window the flush now happens only at drain
-  points, so the buffer is what lets ~190 frames coalesce per syscall. The
-  1.26× is the combination; it could not be decomposed further.
+**AC checks**
 
-**AC**
+- Ordering deterministic: read results stay index-aligned with the plan, so
+  failures and successes surface in the order a serial read would produce.
+- Correctness: full-tree content digest after a read-ahead push matches the
+  source exactly (`b6114e969f2f7997…`), the same digest 4.4 recorded.
+- Large-file and `--streams` unregressed: 96 MB striped file, 1.59 s / 1.68 s
+  before against 1.59 s / 1.61 s after at 1 and 4 streams.
 
-- Read-ahead: the next batch is loaded by worker threads while the current one
-  is hashed, compressed, and written to the wire. Same pool discipline as the
-  local path (`MACOS_WORKER_CAP` applies).
-- Measured on congress-100k against at least two targets (one Unix, one
-  Windows). Success is closing a real part of the 7,500 → 20,388 files/s gap;
-  both endpoints sitting near-idle says most of it is recoverable.
-- Large-file and `--streams` paths unregressed (Manga spot check).
-- Ordering stays deterministic: batches still ship in plan order even when
-  loaded out of order.
+**Also fixed here**: `sparse.rs` imported `FileIdentity` and `UnixMetadata`
+unconditionally while using them only in the Unix arm, so 4.5 had left a
+`unused_imports` warning that only appears on Windows — where CI builds with
+`-D warnings`. Found by building the A/B arms on the Windows host.
 
 ## Phase 7 — Research program
 
