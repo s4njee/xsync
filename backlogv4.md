@@ -1010,21 +1010,47 @@ control session single-file (see 4.14); locally, a worker pool covers
 everything. 4.15 adds sender-side read/send overlap. These stories are the
 axes not yet explored.
 
-### 4.25 — Stripe small-file batches across data streams
+### 4.25 — Stripe small-file batches across data streams *(done 2026-08-30)*
 
-- [ ] The multi-stream partition sends every file ≤8 MB through the control
-  session. For congress that is 100% of the corpus: **`--streams N` buys zero
-  parallelism on exactly the workload that is slowest**. The batches are
-  already self-contained (disjoint files, own frames, own acks), so they are
-  in principle distributable across the data connections the user already
-  paid ~1.3 s each to open.
+- [x] Everything at or below `MAX_DATA_SEGMENT` used to ride the control
+  session, so `--streams N` bought **zero** parallelism on the workload that is
+  slowest — for congress, 100% of the corpus. Small files are now striped
+  across the data sessions, balanced by **count rather than bytes**, because at
+  this size the per-file cost dominates the payload.
 
-**Research questions**: does a second stream of batches scale small-file
-throughput on Linux, or does the receiver serialize anyway (see 4.26)? Where
-does it cross the connection-setup cost? Does Windows — where streams were
-harmful even at the connection level — stay harmful? Interlocks with the 4.14
-heuristic: if this works, the byte-share gate becomes wrong, and the heuristic
-should choose streams for small-file corpora too.
+Also wires the 4.26 apply pool into `run_data_sink`, which 4.26 had left out;
+without it the striped files would have landed on a serialized receiver.
+
+**Linux — it works, modestly.** freya, congress-100k, verified:
+
+| | streams=1 | streams=2 | streams=4 | streams=8 |
+|---|---:|---:|---:|---:|
+| post-4.25 | 9.20 s | 7.77 s | **6.98 s** | 7.17 s |
+
+Same-stream-count A/B at `--streams 4`, alternating: **7.59 s → 6.75 s, 1.12×**.
+Best absolute is 6.75 s against 8.46 s single-stream — **1.25×** — and it
+plateaus at 4.
+
+The gain is smaller than the premise implied, and the reason is 4.26: a single
+receiver already applies files across 8 threads, so extra connections add
+receivers to a path that is no longer receiver-starved.
+
+**Windows — streams remain harmful, and striping does not rescue them.**
+
+| | streams=1 | streams=2 | streams=4 |
+|---|---:|---:|---:|
+| congress-100k | **56.62 s** | 63.64 s | 65.97 s |
+
+Two streams cost 12% and four cost 17%. Whatever serializes NTFS file creation
+is not relieved by more concurrent writers — the apply pool already gives each
+receiver 8 threads, and adding receivers contends rather than parallelises.
+
+**What this settles for 4.14.** The byte-share gate is wrong in both
+directions. Small-file corpora *do* benefit from streams on Linux, so gating on
+"share of bytes in files above `MAX_DATA_SEGMENT`" would wrongly refuse them.
+But the platform cap dominates: on Windows the right stream count is 1
+regardless of corpus. **Platform first, corpus second** — the opposite priority
+to the one 4.14 currently specifies.
 
 ### 4.26 — Receiver-side parallel apply *(done 2026-08-30)*
 
@@ -1069,9 +1095,8 @@ platform, and unblocking the receiver is worth more there than on Linux.
 **4.15 and 4.26 multiply, as claimed.** congress-100k to freya has gone
 26.30 s → 12.80 s (4.15) → **8.46 s** (4.26): **3.11× end to end**.
 
-**Not addressed**: the same pool is not applied to `run_data_sink`, the
-multi-stream data path. Small files never travel that route (they ride the
-control session — see 4.25), so it moves no needle today.
+**Followed up in 4.25**: the pool is now wired into `run_data_sink` as well,
+which that story needed once small files began travelling the data path.
 
 ### 4.27 — Syscall-level batching: io_uring and its cousins
 

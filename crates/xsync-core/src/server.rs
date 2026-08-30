@@ -2149,7 +2149,10 @@ impl Server {
         reader: &mut R,
         writer: &mut W,
     ) -> Result<(), ServerError> {
-        let sink = Sink::new(&self.root)?;
+        // Shared with the apply pool, exactly as the control session does.
+        let sink = Arc::new(Sink::new(&self.root)?);
+        let mut apply = ApplyPool::new(&sink, false, apply_worker_count());
+        let mut acks_unflushed = false;
         // file_id -> EntryRecord for small/whole files.
         let mut active_files: HashMap<u64, EntryRecord> = HashMap::new();
         // file_id -> FileEntry for chunked large files, plus the ranges this
@@ -2158,6 +2161,10 @@ impl Server {
         let mut large_ranges: HashMap<u64, Vec<ByteRange>> = HashMap::new();
 
         loop {
+            if acks_unflushed {
+                writer.flush()?;
+                acks_unflushed = false;
+            }
             let frame = match self.decoder.read(reader) {
                 Ok(frame) => frame,
                 Err(ProtocolError::Read(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
@@ -2195,13 +2202,23 @@ impl Server {
                             &file_entry.path,
                             &mut self.seen_destinations,
                         )?;
-                        let hash = blake3::Hash::from_bytes(digest);
-                        sink.write_file_with_retry(
-                            &file_entry,
-                            &hash,
-                            |_attempt| Ok(data.clone()),
-                        )?;
-                        self.ack(writer, frame.message_id, 4)?;
+                        apply.submit(ApplyJob {
+                            message_id: frame.message_id,
+                            entry: file_entry,
+                            hash: blake3::Hash::from_bytes(digest),
+                            data,
+                        })?;
+                        // Drain fully at the batch boundary; the sender waits
+                        // for every acknowledgement there.
+                        let limit = if active_files.is_empty() {
+                            0
+                        } else {
+                            apply.capacity()
+                        };
+                        apply.collect(limit, |id| {
+                            acks_unflushed = true;
+                            self.ack_buffered(writer, id, 4)
+                        })?;
                     } else if let Some(file_entry) = large_files.get(&file_id) {
                         let length = data.len() as u64;
                         let hash = blake3::Hash::from_bytes(digest);
@@ -2288,6 +2305,11 @@ impl Server {
             }
         }
 
+        apply.finish(|id| {
+            acks_unflushed = true;
+            self.ack_buffered(writer, id, 4)
+        })?;
+        writer.flush()?;
         Ok(())
     }
 
@@ -5792,7 +5814,14 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             "control handshake".to_owned(),
         ));
     };
-    let control_compress = control_compression == CompressionMode::Zstd;
+    // The negotiated mode still governs what the peer compresses back to us
+    // (the destination scan pages). The control session no longer sends file
+    // data itself — that is striped across the data sessions below — so there
+    // is no outbound data-frame setting to derive from it here.
+    debug_assert!(
+        control_compression == CompressionMode::Zstd || !options.compress,
+        "control session must negotiate zstd whenever compression is enabled"
+    );
     expect_ack(&mut cdec, &mut creader)?;
     let control_filter = filter_for_peer(options, control_remote_capabilities)?;
 
@@ -6076,10 +6105,9 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         drain_acks(&mut cdec, &mut creader, &mut pending, 0)?;
     }
 
-    let source_reader = SourceReader::new(source_path);
 
     // ---- Partition files ----
-    // Small/medium files: written by the control session itself.
+    // Small/medium files: striped across the data sessions (4.25).
     let mut small_files: Vec<FileEntry> = Vec::new();
     // Large files: striped across data sessions.
     let mut large_files: Vec<FileEntry> = Vec::new();
@@ -6136,26 +6164,23 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         control_large_ids.push((file_id, file.clone()));
     }
 
-    // Control: write small/medium files.
+    // Small files are striped across the data sessions rather than pushed down
+    // the control session alone.
     //
-    // These go through the same coalescing, pipelined sender the single-stream
-    // path uses. Sending them one at a time with a blocking ack after each
-    // frame was the entire `--streams` regression on small-file corpora; the
-    // data sessions below never carried them and still do not.
-    send_small_files_batched(
-        &mut cwriter,
-        &mut creader,
-        &mut cdec,
-        &source_reader,
-        &small_files,
-        &prefix,
-        control_compress,
-        options.compress_level,
-        options.local_workers,
-        &mut calloc,
-        &mut report,
-        &mut emit,
-    )?;
+    // Everything at or below `MAX_DATA_SEGMENT` used to ride the control
+    // connection, which meant `--streams N` bought no parallelism at all on the
+    // workload that is slowest — for congress that is 100% of the corpus.
+    //
+    // Balanced by **count, not bytes**: for files this small the per-file cost
+    // dominates the payload, so equal counts share the work more evenly than
+    // equal byte totals would.
+    let small_shares: Vec<Vec<FileEntry>> = {
+        let mut shares: Vec<Vec<FileEntry>> = (0..streams).map(|_| Vec::new()).collect();
+        for (index, file) in small_files.iter().enumerate() {
+            shares[index % streams].push(file.clone());
+        }
+        shares
+    };
 
     // ---- Partition large-file missing ranges across data sessions ----
     let chunk = 8 * 1024 * 1024u64;
@@ -6204,7 +6229,8 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         // rather than a sequential loop -- but bounded, so a high stream count
         // does not trip the peer's `MaxStartups`.
         let gate = ConnectionGate::new(MAX_CONCURRENT_CONNECTIONS);
-        for work in data_work {
+        let workers = options.local_workers;
+        for (work, small) in data_work.into_iter().zip(small_shares) {
             let sp = source_path_buf.clone();
             let prefix_copy = prefix.clone();
             let job = job_id_copy;
@@ -6222,6 +6248,8 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                     &prefix_copy,
                     job,
                     work,
+                    small,
+                    workers,
                     compress,
                     compression_level,
                     permit,
@@ -6231,7 +6259,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         handles
     };
 
-    let written: Vec<Result<(Vec<(WirePath, Vec<ByteRange>)>, u64), ServerError>> = data_threads
+    let written: Vec<Result<DataThreadResult, ServerError>> = data_threads
         .into_iter()
         .map(|h| {
             h.join().unwrap_or_else(|_| {
@@ -6243,9 +6271,24 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         .collect();
     let mut written_by_path: HashMap<WirePath, Vec<ByteRange>> = HashMap::new();
     for result in written {
-        let (ranges, wire_bytes) = result?;
-        report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes);
-        for (path, mut rs) in ranges {
+        let outcome = result?;
+        report.wire_bytes = report.wire_bytes.saturating_add(outcome.wire_bytes);
+        report.failed_entries = report.failed_entries.saturating_add(outcome.small_failed);
+        // Small files published by this session. Accounted here so the counters
+        // and the event stream stay on the caller's thread.
+        for (path, bytes) in outcome.small_transferred {
+            report.transferred_files = report.transferred_files.saturating_add(1);
+            report.transferred_bytes = report.transferred_bytes.saturating_add(bytes);
+            report.physical_bytes = report.physical_bytes.saturating_add(bytes);
+            report.byte_copies = report.byte_copies.saturating_add(1);
+            emit(LocalEvent::Transferred {
+                path,
+                bytes,
+                physical_bytes: bytes,
+                method: TransferMethod::ByteCopy,
+            });
+        }
+        for (path, mut rs) in outcome.ranges {
             if let Some(file) = large_files.iter().find(|file| file.path == path) {
                 emit(LocalEvent::Progress {
                     path: path.to_string(),
@@ -6501,7 +6544,15 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
 
 /// Drive one data-only `--server` session (Story 4.2), handshaking with the
 /// `CAP_DATA_ONLY` capability bit and writing the assigned large-file ranges.
-type DataThreadResult = (Vec<(WirePath, Vec<ByteRange>)>, u64);
+/// What one data session accomplished.
+struct DataThreadResult {
+    /// Large-file ranges this session durably wrote.
+    ranges: Vec<(WirePath, Vec<ByteRange>)>,
+    wire_bytes: u64,
+    /// Small files this session published, for the caller to account and emit.
+    small_transferred: Vec<(String, u64)>,
+    small_failed: usize,
+}
 ///
 /// # Errors
 /// Returns [`ServerError`] on protocol or transport failure.
@@ -6512,6 +6563,8 @@ fn run_data_thread(
     prefix: &str,
     job_id: [u8; 16],
     work: Vec<(FileEntry, Vec<ByteRange>)>,
+    small: Vec<FileEntry>,
+    local_workers: usize,
     compress: bool,
     compression_level: i32,
     permit: ConnectionPermit,
@@ -6538,6 +6591,8 @@ fn run_data_thread(
         prefix,
         job_id,
         &work,
+        &small,
+        local_workers,
         compress,
         compression_level,
         permit,
@@ -6561,6 +6616,8 @@ fn run_data_inner(
     prefix: &str,
     job_id: [u8; 16],
     work: &[(FileEntry, Vec<ByteRange>)],
+    small: &[FileEntry],
+    local_workers: usize,
     compress: bool,
     compression_level: i32,
     permit: ConnectionPermit,
@@ -6626,8 +6683,37 @@ fn run_data_inner(
     drop(permit);
 
     let source_reader = SourceReader::new(source_path);
+    // This session's share of the small files. Batches are self-contained —
+    // disjoint files, their own frames, their own acks — so they distribute
+    // across the data connections the user already paid to open.
+    let mut small_report = LocalSyncReport::default();
+    let mut small_events: Vec<LocalEvent> = Vec::new();
+    if !small.is_empty() {
+        let mut collect = |event: LocalEvent| small_events.push(event);
+        send_small_files_batched(
+            &mut writer,
+            &mut reader,
+            &mut decoder,
+            &source_reader,
+            small,
+            prefix,
+            compress,
+            compression_level,
+            local_workers,
+            &mut alloc,
+            &mut small_report,
+            &mut collect,
+        )?;
+    }
+    let small_transferred: Vec<(String, u64)> = small_events
+        .into_iter()
+        .filter_map(|event| match event {
+            LocalEvent::Transferred { path, bytes, .. } => Some((path, bytes)),
+            _ => None,
+        })
+        .collect();
     let mut written: Vec<(WirePath, Vec<ByteRange>)> = Vec::new();
-    let mut wire_bytes = 0_u64;
+    let mut wire_bytes = small_report.wire_bytes;
     for (file, ranges) in work {
         let rel = if prefix.is_empty() {
             file.path.clone()
@@ -6693,7 +6779,12 @@ fn run_data_inner(
     // Signal EOF to end the data session cleanly.
     drop(writer);
     drop(reader);
-    Ok((written, wire_bytes))
+    Ok(DataThreadResult {
+        ranges: written,
+        wire_bytes,
+        small_transferred,
+        small_failed: small_report.failed_entries,
+    })
 }
 
 /// Spawn a local child `xsync --server <path>` process and execute pull.
