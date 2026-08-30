@@ -20,7 +20,7 @@ not by value. Anything marked *unverified* has been built but not proven.
 | Not yet measured | Anything above ~1 GbE; any x86 that is not Zen 4; XFS and btrfs; WiFi; BSD. See 4.18. WSL2 is enabled but has no distro — 4.47 |
 | Known-unverified code | None. Phase 2 is complete: 4.4 verified V3.22 on the wire, 4.5, 4.6 and 4.7 are landed and measured |
 | Recently invalidated | The v1 wire is not frozen. `wire_bytes` is not the bytes on the wire (4.44). The preflight's "frozen wire" comment blamed the wrong encoding (4.5). The ~1.3 s sequential-spawn cost did not reproduce (4.7) |
-| Measured but not yet trustworthy | Nothing outstanding. 4.49 settled 4.15 at **2.15× idle**. Absolute figures on freya drift between sessions by ~1.7× for reasons not identified — compare only within a session, with alternating arms |
+| Measurement discipline | 4.15 is **2.05–2.15×** (4.49, three sessions). freya is stable across sessions: the same code measured 24.88 / 24.79 / 26.30 s, a 6% spread. The lone 14.4 s figure reproduces under no configuration and is treated as erroneous. Every benchmark verifies exit status and landed file count |
 
 **The result the next few phases exist to act on.** Small-file network sync is
 bound by neither endpoint: both sit near 50% CPU, and a Pi 5 receives within 7%
@@ -1723,38 +1723,45 @@ part that matters for engineering.
 > original 19.70 s. There was no warmup effect. **A mechanism proposed to
 > explain a surprising number must be tested before it is written down.**
 
-### 4.49 — Re-measure 4.15 idle *(done 2026-08-30 — the stated hypothesis was wrong)*
+### 4.49 — Re-measure 4.15 idle *(closed 2026-08-30 — twice, and the second pass corrected the first)*
 
-- [x] Idle freya (load 0.51, `xc` finished), congress-100k, alternating arms:
+**Final answer: 4.15 is 2.05×–2.15×.** Idle host, wired link, alternating arms,
+every run verified by exit status *and* landed file count:
 
-| | rep 1 | rep 2 | files/s |
-|---|---|---|---|
-| before 4.15 | 24.89 s | 24.69 s | 4,422 |
-| after 4.15 | 11.53 s | 11.54 s | **9,504** |
+| session | conditions | before | after | ratio |
+|---|---|---:|---:|---|
+| first | freya loaded (`xc` ~950% CPU) | 24.88 s | 13.36 s | 1.86× |
+| second | freya idle | 24.79 s | 11.54 s | 2.15× |
+| third | freya idle, wired, verified | 26.30 s | 12.80 s | **2.05×** |
 
-**4.15 is 2.15× on an idle host**, tighter than the 1.86× measured under load.
-The loaded figure *understated* the gain.
+**The premise this story was filed on was false**, and so was the conclusion I
+first drew from disproving it.
 
-**The hypothesis this story was filed on is false.** It assumed contention had
-inflated the *before* arm. It had not: idle `before` is 24.79 s against 24.88 s
-loaded — indistinguishable. So the 14.4 s recorded earlier in the cycle for
-"equivalent code" had some other cause.
+The filing assumed contention had inflated the *before* arm. It had not — idle
+and loaded `before` are indistinguishable. That left the 14.4 s recorded earlier
+in the cycle for equivalent code unexplained, and I wrote it up as *"the same
+commit is simply slower on this host today"* — i.e. as **host drift**, which
+would cast doubt on every freya number ever taken.
 
-**Chased and settled: the code is exonerated.** Building `bb5d6a06` — the exact
-pre-4.5 commit that produced 14.4 s — for **both** client and server and
-re-running gives **24.98 / 24.46 s**. 4.5, 4.6 and 4.7 therefore introduced no
-regression; the same commit is simply slower on this host today than it was this
-morning. ZFS fragmentation is ruled out (`FRAG 12%`, `CAP 7%`, unchanged), as is
-load. **The cause is unidentified and the 14.4 s figure is not reproducible by
-any version, including its own.** It should not be cited.
+That was the wrong conclusion. The same `before` code has now been measured in
+three separate sessions at **24.88, 24.79 and 26.30 s** — a 6% spread across
+load states, link states and rebuilds. **This host is stable.** The 14.4 s
+figure is a lone 1.8× outlier that reproduces under *no* tested configuration:
+not with matched pre-4.5 client and server (`bb5d6a06`: 24.98 / 24.46 s), not
+idle, not wired, not verified. Load, ZFS fragmentation (`FRAG 12%`, `CAP 7%`,
+unchanged), CPU governor and network path are all ruled out.
 
-**The methodology lesson, which is the durable part.** A single-arm number from
-hours earlier was treated as a baseline and produced a false regression scare.
-Only the interleaved A/B — same session, alternating arms — survived contact
-with the host's own drift. 4.21's harness must make bracketed controls the
-default rather than something remembered, and cross-session absolute
-comparisons should be refused outright unless the host state is captured
-alongside them.
+**It should therefore be treated as an erroneous measurement, not as evidence of
+drift** — a contained problem rather than one that taints the record. It was
+taken before verification was routine, in the same stretch that produced the
+retracted WSL numbers in 4.48, and it verified only the final repetition's file
+count.
+
+**The durable lesson stands and is now sharper.** A single-arm number from hours
+earlier was treated as a baseline and manufactured a false regression scare, then
+a false drift conclusion on top of it. Only interleaved same-session A/Bs with
+per-run verification have survived contact with reality this cycle. 4.21 must
+make both the default.
 
 ### 4.50 — A 2.5 GbE point-to-point link, and what it is for
 
