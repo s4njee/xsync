@@ -18,8 +18,8 @@ not by value. Anything marked *unverified* has been built but not proven.
 | Measured platforms | macOS (M1 Max), Linux x86_64 (freya 7950X; mars 7900X), Linux aarch64 (orion, Pi 5), Windows 11 (7900X — the same physical box as mars, dual-boot) |
 | Measured corpora | congress (1k/10k/100k/1m), cb7, Manga |
 | Not yet measured | Anything above ~1 GbE; any x86 that is not Zen 4; XFS and btrfs; WiFi; BSD. See 4.18 |
-| Known-unverified code | 4.7 — multi-stream capability negotiation still hands the control session `capabilities=0x0` |
-| Recently invalidated | The v1 wire is not frozen. `wire_bytes` is not the bytes on the wire (4.44). The preflight's "frozen wire" comment blamed the wrong encoding entirely (settled in 4.5) |
+| Known-unverified code | None. Phase 2 is complete: 4.4 verified V3.22 on the wire, 4.5, 4.6 and 4.7 are landed and measured |
+| Recently invalidated | The v1 wire is not frozen. `wire_bytes` is not the bytes on the wire (4.44). The preflight's "frozen wire" comment blamed the wrong encoding (4.5). The ~1.3 s sequential-spawn cost did not reproduce (4.7) |
 
 **The result the next few phases exist to act on.** Small-file network sync is
 bound by neither endpoint: both sit near 50% CPU, and a Pi 5 receives within 7%
@@ -116,7 +116,7 @@ after the batching fix). A macOS number completes that comparison.
 
 ---
 
-## Phase 2 — The work the unfrozen wire unblocks
+## Phase 2 — The work the unfrozen wire unblocks *(complete 2026-08-30)*
 
 `backlogv3.md` carries the full note. Backward compatibility is not a
 requirement, so "the wire cannot change" stops being a valid reason. Ordered so
