@@ -5535,31 +5535,46 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         streams,
     });
 
+    // The control session carries every small file and the whole plan, so it
+    // needs the same capabilities as the data sessions below. Advertising none
+    // meant it negotiated no compression and could not represent filter rules,
+    // which silently emptied the destination index whenever an include rule was
+    // in play -- every file then looked new and was re-sent on every run.
+    let control_capabilities = CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES;
     write_frame(
         &mut cwriter,
         calloc(),
         &Message::Handshake {
             role: Role::Source,
-            capabilities: 0,
+            capabilities: control_capabilities,
             max_payload: MAX_COMPLETE_PAYLOAD as u32,
             max_segment: MAX_DATA_SEGMENT as u32,
             window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
             job_id,
-            compression: CompressionMode::None,
-            compression_level: 3,
+            compression: if options.compress {
+                CompressionMode::Zstd
+            } else {
+                CompressionMode::None
+            },
+            compression_level: options.compress_level,
         },
     )?;
-    if !matches!(
-        cdec.read(&mut creader)
-            .map_err(|e| map_transport_error(e, 0))?
-            .message,
-        Message::Handshake { .. }
-    ) {
+    let Message::Handshake {
+        compression: control_compression,
+        capabilities: control_remote_capabilities,
+        ..
+    } = cdec
+        .read(&mut creader)
+        .map_err(|e| map_transport_error(e, 0))?
+        .message
+    else {
         return Err(ServerError::UnexpectedMessage(
             "control handshake".to_owned(),
         ));
-    }
+    };
+    let control_compress = control_compression == CompressionMode::Zstd;
     expect_ack(&mut cdec, &mut creader)?;
+    let control_filter = filter_for_peer(options, control_remote_capabilities)?;
 
     write_frame(
         &mut cwriter,
@@ -5573,8 +5588,8 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             checksum: options.checksum,
             paranoid: options.paranoid,
             dry_run: options.dry_run,
-            exclude_patterns: encode_exclude_patterns(&options.exclude_patterns),
-            filter_rules: Vec::new(),
+            exclude_patterns: control_filter.exclude_patterns,
+            filter_rules: control_filter.rules,
         },
     )?;
     expect_ack(&mut cdec, &mut creader)?;
@@ -5908,7 +5923,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         &source_reader,
         &small_files,
         &prefix,
-        false,
+        control_compress,
         options.compress_level,
         &mut calloc,
         &mut report,
@@ -5958,19 +5973,22 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         let compress = options.compress;
         let compression_level = options.compress_level;
         let mut handles = Vec::new();
-        let work_by_thread: Vec<(std::process::Child, Vec<(FileEntry, Vec<ByteRange>)>)> =
-            data_work
-                .into_iter()
-                .map(|work| {
-                    let child = spawn_server_child(&dest, rsh, host)?;
-                    Ok((child, work))
-                })
-                .collect::<Result<_, ServerError>>()?;
-        for (child, work) in work_by_thread {
+        // Each thread opens its own connection, so establishment is concurrent
+        // rather than a sequential loop -- but bounded, so a high stream count
+        // does not trip the peer's `MaxStartups`.
+        let gate = ConnectionGate::new(MAX_CONCURRENT_CONNECTIONS);
+        for work in data_work {
             let sp = source_path_buf.clone();
             let prefix_copy = prefix.clone();
             let job = job_id_copy;
+            let dest_copy = dest.clone();
+            let rsh_copy = rsh.map(str::to_owned);
+            let host_copy = host.map(str::to_owned);
+            let gate_copy = std::sync::Arc::clone(&gate);
             handles.push(std::thread::spawn(move || {
+                let permit = ConnectionGate::acquire(&gate_copy);
+                let child =
+                    spawn_server_child(&dest_copy, rsh_copy.as_deref(), host_copy.as_deref())?;
                 run_data_thread(
                     child,
                     &sp,
@@ -5979,6 +5997,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
                     work,
                     compress,
                     compression_level,
+                    permit,
                 )
             }));
         }
@@ -6257,6 +6276,7 @@ fn run_data_thread(
     work: Vec<(FileEntry, Vec<ByteRange>)>,
     compress: bool,
     compression_level: i32,
+    permit: ConnectionPermit,
 ) -> Result<DataThreadResult, ServerError> {
     let stdin = child.stdin.take().ok_or_else(|| ServerError::Transport {
         stream: 0,
@@ -6282,6 +6302,7 @@ fn run_data_thread(
         &work,
         compress,
         compression_level,
+        permit,
     );
     if let Some(handle) = stderr {
         let text = handle.join().unwrap_or_default();
@@ -6304,6 +6325,7 @@ fn run_data_inner(
     work: &[(FileEntry, Vec<ByteRange>)],
     compress: bool,
     compression_level: i32,
+    permit: ConnectionPermit,
 ) -> Result<DataThreadResult, ServerError> {
     let mut writer = BufWriter::with_capacity(TRANSPORT_WRITE_BUFFER, stdin);
     let mut reader = BufReader::new(stdout);
@@ -6360,6 +6382,10 @@ fn run_data_inner(
         },
     )?;
     expect_ack(&mut decoder, &mut reader)?;
+    // Authentication is finished, so the connection slot can go to the next
+    // stream. Holding it for the whole transfer would cap concurrency instead
+    // of just establishment.
+    drop(permit);
 
     let source_reader = SourceReader::new(source_path);
     let mut written: Vec<(WirePath, Vec<ByteRange>)> = Vec::new();
@@ -6972,6 +6998,67 @@ fn ensure_remote_shell_known(rsh: Option<&str>, host: Option<&str>) {
     }
     // Neither form answered. Leave the cache alone and let the session report
     // the real failure rather than masking it here.
+}
+
+/// How many SSH connections may be authenticating at the same time.
+///
+/// OpenSSH's default `MaxStartups` is `10:30:100`: past ten concurrent
+/// *unauthenticated* connections it starts refusing at random. `--streams 16`
+/// opens seventeen at once counting the control session, which failed about
+/// two runs in three with a disconnected stream. Every stream still runs; they
+/// just do not all authenticate simultaneously.
+const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+
+/// Bounds how many peer connections are being established concurrently.
+struct ConnectionGate {
+    available: std::sync::Mutex<usize>,
+    released: std::sync::Condvar,
+}
+
+impl ConnectionGate {
+    fn new(permits: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            available: std::sync::Mutex::new(permits.max(1)),
+            released: std::sync::Condvar::new(),
+        })
+    }
+
+    /// Block until a connection slot is free, yielding a guard that frees it.
+    fn acquire(gate: &std::sync::Arc<Self>) -> ConnectionPermit {
+        let mut available = gate
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *available == 0 {
+            available = gate
+                .released
+                .wait(available)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *available -= 1;
+        ConnectionPermit {
+            gate: std::sync::Arc::clone(gate),
+        }
+    }
+}
+
+/// Frees its connection slot when dropped, which the data path does as soon as
+/// the peer's handshake proves authentication finished — not when the transfer
+/// finishes, which would cap concurrency for the whole run.
+struct ConnectionPermit {
+    gate: std::sync::Arc<ConnectionGate>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut available = self
+            .gate
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *available += 1;
+        self.gate.released.notify_one();
+    }
 }
 
 fn spawn_server_child(

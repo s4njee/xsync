@@ -276,18 +276,61 @@ bootstrap exist for.
 pattern vector *for every entry scanned* — an allocation per file. They now
 share one hoisted `FilterSet`.
 
-### 4.7 — Fix multi-stream capability negotiation *(V3.18 remainder)*
+### 4.7 — Fix multi-stream capability negotiation *(done 2026-08-30)*
 
-- [ ] The multi-stream control session negotiates `capabilities=0x0`, so it
-  compresses nothing — and every small file goes over it.
+- [x] The control session advertised `capabilities: 0` and hardcoded
+  `CompressionMode::None`. It carries the plan and **every small file**, so the
+  whole small-file path was uncompressed whenever `--streams > 1`.
 
-**AC**
-- The control session negotiates the same capabilities as the data sessions.
-- `--streams 16` stops failing with `Broken pipe` (N+1 SSH connections exceed
-  OpenSSH's default `MaxStartups`): cap concurrent connections, back off, or
-  refuse up front with a message naming the cause.
-- Connections are established concurrently rather than in a sequential
-  `spawn_server_child` loop, which costs ~1.3 s at 4-8 streams.
+**AC1 — the control session negotiates like the data sessions: PASS.** It now
+advertises `CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES` and uses the
+negotiated compression for its batched small-file sender, which was passed a
+hardcoded `false`. Measured on a 5-file congress subtree over `--streams 2`:
+**557,868 logical → 78,999 wire bytes, 7.06×**, where the previous code could
+not compress at all.
+
+**A third bug, found while testing, worse than the one filed.** The control
+session also sent `filter_rules: Vec::new()` plus the raw exclude list, so the
+server applied `--exclude '*'` to its *own destination scan*. The destination
+index came back empty, every file looked new, and **multi-stream re-transferred
+everything on every run**:
+
+| `--streams 2 --include 'keep/**' --exclude '*'`, run twice | before | after |
+|---|---|---|
+| second run | 3 transferred, 0 skipped | 0 transferred, **3 skipped** |
+| single-stream control | 0 transferred, 3 skipped | unchanged |
+
+The transferred *set* was always right — source filtering is client-side — so
+this was invisible except as work redone every time.
+
+**AC2 — `--streams 16` stops failing: PASS.** OpenSSH's default `MaxStartups`
+is `10:30:100`, and 16 streams plus the control session opens 17 connections
+that all authenticate at once. Measured before: **2 of 3 runs failed** with
+`server stream disconnected`. A `ConnectionGate` now bounds concurrent
+establishment to 8. After: **10 of 10 runs pass** (5 with a trivial file, 5
+with a 96 MB striped file). The permit is released as soon as the peer's
+handshake proves authentication finished, not when the transfer ends — holding
+it longer would have capped transfer concurrency rather than establishment.
+
+**AC3 — concurrent establishment: DONE, but the stated cost was not
+reproducible.** Each thread now opens its own connection instead of the main
+thread spawning them in a sequential loop. The ~1.3 s figure did not reproduce
+on this path: `spawn_server_child` only calls `Command::spawn`, which does not
+block on the SSH handshake, and the handshakes already ran inside the data
+threads. Measured setup, 96 MB file:
+
+| streams | 1 | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| before | 1.62 | 1.62 | 1.61 | 1.63–1.91 | 2 of 3 failed |
+| after | 1.71 | 1.68 | 1.56 | 1.56 | 1.66 |
+
+Flat in both, so there was no sequential-spawn penalty to remove here. If the
+1.3 s was real it was measured elsewhere — Windows process spawn is the
+plausible candidate, and 4.10's Windows numbers would settle it.
+
+**Not addressed**: streams still do not help this workload at all — 96 MB moves
+in ~1.6 s at every stream count, so the link is the limit. That is 4.14's
+question, not this one.
 
 ---
 
