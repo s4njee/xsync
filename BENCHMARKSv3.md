@@ -260,9 +260,16 @@ part.
 
 All figures congress-100k unless noted, two reps, warmup discarded, verified.
 
+> **The macOS → freya row did not reproduce.** Re-measured 2026-08-31 under R0a
+> (three reps, rotated order, paired ratio): `rsync -a` **10.94 s**, xsync **8.87 s**,
+> ratio **1.24×** — not 2.5×. xsync barely moved (8.00 → 8.87 s); `rsync -a` halved
+> (20.24 → 10.94 s). The 20.24 s figure is treated as erroneous, and the conclusion
+> drawn from it below — that macOS rsync is inherently slow — is **not supported**:
+> on the switched route macOS rsync runs the same corpus in 6.86 s.
+
 | sender → receiver | rsync -a | rsync -az | xsync | best |
 |---|---:|---:|---:|---|
-| macOS → freya | 20.24 s | 24.76 s | **8.00 s** | xsync **2.5×** |
+| macOS → freya *(superseded, see note)* | 20.24 s | 24.76 s | **8.00 s** | ~~xsync 2.5×~~ → **1.24×** |
 | macOS → freya, *no-op re-sync* | 6.52 s | — | **2.07 s** | xsync **3.2×** |
 | macOS → freya, *cb7* | 80.2 s | 195.3 s | **59.0 s** | xsync **1.36×** |
 | freya → orion | 9.86 s | 8.08 s | **7.81 s** | xsync **1.03×** |
@@ -270,10 +277,13 @@ All figures congress-100k unless noted, two reps, warmup discarded, verified.
 
 ### Three things this says
 
-**The sender platform decides the margin.** xsync is 2.5× ahead from macOS, at
-parity from a fast Linux box, and slightly *behind* from a Pi. rsync's cost
-profile is far more sender-sensitive than ours: macOS rsync is remarkably slow
-here, and that — not xsync being fast — is most of the 2.5×.
+**The sender platform decides the margin** — but by less than this section
+originally claimed. xsync is **1.24×** ahead from macOS over the mesh route
+(R0a, 2026-08-31), **1.02×** on the switched route to mars, at parity from a
+fast Linux box, and slightly *behind* from a Pi. The original text attributed
+most of a 2.5× margin to macOS rsync being "remarkably slow"; that attribution
+is withdrawn. macOS `rsync -a` runs this corpus in 6.86 s to mars and 10.94 s
+to freya, which is ordinary.
 
 **`-z` is a liability, not a feature, outside compressible data.** rsync
 compresses unconditionally when asked. On cb7 — largely `node_modules` and

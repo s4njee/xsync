@@ -127,12 +127,18 @@ well under an hour of machine time, excluding orion's slower cells.
 historical. Two specific claims must be resolved by it, because both are currently
 load-bearing and both are suspect:
 
-- **"xsync is 2.5x ahead of rsync from macOS"** rests on macOS→freya rsync taking
-  20.24 s. On 2026-08-31 macOS→mars rsync ran the same corpus in **7.76 s**. The mesh
-  accounts for perhaps 13%, not 160%. Either the freya figure is stale or it is
-  route-specific; until cell 8 says which, the 2.5x is not evidence.
-- **The README's 0.515x local APFS result** predates the native clone path and is
-  contradicted by later tuning documents. Cell 9 decides it.
+- **"xsync is 2.5x ahead of rsync from macOS"** — **resolved: it is 1.24x.** Cell 8
+  measured `rsync -a` at 10.94 s against xsync's 8.87 s on the same route. xsync barely
+  moved (8.00 → 8.87 s); rsync halved (20.24 → 10.94 s), so the original baseline was
+  erroneous. The gloss that macOS rsync is inherently slow is withdrawn — it runs this
+  corpus in 6.86 s to mars.
+- **The README's 0.515x local APFS result** — **resolved, and it was a corpus mismatch,
+  not a stale number.** Every 0.515/0.534 figure was `congress-10k`; cell 9 measured
+  `congress-100k` at **4.34x in xsync's favour** (5.79 s against 25.72 s). The comparison
+  inverts with scale because xsync's local cost is nearly flat in file count (5.29 s at
+  10k, 5.79 s at 100k) while rsync's is linear (2.82 s → 25.72 s). **A current
+  `congress-10k` local run is now the missing measurement**, since the small-end figures
+  predate the clone work.
 
 **Deliberately not in the anchor:** cb7, Windows and WSL2 (see the scheduling conflict
 under R4), no-op and churn workloads, and full phase attribution. The anchor establishes
