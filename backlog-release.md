@@ -4,7 +4,7 @@ Written 2026-08-30. The question this answers is narrower than "is v1 done": it
 is **what would hurt if this binary were installed on all your machines and used
 daily.**
 
-The packaging is not the problem. `release.yml` already builds five targets,
+The packaging *machinery* is not the problem, though the pipeline that runs it is (R1.5). `release.yml` already builds five targets,
 publishes `SHA256SUMS`, emits a build-provenance attestation, gates on a
 changelog entry, and `deny.toml` is enforced in CI. `docs/verifying-downloads.md`
 and `docs/release-process.md` exist and are real. **The blockers are
@@ -93,6 +93,37 @@ useless to anyone who has not read the codec.
   it.
 - Upgrade and rollback procedure in `docs/`, including what happens to
   in-progress transfers and existing journals.
+
+### R1.5 — CI has never been green
+
+- [ ] Four CI runs exist in this repo's entire history. **All four failed.**
+  v0.1 was tagged and released on top of a red build.
+
+Three distinct causes, and they are not equally serious:
+
+- **Format** — `cargo fmt --all -- --check` was red at every commit since the
+  gate was added. Not a toolchain disagreement: CI's pinned 1.88 and a local
+  1.97 produce byte-identical diffs. *Fixed in `80ed09b8`.*
+- **`x86_64-pc-windows-msvc`** — `cargo build --workspace` fails, but **every
+  error is in one file**, `benches/engine/src/bin/xsync-remote-spike.rs`, which
+  takes `std::os::unix::fs::MetadataExt`, `PermissionsExt`, and
+  `process::CommandExt` unconditionally. The shipped crates are fine; a bench
+  spike binary is breaking the workspace build on a target we release for.
+  Gate the bin on `#[cfg(unix)]` with a stub `main` elsewhere.
+  (`clone_spike.rs:14` also warns on an unused `set_symlink_file_times` on
+  Windows — a warning, not part of the failure.)
+- **The two runs on 2026-08-25** timed out at **24h0m** on a runner label that
+  no longer exists. `timeout-minutes: 45` was added afterwards, so this should
+  now fail in 45 minutes rather than a day — but it has not been re-observed,
+  so treat the runner matrix as unverified.
+
+**A red CI is worse than no CI**, because it stops being read. Nothing else in
+this document can be trusted to stay fixed until the pipeline is green and
+kept green.
+
+**AC**
+- All jobs green on `main`.
+- A release tag cannot be published from a red build.
 
 ---
 
@@ -203,11 +234,13 @@ Recording these so they are not re-litigated at release time:
 
 ## Suggested order
 
-1. **R1.1 signal handling** — most likely to bite, and it can leave a mess.
-2. **R1.3 `--version`** — small, and everything else's diagnosis depends on it.
-3. **R1.4 version skew** — required before the *second* machine gets a binary.
-4. **R2.1 memory at scale** — a measurement, not a change; do it before the Pi.
-5. **R1.2 `--delete` backup** — the largest piece of work here, and the guard
+1. **R1.5 green CI** — everything below is unenforceable without it, and the
+   remaining piece is one `#[cfg(unix)]` on a bench binary.
+2. **R1.1 signal handling** — most likely to bite, and it can leave a mess.
+3. **R1.3 `--version`** — small, and everything else's diagnosis depends on it.
+4. **R1.4 version skew** — required before the *second* machine gets a binary.
+5. **R2.1 memory at scale** — a measurement, not a change; do it before the Pi.
+6. **R1.2 `--delete` backup** — the largest piece of work here, and the guard
    already prevents the catastrophic case, so it need not block the first
    install on machines you control.
-6. Everything else.
+7. Everything else.
