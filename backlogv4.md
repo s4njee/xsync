@@ -1294,6 +1294,41 @@ than materialising a `Plan`, so the shape is present; the push path calls
 reading with sending *inside* the transfer phase. This overlaps the phase
 boundary itself.
 
+### 4.57 — The rsync fallback cannot pull
+
+- [ ] `rsync.rs` implements `sync_push` and nothing else. `--transport rsync`
+  (and the `auto` fallback that selects it when a peer has no `xs`) therefore
+  **works for uploads and fails for downloads**, which is half the operations a
+  general-purpose client performs.
+
+**Why it matters more than it looks.** The rsync transport is what makes `xs`
+usable against hosts the user does not administer: it speaks the rsync wire
+protocol (v32) natively to the remote's own `rsync --server`, needing no local
+`rsync` and no remote `xs`. That is the rung that turns "an optimisation for
+machines you control" into "works nearly everywhere" — and today it only holds
+weight in one direction.
+
+Surfaced by the Kestrel review (`../sftp/backlog-xs.md`, XS-A2b): a file browser
+downloads at least as often as it uploads, so a pull-less fallback drops half
+its traffic straight to a per-file protocol.
+
+**AC**
+- `sync_pull` over the rsync wire at parity with `sync_push`: recursive trees,
+  resumable where the protocol allows, the same `LocalEvent` stream, and the
+  same transient/fatal error classification.
+- `--transport auto` selects it for pulls on the same terms it already selects
+  it for pushes, and the run summary names the transport actually used.
+- The existing refusals stay honest rather than being silently widened:
+  `--delete`, include rules, `--streams > 1` and `--paranoid` are refused on
+  this transport today, and each must either work for pull or be refused with
+  the same message it gets on push.
+- Round-trip tested against a real GNU rsync peer, not only against ourselves —
+  the push path already has that discipline in `rsync_wire` tests.
+
+**Explicitly out of scope**: making the rsync transport reach feature parity
+with the native one. It is a compatibility rung, not a second first-class
+backend, and it should stay small enough to stay correct.
+
 ## Phase 10 — Benchmarkability
 
 Written 2026-08-29, after asking where this cycle's knowledge actually came
