@@ -2060,6 +2060,66 @@ a false drift conclusion on top of it. Only interleaved same-session A/Bs with
 per-run verification have survived contact with reality this cycle. 4.21 must
 make both the default.
 
+### 4.66 — The receiver writes large-file chunks inline, and slow storage pays for it
+
+- [ ] On a Raspberry Pi 5 receiver, large-file push runs at **85.5 MB/s against
+  rsync's 111.8** -- a 1.31x gap that does not appear on a fast NVMe host. The
+  receiver's disk write happens *in* the receive loop, so it never overlaps the
+  network.
+
+**Measured 2026-08-31, Mac -> orion, after orion was moved onto router1** (so
+this is a switched gigabit path, not the mesh). Corpora: congress-100k
+(109,615 files, 850 MB) and 3 large files (0.98 GB). Every run verified exit
+status and landed file count.
+
+| corpus | direction | rsync | xsync |
+|---|---|---:|---:|
+| congress-100k | push | 9.26 s | **8.60 s** |
+| large files | push | 8.78 s (111.8 MB/s) | 11.49 s (85.5 MB/s) |
+| large files | pull | 8.79 s (111.7 MB/s) | 9.81 s (100.1 MB/s) |
+
+Small files are fine -- xsync is *ahead* there, and the Pi receives 109,615
+files within 20% of what the 7900X manages. Large-file push is the problem.
+
+**The diagnosis, after two wrong turns.**
+
+1. *Receiver fsync frequency.* Batching the receiver's flush and checkpoint to
+   every 8 chunks produced **no measurable change** (11.49 s before, 11.49 s
+   after). Reverted rather than kept: it traded resume granularity for nothing.
+   The reasoning error is worth recording -- `sync_staged_chunks` flushes the
+   whole staging file, so batching 8 chunks flushes 64 MB in one call instead
+   of 8 MB in eight. The same bytes are flushed either way, and fsync cost
+   tracks bytes, not calls.
+2. *Write pattern.* xsync `set_len`s the staging file and fills holes with
+   seek-and-write per chunk, where rsync extends sequentially. Measured on
+   orion directly: **414.2 MB/s sequential vs 413.7 MB/s sparse-and-reopen**.
+   No difference at all.
+
+**What it actually is.** Destination on tmpfs gives **107.6 MB/s** against
+ext4's 85.5, and orion's disk sustains 413 MB/s. Writing 982 MB therefore costs
+~2.4 s, and the measured ext4-vs-tmpfs gap is 2.36 s. Transfer 8.7 s plus a
+serialized 2.4 s of disk is 11.1 s, against 11.49 s observed. fsync *interval*
+explains only 0.46 s of it (346 MB/s at every 8 MB, 413 MB/s at once-at-end).
+
+The receive loop verifies and writes each chunk before reading the next, so on
+any destination slower than the wire the two costs add instead of overlapping.
+mars hides this because its NVMe is roughly 8x faster than the link.
+
+**AC**
+
+- Large-file chunk writes overlap the network receive, as 4.26 already does for
+  small files with `ApplyPool`. The natural shape is the same: a bounded writer
+  pool, with acknowledgement still gated on the write completing.
+- Bounded memory. In-flight chunks must not accumulate without limit on a 4 GB
+  Pi; the existing request window is the natural bound.
+- The durability ordering is preserved: a range is journalled only after it is
+  on disk.
+- Re-measured on orion against rsync, and on mars to confirm no regression
+  where the disk was never the constraint.
+
+**Note on the earlier 3 GB figure.** orion has **4 GB** of RAM, not 3 GB as
+4.23 and `backlog-release.md` R2.1 state. It also boots from NVMe, not SD.
+
 ### 4.65 — Pull's durability barriers were the last of the gap
 
 - [x] **Fixed 2026-08-31. Pull is now within 2% of rsync.** The receiver flushed
