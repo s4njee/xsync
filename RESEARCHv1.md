@@ -118,6 +118,7 @@ R2 depends on it. Initial copy only; no-op and churn workloads belong to R5 and 
 | 7 | mars → Mac, pull | large | pull is separate code and has its own history |
 | 8 | Mac → freya, ext4 | congress-100k | settles the disputed 2.5x (label as mesh) |
 | 9 | macOS APFS, same volume | congress-100k | settles the README's 0.515x local claim |
+| 9b | macOS APFS, same volume | congress-10k | the size the 0.515x was actually measured at |
 | 10 | mars ext4, cross-device | congress-100k | local Linux anchor for R2 |
 
 Ten cells, two arms, four runs each. At roughly 8-12 s per run for these corpora that is
@@ -132,13 +133,18 @@ load-bearing and both are suspect:
   moved (8.00 → 8.87 s); rsync halved (20.24 → 10.94 s), so the original baseline was
   erroneous. The gloss that macOS rsync is inherently slow is withdrawn — it runs this
   corpus in 6.86 s to mars.
-- **The README's 0.515x local APFS result** — **resolved, and it was a corpus mismatch,
-  not a stale number.** Every 0.515/0.534 figure was `congress-10k`; cell 9 measured
-  `congress-100k` at **4.34x in xsync's favour** (5.79 s against 25.72 s). The comparison
-  inverts with scale because xsync's local cost is nearly flat in file count (5.29 s at
-  10k, 5.79 s at 100k) while rsync's is linear (2.82 s → 25.72 s). **A current
-  `congress-10k` local run is now the missing measurement**, since the small-end figures
-  predate the clone work.
+- **The README's 0.515x local APFS result** — **resolved: obsolete, and the loss is
+  gone at both sizes.** Cell 9 measured `congress-100k` at **4.34x** in xsync's favour
+  (5.79 s against 25.72 s). The follow-up `congress-10k` cell, run on the same binary,
+  measured **2.47x** ahead (1.36 s against 3.34 s) where the old figure was 0.53x behind
+  — xsync improved 3.9x against its own past self at that size (5.29 s → 1.36 s).
+  There is no crossover; xsync leads at both sizes and its margin grows because it scales
+  better (4.26x cost for 10x the files, against rsync's 7.70x).
+
+  An intermediate revision of this file claimed the local cost was "nearly flat in file
+  count". That was wrong, and wrong in this project's characteristic way: it paired a 10k
+  number from one revision with a 100k number from another. The corrected pair is above,
+  both from `a6410601-dirty`.
 
 **Deliberately not in the anchor:** cb7, Windows and WSL2 (see the scheduling conflict
 under R4), no-op and churn workloads, and full phase attribution. The anchor establishes

@@ -1,0 +1,45 @@
+{
+  "schema": "xsync.release-bench.v1",
+  "generated_unix_seconds": 1788211132,
+  "tier": "smoke",
+  "seed": 42,
+  "repetitions": 3,
+  "routes": [
+    "same-volume"
+  ],
+  "cells": [
+    {
+      "cell": "congress-10k-initial-copy-same-volume",
+      "class": "congress-10k",
+      "workload": "initial-copy",
+      "route": "same-volume",
+      "status": "passed",
+      "report": "benches/results/r0a/macos-same-volume-congress-10k/report-congress-10k-initial-copy-same-volume.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 3.342511499999091,
+          "mad_wall_seconds": 0.016765249994932674,
+          "median_cpu_seconds": 4.932583999999999,
+          "peak_rss_bytes": 52805632,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 1.360276750012417,
+          "mad_wall_seconds": 0.03277337498730071,
+          "median_cpu_seconds": 2.275916,
+          "peak_rss_bytes": 52838400,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": 2.4695538977368825,
+          "paired_ratio_mad": 0.08897107655691183
+        }
+      }
+    },
+    {
+      "route": "ssh",
+      "status": "blocked",
+      "reason": "the ssh route was not selected; native xsync-over-SSH and RsyncTransport rows require --routes ssh with --ssh-host"
+    }
+  ]
+}

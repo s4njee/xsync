@@ -1285,22 +1285,29 @@ paired wall ratio (xsync median 5.977 s, rsync median 3.215 s). The same shape s
 the synthetic `deep-small` corpus locally: **0.578x**, with 2.46 s of CPU against rsync's
 0.23 s — a 10.6x CPU gap that is compute-bound, not round-trip-bound.
 
-> **Read that figure as a `congress-10k` result, because it is one.** Every measurement in
-> the 0.515/0.534 family was taken on `congress-10k` (10,961 files). On `congress-100k`
-> the same comparison **inverts**: R0a measured xsync **5.79 s** against `rsync -a`
-> **25.72 s**, a paired ratio of **4.34x** in xsync's favour (2026-08-31, three reps,
-> MAD ≤ 2.3%).
+> **Everything in this subsection is historical. The local loss no longer exists at any
+> measured size.** Re-measured 2026-08-31 on one binary, three reps, rotated order,
+> independent manifest oracle:
 >
-> The reason is that the two tools scale differently, not that one measurement was wrong.
-> xsync's local cost is nearly flat in file count — **5.29 s at 10k, 5.79 s at 100k** —
-> because the clone path does O(1) work per cloned subtree. rsync's is linear: **2.82 s to
-> 25.72 s** for 10x the files. The crossover sits somewhere between 10k and 100k entries.
+> | corpus | xsync | `rsync -a` | paired ratio | MAD |
+> |---|---:|---:|---:|---:|
+> | `congress-10k` | **1.36 s** | 3.34 s | **2.47x** ahead | ≤2.4% |
+> | `congress-100k` | **5.79 s** | 25.72 s | **4.34x** ahead | ≤2.3% |
 >
-> So the per-file syscall analysis below is sound *at small scale*, and the conclusion that
-> xsync's advantage comes from doing categorically less work is exactly right — that is
-> precisely what the flat curve shows. What does not follow is that xsync is slower locally
-> in general. **A current `congress-10k` local re-measurement is missing**; the 10k figures
-> predate the clone work, so whether the loss still exists at that size is unknown.
+> The 0.515x/0.534x figures were `congress-10k` results taken *before* the native clone
+> path landed. At the same size xsync now runs in **1.36 s against the 5.29 s** those
+> measurements recorded — a 3.9x improvement on its own past self, which is what turned a
+> 0.53x loss into a 2.47x win.
+>
+> **There is no crossover.** xsync is ahead at both sizes, and its margin grows with scale
+> because it scales better, not because it is flat: over a 10x increase in file count xsync
+> costs **4.26x** more (1.36 → 5.79 s) against rsync's **7.70x** (3.34 → 25.72 s). An
+> earlier revision of this note claimed the local cost was "nearly flat"; that was wrong,
+> and wrong in the way this project keeps warning about — it paired a 10k number from one
+> revision with a 100k number from another.
+>
+> The per-file syscall analysis below remains an accurate account of *why* the old loss
+> existed and how it was closed. It is no longer a description of current behaviour.
 
 **The conclusion this drives:** xsync does not have a bytes problem or a hashing problem.
 It has a **per-file syscall volume problem**, and its durable advantages come from doing
@@ -1697,18 +1704,21 @@ performance claim)*. Target: `congress-10k` initial copy with system time within
 MAD/median ≤ 15%, confirmed an order of magnitude up on `congress-100k`, with no regression
 on large files or on the no-op case (currently 1.91x ahead).
 
-Current status: **not met at `congress-10k`; met by a wide margin at `congress-100k`.**
-The 0.515x figure is a `congress-10k` measurement. The gate's own confirmation step — "an
-order of magnitude up on `congress-100k`" — now passes decisively: R0a measured a **4.34x**
-paired ratio there (xsync 5.79 s, `rsync -a` 25.72 s, 2026-08-31). xsync's local time is
-nearly flat in file count while rsync's is linear, so the gate is really asking about the
-small end of the curve.
+Current status: **met at both measured sizes.** The gate asks for a wall-clock paired
+ratio of at least 0.9 on `congress-10k`, confirmed an order of magnitude up on
+`congress-100k`. Re-measured 2026-08-31: **2.47x** at 10k (xsync 1.36 s, `rsync -a`
+3.34 s) and **4.34x** at 100k (5.79 s against 25.72 s), three repetitions each with
+MAD/median ≤ 2.4%.
 
-Two of three known waste items are fixed (read-buffer sizing, the 12 MiB clone threshold);
-the third (temp-path hash caching) was measured, showed no useful gain, and is honestly
-reported as such. **The 10k figure has not been re-measured since the clone work landed**,
-so the first action on this story is a current `congress-10k` local run, not more
-optimisation.
+The 0.515x that this line previously reported was a pre-clone-path measurement. Two of
+three known waste items are fixed (read-buffer sizing, the 12 MiB clone threshold); the
+third (temp-path hash caching) was measured, showed no useful gain, and is honestly
+reported as such.
+
+**The system-time half of the gate is still unverified.** The target was system time within
+1.5x of `rsync -a`, and the attribution trace remains blocked below. Wall clock passing does
+not establish that the per-file syscall volume was fixed rather than hidden behind work the
+clone path now avoids entirely.
 
 The attribution trace is **blocked**: macOS SIP produces empty `dtruss` tables even under a
 user-run privileged capture, and `fs_usage` requires root. Options are a Linux host for the
