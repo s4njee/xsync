@@ -2137,6 +2137,40 @@ of it -- but a fifth of what looked like the problem was rsync doing less work.
 not slower at moving or committing bytes; it is slower only because it stops to
 write them. Remove the serialization and it is already ahead.
 
+**`--streams` confirms the diagnosis, and works around it today.** If the
+bottleneck really is a serialized receiver write, then running several data
+sessions concurrently should overlap one session's disk write with another's
+network receive. It does. To durability, on orion:
+
+| arm | runs | throughput |
+|---|---|---:|
+| rsync | 9.69 / 9.82 s | 100.6 MB/s |
+| `--streams 1` | 11.88 / 11.73 s | 83.2 MB/s |
+| `--streams 2` | 13.69 / 13.40 s | **72.5 MB/s** (worse than 1) |
+| `--streams 4` | 11.32 / 11.70 s | 85.3 MB/s |
+| `--streams 8` | 9.37 / 9.88 / 10.52 s | **93-105 MB/s** |
+| `--streams 12` | 11.28 s | 87.1 MB/s |
+| `--streams 16` | 11.85 s | 82.9 MB/s |
+
+All verified by SHA-256. Eight streams reaches roughly rsync parity, with
+noticeably wider run-to-run spread than single-stream. Two streams being
+*slower* than one is unexplained and worth a look.
+
+**This complicates 4.14's heuristic in a way that story does not anticipate.**
+4.14 measured Manga peaking at **4** streams and proposes deriving the default
+from the share of transferred bytes in files above `MAX_DATA_SEGMENT`. On the
+same corpus orion peaks at **8**. The difference is not the corpus -- it is the
+*receiver's disk*: streams help here precisely because they hide a write the
+sender knows nothing about. A sender-side heuristic keyed on the byte
+distribution cannot see that, so it will pick the wrong value on exactly the
+hosts where streams matter most.
+
+**It is a workaround, not the fix.** Eight streams means eight SSH connections
+and eight server processes on a four-core Pi, plus the ~1.3 s of connection
+setup 4.14 measured. A receiver-side writer pool buys the same overlap inside
+one session, and would also make the streams default a question about the wire
+rather than about the destination's disk.
+
 **AC**
 
 - Large-file chunk writes overlap the network receive, as 4.26 already does for
