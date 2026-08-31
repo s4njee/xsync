@@ -4333,19 +4333,24 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     .clone();
             }
 
-            let stable = match source_reader.read(&file_to_read) {
-                Ok(s) => s,
-                Err(err) => {
-                    emit(LocalEvent::Failed {
-                        path: file.path.to_string(),
-                        message: err.to_string(),
-                    });
-                    report.failed_entries = report.failed_entries.saturating_add(1);
-                    continue;
-                }
-            };
-
+            // Only the small/medium path buffers the whole file, because it
+            // sends the whole file as one segment anyway. Large files stream:
+            // buffering them cost 555 ms and 517 ms of dead air per file before
+            // a single chunk shipped, spent reading and hashing with the
+            // network idle, and held the entire file in memory while doing it
+            // (4.63, and the memory half of 4.23).
             if file.size <= MAX_DATA_SEGMENT as u64 {
+                let stable = match source_reader.read(&file_to_read) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        emit(LocalEvent::Failed {
+                            path: file.path.to_string(),
+                            message: err.to_string(),
+                        });
+                        report.failed_entries = report.failed_entries.saturating_add(1);
+                        continue;
+                    }
+                };
                 // Small / medium file: send batch + segment.
                 let mut rec = entry_record_from_file_entry(file);
                 rec.path = file.path.as_bytes().to_vec();
@@ -4470,6 +4475,29 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 let missing =
                     crate::journal::missing_chunks(file.size, LARGE_FILE_CHUNK, &verified_ranges);
                 let mut sent_bytes = 0u64;
+                // Resume needs every byte to compute the whole-file digest, and
+                // `missing_chunks` can return ranges that are not chunk aligned
+                // once some are already verified. Streaming covers the fresh
+                // case -- the one that matters, and the one that is always
+                // aligned. A resume falls back to buffering, which is what it
+                // did before and is rare enough not to matter.
+                let streaming = verified_ranges.is_empty();
+                let mut whole = blake3::Hasher::new();
+                let buffered = if streaming {
+                    None
+                } else {
+                    match source_reader.read(&file_to_read) {
+                        Ok(stable) => Some(stable),
+                        Err(err) => {
+                            emit(LocalEvent::Failed {
+                                path: file.path.to_string(),
+                                message: err.to_string(),
+                            });
+                            report.failed_entries = report.failed_entries.saturating_add(1);
+                            continue;
+                        }
+                    }
+                };
                 // Chunks go out without stopping for each acknowledgement.
                 // Before 4.60 this loop wrote one 8 MB chunk and blocked on
                 // both of its acks, so the wire sat idle while the receiver
@@ -4488,6 +4516,18 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     let start = usize::try_from(range.offset).unwrap_or(0);
                     let len = usize::try_from(range.length).unwrap_or(0);
                     sent_bytes = sent_bytes.saturating_add(range.length);
+                    let chunk = match &buffered {
+                        Some(stable) => stable.bytes[start..(start + len)].to_vec(),
+                        None => {
+                            source_reader.read_range(&file_to_read, range.offset, range.length)?
+                        }
+                    };
+                    // Streaming visits every chunk in order, so the whole-file
+                    // digest can be accumulated as the data goes past instead
+                    // of demanding a separate pass over the file.
+                    if streaming {
+                        whole.update(&chunk);
+                    }
                     let range_msg = Message::LargeFileRange {
                         file_id,
                         range: ByteRange {
@@ -4502,8 +4542,8 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     let seg_msg = Message::FileSegment {
                         file_id,
                         offset: range.offset,
-                        digest: *blake3::hash(&stable.bytes[start..(start + len)]).as_bytes(),
-                        data: stable.bytes[start..(start + len)].to_vec(),
+                        digest: *blake3::hash(&chunk).as_bytes(),
+                        data: chunk,
                     };
                     let msg_id = alloc_id();
                     let wire_bytes = write_data_frame(
@@ -4552,9 +4592,13 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 checkpoint_bytes_total =
                     checkpoint_bytes_total.saturating_add(resumed_bytes.saturating_add(sent_bytes));
 
+                let file_digest = match &buffered {
+                    Some(stable) => *stable.blake3.as_bytes(),
+                    None => *whole.finalize().as_bytes(),
+                };
                 let finish_msg = Message::LargeFileFinish {
                     file_id,
-                    digest: *stable.blake3.as_bytes(),
+                    digest: file_digest,
                 };
                 let msg_id = alloc_id();
                 let b = encode_frame(msg_id, &finish_msg)?;

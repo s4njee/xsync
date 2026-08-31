@@ -2060,6 +2060,56 @@ a false drift conclusion on top of it. Only interleaved same-session A/Bs with
 per-run verification have survived contact with reality this cycle. 4.21 must
 make both the default.
 
+### 4.63 — Push buffered the whole file before sending a byte
+
+- [x] **Fixed 2026-08-31. Push is now at parity with rsync and at the link
+  ceiling.** `source_reader.read()` buffered *and hashed* the entire file
+  before the first chunk shipped, so the network sat idle for the whole of it.
+
+**How the candidate was chosen, rather than guessed.** Two suspects were named:
+the whole-file buffer, and BLAKE3 running inline in the send loop. They predict
+different signatures -- a buffer is a one-time stall per *file*, inline hashing
+is a fixed cost per *chunk* -- and the `--progress-json` stream separates them:
+
+| measurement | before |
+|---|---:|
+| per-chunk gap (median of 116) | **72.5 ms** |
+| 8 MB at 112 MB/s, i.e. pure wire time | 71.4 ms |
+| stall before each file's first chunk | **555 ms, 517 ms** |
+
+Per-chunk cost was **1.1 ms above wire time**: inline BLAKE3 was already
+entirely hidden behind the network by 4.60's pipelining, so that candidate was
+dead. The ~1.07 s of per-file dead air was the whole gap.
+
+**Result.** Large files stream through `read_range`, accumulating the
+whole-file digest as the data goes past rather than demanding a separate pass.
+
+| arm | runs (s) | median | throughput |
+|---|---|---:|---:|
+| rsync | 8.71 / 8.76 / 8.73 | 8.73 | 112.4 MB/s |
+| xsync | 9.21 / 8.75 / 8.74 | 8.75 | **112.2 MB/s** |
+
+The first xsync run is a cold page cache; the rest are indistinguishable from
+rsync. `dd | ssh cat` on this path gives ~113 MB/s, so **this is the link, not
+the tool.** Stall fell from 555/517 ms to 198/91 ms and the per-chunk gap is
+unchanged at 72.4 ms. All files verified by SHA-256.
+
+**It also removes the whole-file buffer**, which is the memory half of 4.23: a
+push no longer holds an entire large file in RAM, so a file bigger than the
+3 GB Pi's memory is no longer an OOM waiting to happen. The small/medium path
+still buffers, which is correct -- it sends the whole file as one segment.
+
+**Two deliberate limits.**
+
+- **Resume still buffers.** `missing_chunks` can return ranges that are not
+  chunk aligned once some are verified, and the whole-file digest needs every
+  byte. Streaming covers the fresh case, which is always aligned and is the one
+  that matters; resume keeps the old path.
+- **A file that becomes unreadable mid-transfer now fails the run** rather than
+  being skipped, because `LargeFilePrepare` has already been sent by then. The
+  common failures -- missing, unreadable, wrong kind -- are still caught before
+  any protocol message and still skip the file.
+
 ### 4.62 — Pull was lockstep on both sides
 
 - [x] **Fixed 2026-08-31.** The pull path spent a full round trip per 8 MB --
