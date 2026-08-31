@@ -723,56 +723,69 @@ conclusion that flips is recorded in `docs/STREAMS.md` / `docs/OS.md`.
 
 ### 4.17 — SSH transport: how much is the tunnel costing? *(measured 2026-08-30 — nothing)*
 
-- [x] Decomposed on a Linux pair (freya → orion, 1 GbE) so no OS or USB-adapter
-  artefact intrudes. **The answer is that SSH is not costing anything
-  measurable, and cipher choice is not a lever.**
+- [x] Decomposed on a Linux pair (freya ↔ orion, 1 GbE), then re-run
+  same-session at matched transfer size after the first pass produced a
+  contradiction. **SSH costs nothing measurable, and no sender optimisation
+  beats it.**
 
-| path | throughput |
+**All senders, 2 GB, freya → orion, same session:**
+
+| sender | throughput |
 |---|---:|
-| ssh, `aes128-gcm` | **85.3 MB/s** |
-| ssh, `chacha20-poly1305` | 84.9 MB/s |
-| ssh, default negotiated | 84.2 MB/s |
-| ssh, `aes256-gcm` | 82.2 MB/s |
-| **raw TCP, native Rust both ends** | **77.1 MB/s** |
-| xsync, cb7 (logical, compressed) | 75.8 MB/s |
-| 1 GbE theoretical | 125.0 MB/s |
+| C++ `send()`, 4 MB writes | **78.1 MB/s** |
+| C++ `send()`, 256 KB writes | 78.1 MB/s |
+| Rust `write_all`, 4 MB | 77.6 MB/s |
+| C++ + 8 MB `SO_SNDBUF` | 77.4 MB/s |
+| **ssh → `cat >/dev/null`** | **77.4 / 75.9 MB/s** |
+| C++ `splice()` pipe→socket | 75.9 MB/s |
+| C++ `MSG_ZEROCOPY` | failed, `ENOBUFS` |
 
-**SSH measures *faster* than raw TCP here**, which is the headline and needs
-saying carefully: it does not mean encryption is free, it means **our raw-TCP
-baseline never beat OpenSSH's socket handling**. Three sender implementations
-were tried — `socat` at default block size (71.6), `socat` with 1 MB blocks
-(69.8), and a purpose-written Rust sender against a Rust sink (77.1, both ends
-agreeing). OpenSSH still wins. Whatever it does with socket options, buffer
-sizes and write batching is better than a naive `write_all` loop.
+**Everything lands in a 3% band.** Language makes no difference, write size makes
+no difference from 256 KB to 4 MB, a larger `SO_SNDBUF` makes no difference,
+zero-copy `splice()` is marginally *worse*, and `MSG_ZEROCOPY` needs a locked-
+memory limit we have not raised. **SSH sits inside the same band as raw
+sockets.**
 
-**Consequences, and they redirect Phase 12.**
+**A number to retract.** The first pass had ssh at **84–85 MB/s**, *above* raw
+TCP, and the write-up reasoned about why OpenSSH might beat a naive loop. It
+does not. That measurement used 1 GB transfers while the raw baselines used
+2 GB; at matched size and in the same session ssh gives 75.9–77.4. **The
+comparison was never like-for-like.** A result that says "the encrypted path
+beats the unencrypted one" should have been treated as a measurement bug
+immediately rather than explained.
 
-- **Cipher selection is dead as an optimisation.** 4% spread across four
-  ciphers, and AES-GCM ties ChaCha20 even with a Pi 5 on one end — the
-  Cortex-A76 has ARMv8 crypto extensions, so the "weak CPU prefers ChaCha20"
-  intuition does not apply.
-- **A QUIC or TLS transport cannot be justified on throughput.** It would have
-  to beat 84 MB/s on a link whose theoretical ceiling is 125 and whose raw
-  sockets give 77. Phase 12's case has to rest on the daemon, the trust model
-  and connection reuse — *not* on speed. The phase premise should be rewritten
-  accordingly.
-- **xsync is within ~10% of the transport.** 75.8 MB/s of logical data against
-  an 84 MB/s SSH ceiling, and the wire figure is lower still because that corpus
-  compresses. There is very little left between us and the tunnel.
-- **The link is the limit on this pair.** 84 MB/s is 67% of gigabit
-  theoretical, which is ordinary for real TCP with a Pi on one end. Going faster
-  means a faster link (4.50), not a better transport — the reverse of what the
-  earlier macOS-only numbers suggested.
+**The link is the limit, and it is symmetric.**
 
-**Still open**: the 5.3 ms in-session round trip and the 195 ms session setup,
-both measured on the macOS pair through a USB gigabit adapter. Those are latency
-questions, not throughput ones, and 4.50 is where they get retested.
+| direction | raw TCP |
+|---|---:|
+| freya → orion | 77.6 MB/s |
+| orion → freya | 74.1 MB/s |
 
-**A measurement note.** Three separate "raw TCP" numbers were wrong before the
-fourth was right: `nc` absent, a Python receiver that capped at 71.6 MB/s, and
-`socat` at an 8 KB default block size. Each looked like a link measurement and
-was a tooling measurement. The rule that caught it was cross-checking against a
-*known* path — SSH — and refusing to believe raw sockets could be slower.
+~75 MB/s both ways, or **60% of gigabit line rate**, with the NIC reporting
+zero errors, drops, carrier faults or collisions. That is what this path
+delivers.
+
+**Consequences.**
+
+- **xsync is at the wire.** It moves 75.8 MB/s of logical data on cb7 against a
+  ~77 MB/s path. There is essentially nothing left to win on this pair.
+- **Cipher selection is dead**: 4% across four ciphers, and AES-GCM ties
+  ChaCha20 even with a Pi 5 on one end (Cortex-A76 has ARMv8 crypto).
+- **QUIC or TLS cannot be justified on throughput.** They would have to beat a
+  transport already indistinguishable from raw sockets. Phase 12 must rest on
+  the daemon, trust model and connection reuse — its stated premise needs
+  rewriting.
+- **Only a faster link moves this**, which is 4.50. Worth noting the path gives
+  60% of line rate, so the first question there is whether that is the switch,
+  the cabling or the Pi, not simply "buy 2.5 GbE".
+
+**Still open**: the 5.3 ms in-session round trip and 195 ms session setup, both
+measured on the macOS pair through a USB adapter. Latency, not throughput; 4.50
+retests them.
+
+**Four wrong "raw TCP" numbers preceded the right one**: `nc` absent, a Python
+sink capping at 71.6, `socat` at an 8 KB default block, and `socat` at 1 MB
+still short. Each read as a link measurement and was a tooling measurement.
 
 ### 4.18 — Platform and hardware matrix: where is the map blank?
 
