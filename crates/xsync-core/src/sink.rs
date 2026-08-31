@@ -5,11 +5,11 @@
 //! verification is requested once more before becoming a file-level failure.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -103,7 +103,6 @@ pub enum SinkError {
 #[derive(Debug, Clone)]
 pub struct Sink {
     root: PathBuf,
-    temporary_hashes: Arc<Mutex<HashMap<WirePath, String>>>,
     /// Directories this sink has already created or verified.
     ///
     /// `create_dir_all` stats every ancestor on each call, so calling it once
@@ -112,7 +111,7 @@ pub struct Sink {
     /// 56,412 stat calls. Directories are created up front by
     /// [`Self::create_directories`], so recording them lets the per-file parent
     /// check become a hash lookup.
-    ensured_directories: Arc<Mutex<HashSet<PathBuf>>>,
+    ensured_directories: Arc<RwLock<HashSet<PathBuf>>>,
 }
 
 impl Sink {
@@ -140,8 +139,7 @@ impl Sink {
     fn from_root(root: PathBuf) -> Self {
         Self {
             root,
-            temporary_hashes: Arc::new(Mutex::new(HashMap::new())),
-            ensured_directories: Arc::new(Mutex::new(HashSet::new())),
+            ensured_directories: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -191,14 +189,11 @@ impl Sink {
     pub fn temporary_path(&self, relative_path: impl Into<WirePath>) -> Result<PathBuf, SinkError> {
         let relative_path = relative_path.into();
         let final_path = self.destination_path(&relative_path)?;
-        let mut temporary_hashes = match self.temporary_hashes.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let hash = temporary_hashes
-            .entry(relative_path.clone())
-            .or_insert_with(|| blake3::hash(relative_path.as_bytes()).to_hex().to_string())
-            .clone();
+        // Computed rather than memoised. BLAKE3 over a short path is tens of
+        // nanoseconds; the global mutex that used to cache it cost microseconds
+        // per file once the apply pool had eight threads contending on it —
+        // the cache was more expensive than the value it held.
+        let hash = blake3::hash(relative_path.as_bytes()).to_hex().to_string();
         let parent = final_path
             .parent()
             .ok_or_else(|| invalid_path(&relative_path.to_string()))?;
@@ -473,7 +468,7 @@ impl Sink {
             .expect("validated destination paths always have a parent");
         if self
             .ensured_directories
-            .lock()
+            .read()
             .is_ok_and(|ensured| ensured.contains(parent))
         {
             return Ok(());
@@ -485,7 +480,7 @@ impl Sink {
     }
 
     fn remember_directory(&self, path: &Path) {
-        if let Ok(mut ensured) = self.ensured_directories.lock() {
+        if let Ok(mut ensured) = self.ensured_directories.write() {
             ensured.insert(path.to_path_buf());
         }
     }
@@ -515,7 +510,7 @@ impl Sink {
         let native = relative_path.to_native_path(&self.root);
         if native.parent().is_some_and(|parent| {
             self.ensured_directories
-                .lock()
+                .read()
                 .is_ok_and(|ensured| ensured.contains(parent))
         }) {
             return Ok(native);

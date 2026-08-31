@@ -1099,24 +1099,58 @@ platform, and unblocking the receiver is worth more there than on Linux.
 **Followed up in 4.25**: the pool is now wired into `run_data_sink` as well,
 which that story needed once small files began travelling the data path.
 
-### 4.27 — Syscall-level batching: io_uring and its cousins
+### 4.27 — io_uring *(investigated and declined 2026-08-30)*
 
-- [ ] Per small file the receiver pays open/write/fsync-free
-  close/utimes/chmod/rename — six-ish syscalls, each a round trip into the
-  kernel. The T1 syscall-attribution work (`benches/results/tuning/T1/`)
-  already measures where that time goes. io_uring can batch and overlap them
-  on Linux; macOS and Windows have no equivalent, which makes this a
-  Linux-only fast path behind a runtime probe.
+- [x] Measured rather than implemented. **The receiver is syscall-heavy but not
+  syscall-limited**, so batching syscalls cannot buy much.
 
-**Now testable on the Windows box**: the WSL2 kernel supports io_uring, so
-4.47 makes this measurable on that hardware for the first time.
+**The receiver is genuinely kernel-bound in CPU terms.** Undistorted
+(`bash time`, no tracer), publishing congress-100k on freya:
 
-**Research questions**: what share of receiver wall time is syscall overhead
-at 100k files (T1 data may already answer this)? Does a registered-buffers
-io_uring writer beat the 4.26 thread pool, complement it, or duplicate it?
-Cost: an `unsafe`-free crate exists (`io-uring` is unsafe; `tokio-uring`
-pulls a runtime) — if every option needs `unsafe`, the 4.11 precedent
-applies: one exemption exists, a second needs a measured win to justify it.
+```
+  7.492 s real   1.982 s user   12.842 s sys
+```
+
+System time is **6.5× user time** — this is a syscall-dominated workload, and
+that is the case *for* io_uring. But 12.84 s of system time spread over 7.49 s
+of wall clock is only ~1.7 cores of an available 32, across eight apply threads.
+The workers are waiting, not saturating.
+
+**The decisive test is worker scaling.** If syscall cost sat on the critical
+path, adding appliers would keep helping:
+
+| apply workers | 1 | 2 | 8 | 16 |
+|---|---:|---:|---:|---:|
+| congress-100k | 11.45 s | 9.23 s | **8.75 s** | 8.80 s |
+
+Going 1 → 2 is worth 1.24×, 2 → 8 is worth **1.05×**, and 8 → 16 is worth
+nothing. The pool has already captured essentially all the parallelism the
+receiver has to give; the asymptote is ~8.7 s and we are on it. Halving the cost
+of each syscall moves a component that is already off the critical path.
+
+**Verdict: declined.** io_uring needs an `unsafe` exemption (the second in a
+crate that has exactly one, documented), is Linux-only behind a runtime probe,
+and targets a few percent of wall clock. 4.11's precedent applies — a permanent
+`unsafe` exemption needs a measured win, and this one is not there.
+
+> **A profiling trap worth recording.** `strace -f -c` on the receiver
+> attributed **70.8% of syscall time to `futex`** and only ~24% to real file
+> I/O, which pointed hard at lock contention in the 4.26 apply pool. Two global
+> `Sink` mutexes were indeed taken per file, so the diagnosis looked sound.
+> Removing them changed wall clock by **nothing** (8.85 s → 8.80 s, alternated).
+>
+> `strace` inflates per-syscall cost by roughly an order of magnitude, and it
+> inflates *cheap, frequent* syscalls hardest — which is exactly what a
+> contended futex looks like. **`strace -c` percentages are a distribution of
+> traced syscalls, not an attribution of wall clock.** The `time` measurement
+> above took two minutes and was worth more than the whole trace.
+
+**Kept anyway, as a simplification.** `Sink::temporary_path` held a global
+`Mutex<HashMap>` purely to memoise a BLAKE3 hash of a short relative path —
+tens of nanoseconds of work behind a lock that eight threads contend for. That
+cache cost more than it saved even if the wall clock could not see it. The map
+is gone and `ensured_directories` is now an `RwLock`, since it is read-mostly.
+**No measured gain**; less code, one fewer allocation per file.
 
 ### 4.28 — Parallelism topologies not yet tried
 
