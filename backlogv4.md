@@ -2060,6 +2060,86 @@ a false drift conclusion on top of it. Only interleaved same-session A/Bs with
 per-run verification have survived contact with reality this cycle. 4.21 must
 make both the default.
 
+### 4.60 — The large-file path has no pipelining, and rsync is 1.8x faster *(PRIORITY)*
+
+- [ ] `run_client_push`'s large-file loop sends one 8 MB chunk and then blocks
+  on two acknowledgements before reading the next. `max_pipelined_frames()` --
+  the window every other send path uses -- is never consulted here. Transfer and
+  receiver-side work never overlap.
+
+```rust
+for range in missing {                     // 8 MB chunks
+    write LargeFileRange frame
+    blake3::hash(chunk)
+    write FileSegment
+    let ack1 = decoder.read(&mut reader)?; // BLOCK
+    let ack2 = decoder.read(&mut reader)?; // BLOCK
+}
+```
+
+**Measured 2026-08-31, Mac -> mars, 1 GbE, 10 files / 4.32 GiB of already-
+compressed `.cbz`.** Three arms interleaved in one session, every run verifying
+exit status and landed file count:
+
+| arm | runs (s) | median | throughput |
+|---|---|---|---|
+| rsync (over the same ssh) | 37.63 / 38.42 / 37.87 | 37.87 | **114.0 MB/s** |
+| xsync -> ext4 | 65.68 / 71.57 / 68.62 | 68.62 | **62.9 MB/s** |
+| xsync -> tmpfs | 49.88 / 49.17 / 49.29 | 49.29 | **87.6 MB/s** |
+
+The gap decomposes, and both halves are the same root cause:
+
+- **1.39x** -- the receiver's disk write, serialized into the transfer window
+  (ext4 vs tmpfs, everything else held constant).
+- **1.30x** -- residual after removing the disk: BLAKE3 verification and the two
+  blocking acks per chunk (tmpfs vs rsync).
+
+**Neither end is busy.** Sampled during the runs: rsync sender CPU median 15.1%,
+receiver 4.8%; xsync sender **8.4%**, receiver 7.2%. xsync burns *half* the
+sender CPU of rsync and takes 1.8x as long -- it is not losing a computation, it
+is waiting. The operator noticed the same thing from across the room: rsync
+spins the fans up and xsync does not.
+
+**This corrects 4.50 and 4.17 on a point that matters.** Those recorded two
+ceilings below the wire and attributed ~23% to SSH itself, from a
+`dd | ssh cat` measurement of 86.5 MB/s. On this pair `dd | ssh cat` gives
+**114.8 MB/s**, and rsync -- which runs over the very same `ssh
+mars.local rsync --server ...` -- reaches 114.0. **There is no SSH tax here.**
+The 86.5 figure was a property of the Mac<->Windows pair, not of SSH, and the
+whole remaining gap belongs to xsync. Wherever those stories say the large-file
+ceiling is shared between SSH and xsync, it is xsync's alone.
+
+**Why this is the priority.** It is the ceiling the 10 GbE link exists to
+probe. A serialized round trip per 8 MB does not get cheaper when the wire gets
+faster: the wire time per chunk shrinks 10x while the receiver's hash and write
+do not, so the *share* lost to the stall grows. xsync would gain far less than
+rsync from the X540, and could plausibly not move at all.
+
+**Not the explanation, checked:** compression (`--no-compress` is no better on
+already-compressed input), thermal or disk drift (rsync held 114 MB/s
+interleaved between every xsync run), and the link (rsync saturates it).
+`--streams` is a *partial, already-known* mitigation -- 4.14 measured ~1.2x on
+Manga peaking at 4 -- which would reach ~96 MB/s at best and still trail rsync.
+It hides the stall behind concurrent connections rather than removing it, and
+costs an SSH connection each.
+
+**AC**
+
+- The large-file loop pipelines chunk sends against the same window the batch
+  path uses, draining acks at a low-water mark rather than after every chunk.
+- The resume journal's durability contract is preserved: a chunk still counts
+  as verified only when its ack is seen, so an interrupted transfer resumes
+  correctly. Pipelining changes *when* acks are collected, never whether.
+- Re-measured against rsync on the same interleaved protocol. The target is the
+  link, not a percentage.
+- Re-run on 10 GbE once the X540 lands, since that is where the remaining
+  per-chunk cost becomes visible.
+
+**Watch for** the 8 MB chunk buffer: the loop does `stable.bytes[start..end]
+.to_vec()` per chunk, and appears to hold the whole file in memory. Pipelining N
+chunks must not become N more full-size copies, which is a real constraint on
+the 3 GB Pi (4.23).
+
 ### 4.58 — The rsync-fallback tests are flaky
 
 - [ ] `test_auto_falls_back_to_rsync_for_remote_source_when_xsync_is_missing`
