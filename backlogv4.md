@@ -1152,27 +1152,70 @@ cache cost more than it saved even if the wall clock could not see it. The map
 is gone and `ensured_directories` is now an `RwLock`, since it is read-mostly.
 **No measured gain**; less code, one fewer allocation per file.
 
-### 4.28 — Parallelism topologies not yet tried
+### 4.28 — Parallelism topologies, surveyed *(measured 2026-08-30)*
 
-- [ ] A survey story: cheap experiments, each answerable in a day, none
-  worth a full story until one shows a pulse.
+- [x] All four sized on a Linux-to-Linux pair (freya → orion, congress-100k,
+  baseline **7.53 s**) so no OS difference contaminates the answer. Two are
+  dead, two are worth roughly 10% each. **The step changes are gone** — 4.15,
+  4.25 and 4.26 took them.
 
-- **One connection, multiplexed logical streams** — N SSH connections cost
-  ~1.3 s serial setup and N sshd processes; rsync-style logical channels over
-  one connection would make stream count free. Overlaps 4.17's ControlMaster
-  question; this is the protocol-level version.
-- **Scan/transfer overlap** — the plan streams, but transfer start is gated
-  on plan completeness per kind. Measure the gap between first-byte time and
-  scan-complete time at 1M files; if it is seconds, pipeline planning.
-- **Parallel compression** — zstd on the sender is single-threaded per batch.
-  With 4.15's worker pool, compressing batch N+1 while batch N ships may come
-  free; alternatively `zstd::stream` multithreading. Only matters once the
-  sender is CPU-bound — re-measure after 4.15.
-- **Hash parallelism** — blake3 has rayon multithreading for large inputs;
-  confirm it is actually enabled on the ≥8 MB chunk path and measure whether
-  it moves Manga-class transfers at all.
-- **Deliberately not pursuing**: multi-process sharding (NUMA-scale problems
-  we do not have) and GPU hashing (PCIe round trip dwarfs the hash).
+**Where the time goes now.** Neither end is CPU-saturated on a 32-thread sender
+and a 4-core receiver:
+
+| | real | user | sys | cores avg |
+|---|---:|---:|---:|---:|
+| sender (freya) | 7.62 s | 4.12 s | 5.44 s | 1.25 |
+| receiver (orion) | 7.49 s | 1.98 s | 12.84 s | 1.71 |
+
+#### 1. Multiplexed logical streams over one connection — **declined**
+
+There is nothing to reclaim. 4.7 already measured connection setup as flat from
+1 to 16 streams, and on this pair extra streams are a *net loss*:
+`--streams 4` costs **8.01 s** against **7.54 s** single-stream. Making stream
+count free is worthless when the streams themselves do not pay.
+
+#### 2. Scan/transfer overlap — **the largest remaining item, ~10%**
+
+`--dry-run` isolates scan and planning with no transfer:
+
+| | freya → orion | macOS → freya |
+|---|---:|---:|
+| scan + plan | **0.79 s** | **1.45 s** |
+| full transfer | 7.53 s | 7.70 s |
+| share, before the first byte moves | **10.5%** | **19%** |
+
+All of it is dead time on the wire. Transfer start is gated on plan completeness
+per kind, so this is recoverable in principle by streaming the classification
+into the sender rather than completing it first. It is the single biggest
+identified slice left.
+
+#### 3. Parallel compression — **real but bounded, ~5–9%**
+
+Compression is demonstrably *on* the sender's critical path — the wall clock
+tracks its cost:
+
+| `--compress-level` | 1 | 3 (default) | 9 |
+|---|---:|---:|---:|
+| congress-100k | 7.14 s | **7.54 s** | 15.23 s |
+
+Level 9 doubles the transfer, which proves the path is compression-sensitive.
+But at the default the headroom is small: dropping to level 1 buys only **5%**,
+so perfectly parallelising level-3 compression is worth on the order of 5–9%,
+not more.
+
+**Compression itself must stay on.** It is a **1.66× win** on this corpus —
+7.53 s against 12.52 s with `--no-compress`. The question was only ever whether
+to parallelise it, never whether to keep it.
+
+#### 4. Hash parallelism — **declined, and currently unavailable**
+
+`blake3` is built with `prefer_intrinsics` but **not** the `rayon` feature, so
+`update_rayon` is not compiled in. Enabling it would only affect inputs at or
+above `MAX_DATA_SEGMENT`, and large-file transfers are transport-bound —
+64.9 MB/s against an 86.5 MB/s `ssh` ceiling. A faster hash cannot move a
+transfer that is waiting on the cipher.
+
+**Still deliberately not pursued**: multi-process sharding and GPU hashing.
 
 ## Phase 10 — Benchmarkability
 
