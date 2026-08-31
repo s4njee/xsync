@@ -1,0 +1,94 @@
+{
+  "schema": "xsync.manifest.v1",
+  "path_encoding": "unix-bytes-hex-components",
+  "digest_algorithm": "blake3",
+  "item_count": 5,
+  "logical_bytes": 887980892,
+  "allocated_bytes": 887980892,
+  "manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+  "entries": [
+    {
+      "path": {
+        "components_hex": []
+      },
+      "kind": "directory",
+      "length": 0,
+      "allocated_bytes": 0,
+      "content_blake3": null,
+      "mode": 493,
+      "mtime": {
+        "seconds": 1788194466,
+        "nanoseconds": 153721122
+      },
+      "symlink_target_hex": null
+    },
+    {
+      "path": {
+        "components_hex": [
+          "436861696e736177204d616e207631352028323032342920284469676974616c2920283172306e292e63627a"
+        ]
+      },
+      "kind": "file",
+      "length": 251453654,
+      "allocated_bytes": 251453654,
+      "content_blake3": "1f69ece817300e6885926b590ac523902e744080dd4b9161cb8144a9dc791b58",
+      "mode": 420,
+      "mtime": {
+        "seconds": 1772233542,
+        "nanoseconds": 182031751
+      },
+      "symlink_target_hex": null
+    },
+    {
+      "path": {
+        "components_hex": [
+          "436861696e736177204d616e207631362028323032342920284469676974616c2920283172306e292e63627a"
+        ]
+      },
+      "kind": "file",
+      "length": 184469287,
+      "allocated_bytes": 184469287,
+      "content_blake3": "8413990abf0cd55b48c94d7c157d988dc0c72357c56cb099a02be817904d814c",
+      "mode": 420,
+      "mtime": {
+        "seconds": 1772233540,
+        "nanoseconds": 394070625
+      },
+      "symlink_target_hex": null
+    },
+    {
+      "path": {
+        "components_hex": [
+          "436861696e736177204d616e207631372028323032352920284469676974616c2920283172306e292e63627a"
+        ]
+      },
+      "kind": "file",
+      "length": 254299689,
+      "allocated_bytes": 254299689,
+      "content_blake3": "3e15e6eb99323165523bbd449324f0f756eafebdd71e8ccf9ea68f9414bce818",
+      "mode": 420,
+      "mtime": {
+        "seconds": 1772233543,
+        "nanoseconds": 961916685
+      },
+      "symlink_target_hex": null
+    },
+    {
+      "path": {
+        "components_hex": [
+          "436861696e736177204d616e207631382028323032352920284469676974616c2920283172306e292e63627a"
+        ]
+      },
+      "kind": "file",
+      "length": 197758262,
+      "allocated_bytes": 197758262,
+      "content_blake3": "7f1ee489324c882e1c273d2522779b7960f35abd960ff0144a9e9fcd21a0fd61",
+      "mode": 420,
+      "mtime": {
+        "seconds": 1772233545,
+        "nanoseconds": 210587382
+      },
+      "symlink_target_hex": null
+    }
+  ]
+}

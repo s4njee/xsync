@@ -1,0 +1,368 @@
+{
+  "schema": "xsync.bench.report.v1",
+  "generated_unix_nanos": 1788212815729768000,
+  "build": {
+    "source_revision": "943b8ec49bc2f3aa0f9a503598b86d3d68f24f57-dirty",
+    "build_id": "4b89da9122c4b5a19f385a6e63d098bf",
+    "profile": "release"
+  },
+  "environment": {
+    "hardware": "Apple M1 Max, 10 logical cores, 64 GiB RAM",
+    "os": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "kernel": "25.6.0",
+    "filesystem": "ext4",
+    "transport": "ssh to root@orion.local",
+    "route": "mbp-to-orion-router1",
+    "shaping": "none"
+  },
+  "session": {
+    "streams": 1,
+    "compression": "adaptive zstd"
+  },
+  "corpus": {
+    "schema": "xsync.manifest.v1",
+    "manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+    "description": "real corpus=large1gb pinned_digest=5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a"
+  },
+  "tools": [
+    {
+      "name": "xsync",
+      "version": "xs 0.1.0 (943b8ec49bc2-dirty 2026-08-31) aarch64-apple-darwin",
+      "command": "xsync --progress-json SRC/ DEST/"
+    },
+    {
+      "name": "rsync",
+      "version": "rsync  version 3.4.4  protocol version 32",
+      "command": "rsync -a SRC/ DEST/"
+    }
+  ],
+  "results": [
+    {
+      "name": "rsync-a",
+      "baseline": null,
+      "samples": [
+        {
+          "repetition": 0,
+          "method_order": 0,
+          "wall_seconds": 7.925116208993131,
+          "cpu_seconds": 3.0686030000000004,
+          "peak_rss_bytes": 25133056,
+          "endpoint_wall_seconds": 0.0,
+          "endpoint_cpu_seconds": 0.0,
+          "endpoint_peak_rss_bytes": 0,
+          "time_to_durable_seconds": 8.563501001000986,
+          "destination_dirty_bytes": 1097728,
+          "cache_resident_bytes": 0,
+          "cache_total_bytes": 0,
+          "item_count": 5,
+          "logical_bytes": 887980892,
+          "source_allocated_bytes": 887980892,
+          "destination_allocated_bytes": 887980892,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "transfer": 7.925116208993131
+          },
+          "seed_destination_seconds": 0.14164424999034964,
+          "verify_oracle_seconds": 0.1452869999920949,
+          "cache_state": "first_pass",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "actual_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "item_count": 5,
+            "logical_bytes": 887980892,
+            "allocated_bytes": 887980892,
+            "mismatch_count": 0,
+            "mismatches": [],
+            "mode": "full",
+            "sample_fraction": null,
+            "sample_seed": null,
+            "hashed_file_count": 4
+          },
+          "source_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+          "mutation_selection": []
+        },
+        {
+          "repetition": 1,
+          "method_order": 1,
+          "wall_seconds": 7.894923708998249,
+          "cpu_seconds": 3.199325,
+          "peak_rss_bytes": 22265856,
+          "endpoint_wall_seconds": 0.0,
+          "endpoint_cpu_seconds": 0.0,
+          "endpoint_peak_rss_bytes": 0,
+          "time_to_durable_seconds": 8.679053083993495,
+          "destination_dirty_bytes": 688128,
+          "cache_resident_bytes": 0,
+          "cache_total_bytes": 0,
+          "item_count": 5,
+          "logical_bytes": 887980892,
+          "source_allocated_bytes": 887980892,
+          "destination_allocated_bytes": 887980892,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "transfer": 7.894923708998249
+          },
+          "seed_destination_seconds": 0.21167825000884477,
+          "verify_oracle_seconds": 0.2013122089992976,
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "actual_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "item_count": 5,
+            "logical_bytes": 887980892,
+            "allocated_bytes": 887980892,
+            "mismatch_count": 0,
+            "mismatches": [],
+            "mode": "full",
+            "sample_fraction": null,
+            "sample_seed": null,
+            "hashed_file_count": 4
+          },
+          "source_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+          "mutation_selection": []
+        },
+        {
+          "repetition": 2,
+          "method_order": 0,
+          "wall_seconds": 14.542791334009962,
+          "cpu_seconds": 4.644969,
+          "peak_rss_bytes": 18006016,
+          "endpoint_wall_seconds": 0.0,
+          "endpoint_cpu_seconds": 0.0,
+          "endpoint_peak_rss_bytes": 0,
+          "time_to_durable_seconds": 15.330610209013685,
+          "destination_dirty_bytes": 1261568,
+          "cache_resident_bytes": 0,
+          "cache_total_bytes": 0,
+          "item_count": 5,
+          "logical_bytes": 887980892,
+          "source_allocated_bytes": 887980892,
+          "destination_allocated_bytes": 887980892,
+          "wire_bytes": 0,
+          "phases_seconds": {
+            "transfer": 14.542791334009962
+          },
+          "seed_destination_seconds": 0.28004145900195,
+          "verify_oracle_seconds": 0.1394275420025224,
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "actual_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "item_count": 5,
+            "logical_bytes": 887980892,
+            "allocated_bytes": 887980892,
+            "mismatch_count": 0,
+            "mismatches": [],
+            "mode": "full",
+            "sample_fraction": null,
+            "sample_seed": null,
+            "hashed_file_count": 4
+          },
+          "source_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+          "mutation_selection": []
+        }
+      ],
+      "median_wall_seconds": 7.925116208993131,
+      "mad_wall_seconds": 0.030192499994882382,
+      "median_cpu_seconds": 3.199325,
+      "peak_rss_bytes": 25133056,
+      "item_count": 5,
+      "logical_bytes": 887980892,
+      "median_source_allocated_bytes": 887980892,
+      "median_destination_allocated_bytes": 887980892,
+      "allocated_throughput_bytes_per_second": 112046419.07866938,
+      "median_wire_bytes": 0,
+      "phase_medians_seconds": {
+        "transfer": 7.925116208993131
+      },
+      "paired_observations": [],
+      "paired_ratio_median": null,
+      "paired_ratio_mad": null
+    },
+    {
+      "name": "xsync",
+      "baseline": "rsync-a",
+      "samples": [
+        {
+          "repetition": 0,
+          "method_order": 1,
+          "wall_seconds": 10.52078445898951,
+          "cpu_seconds": 3.045006,
+          "peak_rss_bytes": 56016896,
+          "endpoint_wall_seconds": 10.365881181,
+          "endpoint_cpu_seconds": 2.7894840000000003,
+          "endpoint_peak_rss_bytes": 29540352,
+          "time_to_durable_seconds": 10.68543354299618,
+          "destination_dirty_bytes": 1097728,
+          "cache_resident_bytes": 0,
+          "cache_total_bytes": 0,
+          "item_count": 5,
+          "logical_bytes": 887980892,
+          "source_allocated_bytes": 887980892,
+          "destination_allocated_bytes": 887980892,
+          "wire_bytes": 887997013,
+          "phases_seconds": {
+            "metadata": 7e-6,
+            "plan": 0.011385,
+            "scan": 0.006863,
+            "transfer": 10.345261
+          },
+          "seed_destination_seconds": 0.20155679099843837,
+          "verify_oracle_seconds": 0.1400513339904137,
+          "cache_state": "first_pass",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "actual_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "item_count": 5,
+            "logical_bytes": 887980892,
+            "allocated_bytes": 887980892,
+            "mismatch_count": 0,
+            "mismatches": [],
+            "mode": "full",
+            "sample_fraction": null,
+            "sample_seed": null,
+            "hashed_file_count": 4
+          },
+          "source_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+          "mutation_selection": []
+        },
+        {
+          "repetition": 1,
+          "method_order": 0,
+          "wall_seconds": 10.948934832995292,
+          "cpu_seconds": 2.8997719999999996,
+          "peak_rss_bytes": 56508416,
+          "endpoint_wall_seconds": 10.798782559,
+          "endpoint_cpu_seconds": 2.7746060000000003,
+          "endpoint_peak_rss_bytes": 29310976,
+          "time_to_durable_seconds": 11.084691291995114,
+          "destination_dirty_bytes": 983040,
+          "cache_resident_bytes": 0,
+          "cache_total_bytes": 0,
+          "item_count": 5,
+          "logical_bytes": 887980892,
+          "source_allocated_bytes": 887980892,
+          "destination_allocated_bytes": 887980892,
+          "wire_bytes": 887997013,
+          "phases_seconds": {
+            "metadata": 7e-6,
+            "plan": 0.013904,
+            "scan": 0.005783,
+            "transfer": 10.777014
+          },
+          "seed_destination_seconds": 0.20873175001179337,
+          "verify_oracle_seconds": 0.16763062500103842,
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "actual_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "item_count": 5,
+            "logical_bytes": 887980892,
+            "allocated_bytes": 887980892,
+            "mismatch_count": 0,
+            "mismatches": [],
+            "mode": "full",
+            "sample_fraction": null,
+            "sample_seed": null,
+            "hashed_file_count": 4
+          },
+          "source_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+          "mutation_selection": []
+        },
+        {
+          "repetition": 2,
+          "method_order": 1,
+          "wall_seconds": 10.631778249997296,
+          "cpu_seconds": 2.827788,
+          "peak_rss_bytes": 76218368,
+          "endpoint_wall_seconds": 10.446440936,
+          "endpoint_cpu_seconds": 2.882164,
+          "endpoint_peak_rss_bytes": 29540352,
+          "time_to_durable_seconds": 10.773612417004188,
+          "destination_dirty_bytes": 1540096,
+          "cache_resident_bytes": 0,
+          "cache_total_bytes": 0,
+          "item_count": 5,
+          "logical_bytes": 887980892,
+          "source_allocated_bytes": 887980892,
+          "destination_allocated_bytes": 887980892,
+          "wire_bytes": 887997013,
+          "phases_seconds": {
+            "metadata": 7e-6,
+            "plan": 0.010923,
+            "scan": 0.006879,
+            "transfer": 10.423846
+          },
+          "seed_destination_seconds": 0.27679541701218113,
+          "verify_oracle_seconds": 0.1360421659919666,
+          "cache_state": "warm",
+          "cache_eviction_method": null,
+          "oracle": {
+            "passed": true,
+            "expected_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "actual_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+            "item_count": 5,
+            "logical_bytes": 887980892,
+            "allocated_bytes": 887980892,
+            "mismatch_count": 0,
+            "mismatches": [],
+            "mode": "full",
+            "sample_fraction": null,
+            "sample_seed": null,
+            "hashed_file_count": 4
+          },
+          "source_manifest_digest": "5588a3f1e7d770113191ba1e92296e96817ce8ba27364cf088baacb9c36e602a",
+          "mutation_selection": []
+        }
+      ],
+      "median_wall_seconds": 10.631778249997296,
+      "mad_wall_seconds": 0.11099379100778606,
+      "median_cpu_seconds": 2.8997719999999996,
+      "peak_rss_bytes": 76218368,
+      "item_count": 5,
+      "logical_bytes": 887980892,
+      "median_source_allocated_bytes": 887980892,
+      "median_destination_allocated_bytes": 887980892,
+      "allocated_throughput_bytes_per_second": 83521389.47219162,
+      "median_wire_bytes": 887997013,
+      "phase_medians_seconds": {
+        "metadata": 7e-6,
+        "plan": 0.011385,
+        "scan": 0.006863,
+        "transfer": 10.423846
+      },
+      "paired_observations": [
+        {
+          "repetition": 0,
+          "baseline_seconds": 7.925116208993131,
+          "candidate_seconds": 10.52078445898951,
+          "speedup": 0.7532818716974565
+        },
+        {
+          "repetition": 1,
+          "baseline_seconds": 7.894923708998249,
+          "candidate_seconds": 10.948934832995292,
+          "speedup": 0.7210677412387558
+        },
+        {
+          "repetition": 2,
+          "baseline_seconds": 14.542791334009962,
+          "candidate_seconds": 10.631778249997296,
+          "speedup": 1.3678606712864483
+        }
+      ],
+      "paired_ratio_median": 0.7532818716974565,
+      "paired_ratio_mad": 0.032214130458700696
+    }
+  ]
+}

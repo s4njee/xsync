@@ -1,0 +1,40 @@
+{
+  "schema": "xsync.release-bench.v1",
+  "generated_unix_seconds": 1788212815,
+  "tier": "smoke",
+  "seed": 42,
+  "repetitions": 3,
+  "routes": [
+    "ssh"
+  ],
+  "cells": [
+    {
+      "cell": "large1gb-initial-copy-ssh",
+      "class": "large1gb",
+      "workload": "initial-copy",
+      "route": "ssh",
+      "status": "passed",
+      "report": "benches/results/r0b-large1gb/mac-to-orion-large1gb-ext4/report-large1gb-initial-copy-ssh.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 7.925116208993131,
+          "mad_wall_seconds": 0.030192499994882382,
+          "median_cpu_seconds": 3.199325,
+          "peak_rss_bytes": 25133056,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 10.631778249997296,
+          "mad_wall_seconds": 0.11099379100778606,
+          "median_cpu_seconds": 2.8997719999999996,
+          "peak_rss_bytes": 76218368,
+          "median_wire_bytes": 887997013,
+          "paired_ratio_median": 0.7532818716974565,
+          "paired_ratio_mad": 0.032214130458700696
+        }
+      }
+    }
+  ]
+}

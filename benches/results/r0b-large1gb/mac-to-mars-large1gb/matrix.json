@@ -1,0 +1,40 @@
+{
+  "schema": "xsync.release-bench.v1",
+  "generated_unix_seconds": 1788212727,
+  "tier": "smoke",
+  "seed": 42,
+  "repetitions": 3,
+  "routes": [
+    "ssh"
+  ],
+  "cells": [
+    {
+      "cell": "large1gb-initial-copy-ssh",
+      "class": "large1gb",
+      "workload": "initial-copy",
+      "route": "ssh",
+      "status": "passed",
+      "report": "benches/results/r0b-large1gb/mac-to-mars-large1gb/report-large1gb-initial-copy-ssh.json",
+      "methods": {
+        "rsync-a": {
+          "median_wall_seconds": 8.610208499987493,
+          "mad_wall_seconds": 0.4048527500126511,
+          "median_cpu_seconds": 2.886232,
+          "peak_rss_bytes": 25100288,
+          "median_wire_bytes": 0,
+          "paired_ratio_median": null,
+          "paired_ratio_mad": null
+        },
+        "xsync": {
+          "median_wall_seconds": 8.504842916998314,
+          "mad_wall_seconds": 0.5327305419923505,
+          "median_cpu_seconds": 2.938952,
+          "peak_rss_bytes": 69058560,
+          "median_wire_bytes": 887997013,
+          "paired_ratio_median": 0.9955240376289629,
+          "paired_ratio_mad": 0.04634758630557745
+        }
+      }
+    }
+  ]
+}

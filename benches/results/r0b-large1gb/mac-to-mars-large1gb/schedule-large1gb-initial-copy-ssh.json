@@ -1,0 +1,14 @@
+[
+  [
+    "rsync-a",
+    "xsync"
+  ],
+  [
+    "xsync",
+    "rsync-a"
+  ],
+  [
+    "rsync-a",
+    "xsync"
+  ]
+]
