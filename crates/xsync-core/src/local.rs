@@ -230,6 +230,9 @@ pub enum LocalEvent {
         physical_bytes: u64,
         /// Application-protocol bytes written to the transport, when known.
         wire_bytes: u64,
+        /// The subset of `wire_bytes` carrying file data. Zero when the
+        /// backend does not distinguish them; see `LocalSyncReport`.
+        data_wire_bytes: u64,
         /// Number of directory clone operations.
         directory_clones: usize,
         /// Number of file clone operations.
@@ -342,8 +345,24 @@ pub struct LocalSyncReport {
     pub transferred_bytes: u64,
     /// Bytes physically moved through the streaming path.
     pub physical_bytes: u64,
-    /// Application-protocol bytes written to the transport, when known.
+    /// Bytes actually crossing the transport, when known.
+    ///
+    /// Measured at the transport boundary rather than summed per frame, so it
+    /// includes metadata, handshake and session frames. Before 4.44 this was a
+    /// hand-maintained per-frame total that omitted every metadata write, and
+    /// so could not be used to evaluate a metadata-path change.
     pub wire_bytes: u64,
+    /// The subset of [`Self::wire_bytes`] carrying file data.
+    ///
+    /// `wire_bytes - data_wire_bytes` is the native protocol's own overhead:
+    /// metadata, handshake, and session negotiation.
+    ///
+    /// **Zero when the backend does not distinguish the two**: the rsync
+    /// fallback, which frames on someone else's protocol, and local copies,
+    /// which have no wire at all. A consumer computing a metadata share must
+    /// check that this is non-zero first, or it will read "all overhead" where
+    /// the honest answer is "not measured".
+    pub data_wire_bytes: u64,
     /// Number of unchanged files skipped.
     pub skipped_files: usize,
     /// Number of entries whose permission bits were repaired without moving data.
@@ -726,6 +745,7 @@ where
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
+        data_wire_bytes: report.data_wire_bytes,
         directory_clones: report.directory_clones,
         file_clones: report.file_clones,
         byte_copies: report.byte_copies,
@@ -983,6 +1003,7 @@ fn try_directory_fast_path(
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
+        data_wire_bytes: report.data_wire_bytes,
         directory_clones: report.directory_clones,
         file_clones: report.file_clones,
         byte_copies: report.byte_copies,

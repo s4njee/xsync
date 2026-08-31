@@ -960,7 +960,7 @@ alarming. Measurement first, architecture second.
 
 ### 4.24 — Version skew wastes an afternoon; `--version` lies
 
-- [ ] Two related hygiene failures, both hit this cycle. A stale binary on
+- [x] Two related hygiene failures, both hit this cycle. A stale binary on
   freya produced `version mismatch: local v1 / remote v2`, which read as a
   protocol bug until the remote's mtime was checked. Separately `build.rs`
   caches `BUILD_COMMIT`, so a fresh build after new commits reports a stale
@@ -971,9 +971,32 @@ and suggests the D5.2 bootstrap path to update the remote; `build.rs` re-runs
 when HEAD moves (`rerun-if-changed` on `.git/HEAD` and the ref it points at);
 a stale-commit repro test if practical.
 
+**Delivered.** The stamp was wrong for a precise reason: `build.rs` already
+watched `.git/HEAD`, but on a branch that file holds `ref: refs/heads/main` and
+never changes as commits land. Every commit after the first went unnoticed. It
+now follows `HEAD` to the ref it names and watches that, plus `packed-refs`
+(where the ref lives once packed, when the loose file does not exist) and
+`index`. `.git` is also resolved when it is a *file*, so a worktree build does
+not silently watch nothing. Verified by committing and rebuilding without
+touching `build.rs`: the stamp moved `6bfeafb0d893-dirty` → `da63c3f14c91`.
+
+The commit is now exact. **The `-dirty` marker remains best-effort** — an
+uncommitted edit that never reaches the index does not re-trigger the script,
+so a binary can report clean while holding modified source. Making it exact
+would require re-running `build.rs` on every build, which is a real incremental
+cost for a marker that is a hint, not a guarantee.
+
+For the mismatch error, the remote's commit is **not** available where the
+error is raised: the mismatch comes from a frame header, before any exchange
+that could carry it. Rather than probing the remote on the failure path — where
+it may already be unreachable, and a hanging diagnostic is worse than none —
+the client prints its own commit and the exact commands to check and update the
+other end. Carrying build identity in the handshake, so the error can name both
+directly, belongs with the version-skew work in `backlog-release.md` R1.4.
+
 ### 4.44 — `wire_bytes` is not the bytes on the wire
 
-- [ ] **Found while verifying 4.4.** `wire_bytes` counts data frames only. Every
+- [x] **Found while verifying 4.4.** `wire_bytes` counts data frames only. Every
   `encode_meta_frame` call site writes to the transport without adding to
   `report.wire_bytes`, so the figure reported in the summary line, the
   `finished` event, and every benchmark writeup understates real traffic.
@@ -1000,6 +1023,27 @@ measure.
   written to a counting transport, so this cannot silently regress.
 - `BENCHMARKv2.md` and `docs/` numbers derived from `wire_bytes` get a note
   that pre-fix figures exclude metadata.
+
+**Delivered, but not the way the AC framed it.** Adding `+=` at the four
+`encode_meta_frame` sites is what the AC asked for and is exactly the design
+that produced the bug: a hand-maintained sum drifts the moment someone adds a
+write site. The count is instead taken at the **transport boundary**, by
+`CountingWriter`/`CountingReader` in `transport.rs`, which cannot drift because
+it does not know about message types. Push counts writes; pull counts reads,
+because that is the direction its payload travels.
+
+`wire_bytes` is now the exact total. The old per-frame sum is kept as
+`data_wire_bytes`, and the JSON reports `data_wire_bytes` and `meta_wire_bytes`
+alongside it, so 4.4's measurement is reproducible without a custom build.
+
+`data_wire_bytes` is **zero when the backend does not distinguish** — the rsync
+fallback, and local copies with no wire at all. A consumer computing a metadata
+share has to check for that, or it reads "all overhead" where the honest answer
+is "not measured".
+
+Measured on a 720-file corpus of small compressible files: 76,633 wire bytes,
+of which **9,715 (12.7%) were previously unreported**. Far above the 0.9% seen
+on congress-100k, because metadata share rises as payloads shrink and compress.
 
 ### 4.45 — Windows preflight still stats every file
 

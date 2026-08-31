@@ -112,7 +112,19 @@ fn bounded<T>(name: &str, default: T, min: T, max: T) -> T
 where
     T: std::str::FromStr + PartialOrd + Copy,
 {
-    let Ok(raw) = std::env::var(name) else {
+    clamp_parsed(std::env::var(name).ok().as_deref(), default, min, max)
+}
+
+/// The parse-and-clamp half of [`bounded`], split out so it can be tested.
+///
+/// Setting an environment variable from a test is unsound in a threaded
+/// process and the workspace denies `unsafe`, so the only honest way to cover
+/// the clamping is to hand it the string directly.
+fn clamp_parsed<T>(raw: Option<&str>, default: T, min: T, max: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + Copy,
+{
+    let Some(raw) = raw else {
         return default;
     };
     let Ok(parsed) = raw.trim().parse::<T>() else {
@@ -225,28 +237,41 @@ pub fn is_tuned() -> bool {
 mod tests {
     use super::*;
 
-    // `bounded` is tested directly rather than through the public accessors:
-    // those cache in a `OnceLock`, so the first test to touch one would fix its
-    // value for every other test in the process.
+    // The public accessors cache in a `OnceLock`, so the first test to touch
+    // one would fix its value for the whole process. The clamping logic is
+    // tested directly instead.
 
     #[test]
     fn an_absent_variable_yields_the_default() {
-        assert_eq!(
-            bounded("XSYNC_TEST_DEFINITELY_UNSET", 2048, 1, 32_768),
-            2048
-        );
-    }
-
-    #[test]
-    fn a_value_below_the_floor_clamps_up_and_above_the_ceiling_clamps_down() {
-        // Chosen so a misconfigured sweep produces a slow run, not a deadlock:
-        // the ceiling is what keeps pending acks inside the SSH channel window.
-        assert_eq!(bounded::<usize>("PATH", 0, 7, 9), 7);
+        assert_eq!(clamp_parsed(None, 2048_usize, 512, 32_768), 2048);
     }
 
     #[test]
     fn an_unparseable_value_is_ignored_rather_than_fatal() {
-        // `PATH` is set and is not a number.
-        assert_eq!(bounded("PATH", 2048, 1, 32_768), 2048);
+        // A fat-fingered export should produce a stock run, not a failed one.
+        assert_eq!(clamp_parsed(Some("garbage"), 2048_usize, 512, 32_768), 2048);
+        assert_eq!(clamp_parsed(Some(""), 2048_usize, 512, 32_768), 2048);
+    }
+
+    #[test]
+    fn a_value_below_the_floor_clamps_up_rather_than_deadlocking() {
+        // Below the floor the sender's window can sit under the receiver's
+        // apply-pool capacity, which hangs the transfer outright. Clamping is
+        // what keeps a bad sweep slow instead of stuck.
+        assert_eq!(clamp_parsed(Some("1"), 2048_usize, 512, 32_768), 512);
+    }
+
+    #[test]
+    fn a_value_above_the_ceiling_clamps_down() {
+        assert_eq!(
+            clamp_parsed(Some("999999"), 2048_usize, 512, 32_768),
+            32_768
+        );
+    }
+
+    #[test]
+    fn an_in_range_value_is_honoured_and_surrounding_whitespace_ignored() {
+        assert_eq!(clamp_parsed(Some("4096"), 2048_usize, 512, 32_768), 4096);
+        assert_eq!(clamp_parsed(Some(" 4096 "), 2048_usize, 512, 32_768), 4096);
     }
 }

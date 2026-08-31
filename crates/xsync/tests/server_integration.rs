@@ -1583,3 +1583,57 @@ fn colliding_destination_paths_are_refused_not_silently_merged() {
         "every colliding path is skipped, so nothing is published"
     );
 }
+
+/// `wire_bytes` must be the bytes that actually crossed the transport.
+///
+/// It used to be a per-frame sum maintained by hand at each write site, and
+/// every metadata site was missed, so the figure in the summary, the `finished`
+/// event and every benchmark writeup understated real traffic (4.44). It is now
+/// counted at the transport boundary, which cannot drift as message types are
+/// added because it does not know about message types.
+///
+/// The regression this guards is specific: if the total ever silently becomes
+/// the data-frame sum again, `meta_wire_bytes` collapses to zero.
+#[test]
+fn reported_wire_bytes_include_the_metadata_frames_they_used_to_omit() {
+    let src = tempdir().unwrap();
+    // Many small files in nested directories: metadata-heavy, so the metadata
+    // share is comfortably above measurement noise.
+    for directory in 0..8 {
+        let nested = src.path().join(format!("d{directory}"));
+        fs::create_dir_all(&nested).unwrap();
+        for file in 0..25 {
+            fs::write(nested.join(format!("f{file}.txt")), b"payload").unwrap();
+        }
+    }
+
+    let dst = tempdir().unwrap();
+    let output = Command::new(xsync_bin())
+        .args(["--transport=xsync", "--progress-json"])
+        .arg("-e")
+        .arg(fake_rsh("exec"))
+        .arg(format!("{}/", src.path().display()))
+        .arg(format!("fakehost:{}/", dst.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let finished = finished_json(&output.stdout);
+    let wire = finished["wire_bytes"].as_u64().unwrap();
+    let data = finished["data_wire_bytes"].as_u64().unwrap();
+    let meta = finished["meta_wire_bytes"].as_u64().unwrap();
+
+    assert_eq!(finished["transferred_files"].as_u64().unwrap(), 200);
+    assert_eq!(data + meta, wire, "the split must account for every byte");
+    assert!(
+        wire > data,
+        "wire_bytes ({wire}) must exceed the data-frame subset ({data}); \
+         equality is the old bug, where metadata was invisible"
+    );
+    // 200 files across 8 directories cannot cost nothing to describe.
+    assert!(meta > 0, "metadata frames reported as zero bytes");
+}

@@ -417,7 +417,42 @@ fn report_fatal(cli: &Cli, error: &CliError) {
     let structured_to_stderr = cli.server && cli.log_json.as_deref() == Some("-");
     if !structured_to_stderr {
         eprintln!("xs: {message}");
+        if let Some(advice) = version_skew_advice(&message, authority.as_deref()) {
+            eprint!("{advice}");
+        }
     }
+}
+
+/// Turn a bare protocol-version mismatch into something an operator can act on.
+///
+/// The error itself can only name two version numbers, because the mismatch is
+/// detected from a frame header -- before any exchange that could carry the
+/// peer's build. Two numbers read as a protocol bug, and did: an afternoon went
+/// into one that was only a stale binary on the far end.
+///
+/// The remote's commit is deliberately *not* probed here. This runs on the
+/// failure path, where the remote may already be unreachable, and a hanging
+/// diagnostic is worse than none. Handing over the exact command is
+/// deterministic, costs nothing, and still works later.
+fn version_skew_advice(message: &str, authority: Option<&str>) -> Option<String> {
+    use std::fmt::Write as _;
+
+    if !message.contains("version mismatch") {
+        return None;
+    }
+    let mut advice = format!("xs: this build is commit {BUILD_COMMIT}\n");
+    advice.push_str(
+        "xs: a version mismatch is usually a stale binary on one end, not a protocol fault\n",
+    );
+    if let Some(host) = authority {
+        let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+        let _ = writeln!(advice, "xs: check the remote with: ssh {host} xs --version");
+        let _ = writeln!(
+            advice,
+            "xs: update it with:        xs --bootstrap=once <src> {host}:<dest>"
+        );
+    }
+    Some(advice)
 }
 
 /// The remote authority this run concerns, when either side is remote.
@@ -1889,6 +1924,7 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             transferred_bytes,
             physical_bytes,
             wire_bytes,
+            data_wire_bytes,
             skipped_files,
             metadata_repaired,
             failed_entries,
@@ -1912,6 +1948,11 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             "transferred_bytes": transferred_bytes,
             "physical_bytes": physical_bytes,
             "wire_bytes": wire_bytes,
+            // Split so a metadata-path change can be evaluated from the JSON
+            // alone. Before 4.44 `wire_bytes` silently omitted metadata, and
+            // measuring it needed a custom instrumented build.
+            "data_wire_bytes": data_wire_bytes,
+            "meta_wire_bytes": wire_bytes.saturating_sub(*data_wire_bytes),
             "skipped_files": skipped_files,
             "metadata_repaired": metadata_repaired,
             "failed_entries": failed_entries,
@@ -2248,6 +2289,40 @@ mod tests {
         };
         let error = xsync_core::rsync::validate_options(&options).unwrap_err();
         assert!(error.to_string().contains("--include"), "{error}");
+    }
+
+    /// A version mismatch is usually a stale binary, not a protocol fault, and
+    /// the bare error says only "local v1 / remote v2" -- which read as a
+    /// protocol bug for an afternoon before someone checked an mtime (4.24).
+    #[test]
+    fn a_version_mismatch_names_this_build_and_how_to_fix_the_other_one() {
+        let advice =
+            version_skew_advice("xsync version mismatch: local v1 / remote v2", Some("mars"))
+                .expect("a version mismatch must carry advice");
+        assert!(
+            advice.contains(BUILD_COMMIT),
+            "must name this build: {advice}"
+        );
+        assert!(advice.contains("ssh mars xs --version"), "{advice}");
+        assert!(advice.contains("--bootstrap=once"), "{advice}");
+    }
+
+    /// The user@host form is common and the bare host is what `ssh` wants in
+    /// the suggested command.
+    #[test]
+    fn the_advice_strips_a_user_prefix_from_the_suggested_command() {
+        let advice = version_skew_advice(
+            "xsync version mismatch: local v1 / remote v2",
+            Some("root@mars"),
+        )
+        .expect("a version mismatch must carry advice");
+        assert!(advice.contains("ssh mars xs --version"), "{advice}");
+    }
+
+    /// Every other failure keeps its single line.
+    #[test]
+    fn an_unrelated_error_gets_no_version_advice() {
+        assert!(version_skew_advice("permission denied", Some("mars")).is_none());
     }
 
     #[test]

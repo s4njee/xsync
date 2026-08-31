@@ -32,13 +32,7 @@ fn main() {
 /// could disagree with the manifest, and a binary whose reported version
 /// differs from the tag it shipped under is worse than no version at all.
 fn stamp_provenance() {
-    // Rebuild the stamp when HEAD moves, so the recorded commit cannot go stale
-    // against the source actually compiled.
-    for path in [".git/HEAD", "../../.git/HEAD"] {
-        if Path::new(path).exists() {
-            println!("cargo:rerun-if-changed={path}");
-        }
-    }
+    watch_git_state();
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
     println!("cargo:rustc-env=XSYNC_BUILD_COMMIT={}", git_commit());
@@ -64,6 +58,78 @@ fn git_commit() -> String {
         Some(status) if !status.is_empty() => format!("{hash}-dirty"),
         _ => hash,
     }
+}
+
+/// Re-run this script whenever the recorded commit could change.
+///
+/// Watching `.git/HEAD` alone is not enough, and that was the bug: on a branch
+/// that file holds `ref: refs/heads/main` and does not change when commits land
+/// on it. The stamp went stale for every commit after the first, so `--version`
+/// named a commit that was not the one compiled -- the one tool for diagnosing
+/// version skew being itself a source of it.
+///
+/// So follow `HEAD` to the ref it names and watch that too, plus `packed-refs`
+/// (where the ref file lives once git has packed it, in which case the loose
+/// file does not exist) and `index` (which moves on `git add`, keeping the
+/// `-dirty` marker roughly honest).
+///
+/// The commit is exact. The `-dirty` marker is best-effort: an uncommitted edit
+/// that never reaches the index does not re-trigger this script, so a binary
+/// can report clean while containing modified source. It is a hint that a build
+/// was not reproducible, not a guarantee that one was.
+fn watch_git_state() {
+    let Some(git_dir) = git_dir() else {
+        return;
+    };
+    let head = git_dir.join("HEAD");
+    watch(&head);
+    watch(&git_dir.join("packed-refs"));
+    watch(&git_dir.join("index"));
+
+    // `ref: refs/heads/<branch>` on a branch; a bare hash when detached, which
+    // needs no further watching because the hash is already in the file.
+    if let Ok(contents) = fs::read_to_string(&head) {
+        if let Some(reference) = contents.trim().strip_prefix("ref:") {
+            watch(&git_dir.join(reference.trim()));
+        }
+    }
+}
+
+/// Locate the git directory, or `None` outside a checkout.
+///
+/// `.git` is a *file* in a worktree or submodule, holding `gitdir: <path>`.
+/// Resolving it matters because a build from a worktree would otherwise watch
+/// nothing and stamp a commit that never updates.
+fn git_dir() -> Option<std::path::PathBuf> {
+    let candidates = [Path::new(".git"), Path::new("../../.git")];
+    for candidate in candidates {
+        if candidate.is_dir() {
+            return Some(candidate.to_path_buf());
+        }
+        if candidate.is_file() {
+            let contents = fs::read_to_string(candidate).ok()?;
+            let target = contents.trim().strip_prefix("gitdir:")?.trim();
+            let resolved = Path::new(target).to_path_buf();
+            let resolved = if resolved.is_absolute() {
+                resolved
+            } else {
+                candidate.parent()?.join(resolved)
+            };
+            if resolved.is_dir() {
+                return Some(resolved);
+            }
+        }
+    }
+    None
+}
+
+/// Declare a rerun trigger for a path that may not exist yet.
+///
+/// Cargo accepts a missing path and re-runs if it later appears, which is what
+/// makes watching both `packed-refs` and a loose ref correct: exactly one of
+/// them exists at any time, and packing switches between them.
+fn watch(path: &Path) {
+    println!("cargo:rerun-if-changed={}", path.display());
 }
 
 fn run_git(args: &[&str]) -> Option<String> {

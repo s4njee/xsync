@@ -74,3 +74,69 @@ pub struct TransportSelection {
     /// Why this backend was selected.
     pub reason: String,
 }
+
+/// Counts bytes crossing a transport, so a report can state what was actually
+/// sent rather than what the frame accounting remembered to add up.
+///
+/// The frame-level counters this replaces were maintained by hand at each
+/// write site, and every site that was missed -- all four metadata paths --
+/// silently understated the total. Counting at the boundary cannot drift as
+/// new message types are added, because it does not know about message types.
+pub struct CountingWriter<W> {
+    inner: W,
+    bytes: u64,
+}
+
+impl<W> CountingWriter<W> {
+    /// Wrap a writer, counting from zero.
+    pub const fn new(inner: W) -> Self {
+        Self { inner, bytes: 0 }
+    }
+
+    /// Bytes written so far.
+    pub const fn byte_count(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let count = self.inner.write(buffer)?;
+        self.bytes = self.bytes.saturating_add(count as u64);
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Counts bytes read from a transport. The pull direction's payload arrives
+/// inbound, so that is where its wire total has to be measured.
+pub struct CountingReader<R> {
+    inner: R,
+    bytes: u64,
+}
+
+impl<R> CountingReader<R> {
+    /// Wrap a reader, counting from zero.
+    pub const fn new(inner: R) -> Self {
+        Self { inner, bytes: 0 }
+    }
+
+    /// Bytes read so far.
+    ///
+    /// Named `byte_count` rather than `bytes` because `Read::bytes` already
+    /// exists and would shadow it at every call site.
+    pub const fn byte_count(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.bytes = self.bytes.saturating_add(count as u64);
+        Ok(count)
+    }
+}

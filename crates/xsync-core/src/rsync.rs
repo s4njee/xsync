@@ -1604,6 +1604,7 @@ fn emit_finished<F: FnMut(LocalEvent)>(report: &LocalSyncReport, emit: &mut F) {
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
+        data_wire_bytes: report.data_wire_bytes,
         skipped_files: report.skipped_files,
         metadata_repaired: report.metadata_repaired,
         failed_entries: 0,

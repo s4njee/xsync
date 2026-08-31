@@ -3597,9 +3597,12 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     _dest_trailing_slash: bool,
     options: &LocalSyncOptions,
     mut reader: R,
-    mut writer: W,
+    writer: W,
     mut emit: F,
 ) -> Result<LocalSyncReport, ServerError> {
+    // Counted at the boundary so the total cannot drift from what was sent.
+    // The per-frame sum kept below is the *data* subset, not the total.
+    let mut writer = crate::transport::CountingWriter::new(writer);
     let mut decoder = FrameDecoder::new();
     let mut next_message_id = 1u64;
     let mut alloc_id = || {
@@ -4434,6 +4437,11 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
     report.retransmitted_bytes = retransmitted_bytes_total;
     report.checkpoint_bytes = checkpoint_bytes_total;
 
+    // Everything accumulated into `wire_bytes` above was a data frame; the
+    // exact total comes from the transport itself.
+    report.data_wire_bytes = report.wire_bytes;
+    report.wire_bytes = writer.byte_count();
+
     emit(LocalEvent::Finished {
         dropped_metadata: dropped,
         transport: None,
@@ -4441,6 +4449,7 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
+        data_wire_bytes: report.data_wire_bytes,
         skipped_files: report.skipped_files,
         metadata_repaired: report.metadata_repaired,
         failed_entries: report.failed_entries,
@@ -4474,10 +4483,13 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     dest_path: &Path,
     _dest_trailing_slash: bool,
     options: &LocalSyncOptions,
-    mut reader: R,
+    reader: R,
     mut writer: W,
     mut emit: F,
 ) -> Result<LocalSyncReport, ServerError> {
+    // Pull's payload arrives inbound, so its wire total is measured on the
+    // read side. The per-frame sum kept below is the data subset.
+    let mut reader = crate::transport::CountingReader::new(reader);
     let mut decoder = FrameDecoder::new();
     let mut next_message_id = 1u64;
     let mut alloc_id = || {
@@ -5340,6 +5352,9 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
     report.retransmitted_bytes = retransmitted_bytes_total;
     report.checkpoint_bytes = checkpoint_bytes_total;
 
+    report.data_wire_bytes = report.wire_bytes;
+    report.wire_bytes = reader.byte_count();
+
     emit(LocalEvent::Finished {
         dropped_metadata: crate::sparse::DroppedMetadata::default(),
         transport: None,
@@ -5347,6 +5362,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
+        data_wire_bytes: report.data_wire_bytes,
         skipped_files: report.skipped_files,
         metadata_repaired: report.metadata_repaired,
         failed_entries: report.failed_entries,
@@ -6048,6 +6064,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             warnings: 0,
             physical_bytes: 0,
             wire_bytes: 0,
+            data_wire_bytes: 0,
             directory_clones: 0,
             file_clones: 0,
             byte_copies: 0,
@@ -6551,6 +6568,7 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         transferred_bytes: report.transferred_bytes,
         physical_bytes: report.physical_bytes,
         wire_bytes: report.wire_bytes,
+        data_wire_bytes: report.data_wire_bytes,
         skipped_files: report.skipped_files,
         metadata_repaired: report.metadata_repaired,
         failed_entries: report.failed_entries,
