@@ -3379,6 +3379,35 @@ impl Server {
                             unix: None,
                         },
                     };
+                    // The wire cannot carry ctime or the unix block, so a
+                    // fingerprint rebuilt from it can never equal a real stat.
+                    // Re-derive it from our own filesystem: this is our file,
+                    // and accepting the peer's description of it would make the
+                    // replacement check in `read_range` compare against a value
+                    // that is wrong by construction. Falling back to the
+                    // wire-derived entry keeps a file we cannot stat behaving
+                    // as it did before rather than failing the transfer.
+                    let entry =
+                        match std::fs::symlink_metadata(entry.path.to_native_path(&self.root)) {
+                            Ok(metadata) if metadata.is_file() => {
+                                match metadata.modified().ok().and_then(|mtime| {
+                                    crate::scanner::fingerprint_from_metadata(
+                                        &metadata,
+                                        ScanEntryKind::File,
+                                        mtime,
+                                    )
+                                    .ok()
+                                }) {
+                                    Some(fingerprint) => FileEntry {
+                                        size: metadata.len(),
+                                        fingerprint,
+                                        ..entry
+                                    },
+                                    None => entry,
+                                }
+                            }
+                            _ => entry,
+                        };
                     large_source_files.insert(file_id, entry);
 
                     let ack = Message::Ack {
@@ -3392,17 +3421,27 @@ impl Server {
                 }
                 Message::LargeFileRange { file_id, range } => {
                     if let Some(entry) = large_source_files.get(&file_id) {
-                        let stable = source_reader.read(entry)?;
-                        let start = usize::try_from(range.offset).unwrap_or(0);
-                        let end = usize::try_from(range.offset.saturating_add(range.length))
-                            .unwrap_or(stable.bytes.len());
-                        let slice = &stable.bytes[start..std::cmp::min(end, stable.bytes.len())];
+                        // Read only the requested range. This used to call
+                        // `read`, which buffers and hashes the *whole* file,
+                        // and then kept one 8 MB slice of it -- so serving a
+                        // 500 MB file in 61 chunks read and BLAKE3'd about
+                        // 30 GB to move 500 MB. The cost per chunk scaled with
+                        // the file size rather than the chunk size, which is
+                        // why pull ran at 29.7 MB/s against rsync's 109.9 on
+                        // the same link (4.61).
+                        //
+                        // `read_range` checks the descriptor and pathname
+                        // before and after the read, so a file replaced mid
+                        // transfer is still reported rather than silently
+                        // mixed in.
+                        let length = range.length.min(entry.size.saturating_sub(range.offset));
+                        let data = source_reader.read_range(entry, range.offset, length)?;
 
                         let seg = Message::FileSegment {
                             file_id,
                             offset: range.offset,
-                            digest: *blake3::hash(slice).as_bytes(),
-                            data: slice.to_vec(),
+                            digest: *blake3::hash(&data).as_bytes(),
+                            data,
                         };
                         let msg_id = self.next_id();
                         write_data_frame(

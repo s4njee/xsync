@@ -2060,6 +2060,56 @@ a false drift conclusion on top of it. Only interleaved same-session A/Bs with
 per-run verification have survived contact with reality this cycle. 4.21 must
 make both the default.
 
+### 4.61 — Pull re-read and re-hashed the whole file for every 8 MB chunk
+
+- [x] **Fixed 2026-08-31.** The server's `LargeFileRange` handler called
+  `source_reader.read(entry)`, which buffers *and BLAKE3-hashes the entire
+  file*, then kept one 8 MB slice and threw the rest away. Serving a 500 MB
+  file in 61 chunks read and hashed roughly **30 GB to move 500 MB**.
+
+The cost per chunk therefore scaled with **file size**, not chunk size --
+quadratic in the number of chunks. Measured directly from the `--progress-json`
+event stream: **266 ms median per 8 MB chunk** (deciles 189→279, no
+bimodality), where 8 MB of wire time is ~70 ms.
+
+| arm | before | after |
+|---|---:|---:|
+| rsync pull | 109.9 MB/s | 110.5 MB/s |
+| xsync pull | **29.7 MB/s** | **73.4 MB/s** |
+
+**2.47x**, and the gap to rsync closes from 3.7x to 1.51x. All three files
+verified identical by SHA-256 against the source after the change.
+
+`read_range` already existed and reads only the requested bytes; the handler
+simply never used it. It also drops the whole-file buffer, which matters for
+4.23 on the 3 GB Pi.
+
+**A second bug had to be fixed to use it.** `read_range` checks the file's
+fingerprint before and after the read, and the entry it checks against was
+reconstructed *from the wire* in the `LargeFilePrepare` handler with
+`ctime: None, unix: None` -- values the protocol cannot carry. Such a
+fingerprint can never equal a real `stat`, so every range read failed with
+"source file changed during read". The old code masked this because `read`
+retries and adopts a refreshed fingerprint on mismatch.
+
+The server now derives the fingerprint from its **own** filesystem. That is the
+correct behaviour independently of performance: accepting the peer's
+description of a local file made the replacement check compare against a value
+that was wrong by construction, so it could never have detected a genuine
+mid-transfer replacement. `test_pull_matches_push_identically` caught this.
+
+**Diagnosis note.** The first hypothesis was per-chunk `fsync` cost -- the pull
+loop issues three durability barriers per chunk (`sink.sync_data`, the
+journal's `sync_all`, and the parent-directory `sync_all`), and macOS
+`F_FULLFSYNC` is expensive. Measured on this Mac, those three total **~21 ms**,
+not the ~196 ms of overhead observed. The hypothesis was wrong and measuring it
+was what pointed at the file-size scaling instead.
+
+**Still open**: the pull loop remains lockstep -- request, segment, ack,
+range-ack per chunk, with the local write and a journal checkpoint serialized
+in between. That is the pull analogue of 4.60 and is the likely bulk of the
+remaining 1.51x.
+
 ### 4.60 — The large-file path has no pipelining, and rsync is 1.8x faster *(PRIORITY)*
 
 - [x] **Push path fixed 2026-08-31.** Pull is unfixed; see below.
