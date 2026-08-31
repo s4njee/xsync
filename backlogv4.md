@@ -2156,6 +2156,21 @@ All verified by SHA-256. Eight streams reaches roughly rsync parity, with
 noticeably wider run-to-run spread than single-stream. Two streams being
 *slower* than one is unexplained and worth a look.
 
+**The mars control makes the point exactly.** The same sweep on mars, whose
+NVMe is roughly 8x faster than the link, to durability:
+
+| arm | mars | orion |
+|---|---:|---:|
+| rsync | 96.2 / 107.7 MB/s | 100.6 MB/s |
+| `--streams 1` | **101.8 / 107.8 MB/s** | 83.2 MB/s |
+| `--streams 4` | 100.2 / 99.5 MB/s | 85.3 MB/s |
+| `--streams 8` | **89.2 / 90.3 MB/s** | **93-105 MB/s** |
+
+Same corpus, same sender, same wire speed, opposite conclusion: eight streams
+**costs 1.19x on mars** and **gains 1.25x on orion**. The only variable is the
+receiver's disk. The default of 1 is therefore right for mars and wrong for
+orion, and no single default is right for both.
+
 **This complicates 4.14's heuristic in a way that story does not anticipate.**
 4.14 measured Manga peaking at **4** streams and proposes deriving the default
 from the share of transferred bytes in files above `MAX_DATA_SEGMENT`. On the
