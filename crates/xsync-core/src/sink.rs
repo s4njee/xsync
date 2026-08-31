@@ -244,6 +244,80 @@ impl Sink {
         })
     }
 
+    /// Write one verified chunk **without** flushing it.
+    ///
+    /// The caller takes on the invariant that `write_chunk_with_retry` keeps
+    /// for itself: it must call [`Self::sync_staged_chunks`] before recording
+    /// any of these ranges in a durable journal, or a resume could trust a
+    /// range that exists only in page cache.
+    ///
+    /// This exists so a receiver can amortise the flush across several chunks.
+    /// Per chunk the barrier costs ~21 ms against ~71 ms of wire time for 8 MB,
+    /// which was the whole of pull's remaining gap to rsync (4.65).
+    ///
+    /// # Errors
+    /// Returns a sink error when the range is invalid, the data fails
+    /// verification, or the write fails.
+    pub fn write_chunk_deferred<F>(
+        &self,
+        entry: &FileEntry,
+        offset: u64,
+        length: u64,
+        expected_hash: &blake3::Hash,
+        mut receive: F,
+    ) -> Result<(), SinkError>
+    where
+        F: FnMut(u8) -> io::Result<Vec<u8>>,
+    {
+        require_kind(entry, EntryKind::File, "file")?;
+        if offset
+            .checked_add(length)
+            .is_none_or(|end| end > entry.size)
+        {
+            return Err(SinkError::InvalidChunkRange {
+                path: entry.path.to_string(),
+                offset,
+                length,
+                size: entry.size,
+            });
+        }
+        let temp_path = self.temporary_path(&entry.path)?;
+
+        for attempt in 1..=MAX_VERIFICATION_ATTEMPTS {
+            let data = receive(attempt).map_err(|source| SinkError::Receive {
+                path: entry.path.to_string(),
+                attempt,
+                source,
+            })?;
+            if data.len() as u64 == length && blake3::hash(&data) == *expected_hash {
+                write_at_maybe_sync(&temp_path, offset, &data, false)?;
+                return Ok(());
+            }
+        }
+
+        Err(SinkError::VerificationFailed {
+            path: entry.path.to_string(),
+            attempts: MAX_VERIFICATION_ATTEMPTS,
+        })
+    }
+
+    /// Flush every chunk written so far for `entry` to the device.
+    ///
+    /// Must be called before a journal checkpoint that covers ranges written
+    /// with [`Self::write_chunk_deferred`].
+    ///
+    /// # Errors
+    /// Returns a sink error when the staging file cannot be opened or synced.
+    pub fn sync_staged_chunks(&self, entry: &FileEntry) -> Result<(), SinkError> {
+        let temp_path = self.temporary_path(&entry.path)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&temp_path)
+            .map_err(|source| io_error("open chunked temp file", &temp_path, source))?;
+        file.sync_data()
+            .map_err(|source| io_error("sync chunked temp file", &temp_path, source))
+    }
+
     /// Ensure the deterministic temp file for chunked writes exists at the
     /// declared size.
     ///
@@ -605,6 +679,10 @@ fn open_temp_file(path: &Path) -> io::Result<File> {
 }
 
 fn write_at(path: &Path, offset: u64, data: &[u8]) -> Result<(), SinkError> {
+    write_at_maybe_sync(path, offset, data, true)
+}
+
+fn write_at_maybe_sync(path: &Path, offset: u64, data: &[u8], sync: bool) -> Result<(), SinkError> {
     let mut file = OpenOptions::new()
         .write(true)
         .open(path)
@@ -613,11 +691,16 @@ fn write_at(path: &Path, offset: u64, data: &[u8]) -> Result<(), SinkError> {
         .map_err(|source| io_error("seek chunked temp file", path, source))?;
     file.write_all(data)
         .map_err(|source| io_error("write chunked temp file", path, source))?;
-    // The caller records the completed range in its durable receiver journal
-    // immediately after this function returns. Flush the staged bytes first
-    // so a checkpoint can never acknowledge data that exists only in cache.
-    file.sync_data()
-        .map_err(|source| io_error("sync chunked temp file", path, source))
+    // The invariant is that a journal checkpoint never acknowledges data that
+    // exists only in cache. Syncing here satisfies it per chunk. A caller that
+    // batches checkpoints must instead call `sync_staged_chunks` before the
+    // checkpoint that covers these ranges -- the *order* is what matters, not
+    // the frequency.
+    if sync {
+        file.sync_data()
+            .map_err(|source| io_error("sync chunked temp file", path, source))?;
+    }
+    Ok(())
 }
 
 fn apply_file_metadata(path: &Path, entry: &FileEntry) -> Result<(), SinkError> {

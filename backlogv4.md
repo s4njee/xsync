@@ -2060,6 +2060,60 @@ a false drift conclusion on top of it. Only interleaved same-session A/Bs with
 per-run verification have survived contact with reality this cycle. 4.21 must
 make both the default.
 
+### 4.65 — Pull's durability barriers were the last of the gap
+
+- [x] **Fixed 2026-08-31. Pull is now within 2% of rsync.** The receiver flushed
+  and checkpointed every 8 MB chunk, costing ~21 ms against ~71 ms of wire time.
+
+**First, the fairness question was tested and answered "no".** 4.64 found that
+on a Linux receiver rsync leaves ~2.4 GB dirty at exit while xsync leaves ~2.6
+MB, so wall-clock comparisons were not like-for-like. That does **not** replicate
+on pull, where the receiver is macOS. Forcing a real `F_FULLFSYNC` barrier over
+every file after each run:
+
+| arm | transfer | to durable | tail |
+|---|---:|---:|---:|
+| rsync | 8.72 s (112.6 MB/s) | 8.77 s (111.9 MB/s) | 0.05 s |
+| xsync | 10.94 s (89.8 MB/s) | 10.98 s (89.4 MB/s) | 0.05 s |
+
+Both tails are ~0.05 s: **both tools' data was already durable.** A macOS
+receiver writes back promptly where a Linux one defers. So pull's gap was real
+work, not an accounting artefact -- and the fairness caveat from 4.64 is
+platform-specific, which is worth knowing before it is applied too widely.
+
+Note that `sync(2)` on macOS only *schedules* writeback, so the earlier attempt
+to measure this with `sync` showed a ~0.10 s tail for both arms and proved
+nothing. `F_FULLFSYNC` is the only honest barrier on that platform.
+
+**What the barriers were buying.** Since rsync's data ends up durable anyway via
+background writeback, xsync's synchronous per-chunk flush was not buying
+durability -- it was buying **resume granularity**, guaranteeing that a
+checkpointed range is really on disk.
+
+**The change.** `Sink::write_chunk_deferred` writes without flushing and
+`Sink::sync_staged_chunks` flushes on demand; the pull loop flushes and
+checkpoints every `XSYNC_CHECKPOINT_CHUNKS` chunks, default **8 (64 MB)**.
+The ordering invariant is untouched -- staged bytes are always flushed *before*
+the checkpoint that records them -- so a resume still never trusts a range that
+exists only in cache. Batching widens only how much an interruption redoes.
+
+| arm | runs (s) | median | throughput |
+|---|---|---:|---:|
+| rsync | 8.95 / 8.76 / 10.52 | 8.95 | 109.7 MB/s |
+| xsync `ckpt=1` (old behaviour) | 10.99 / 10.64 / 10.85 | 10.85 | 90.5 MB/s |
+| xsync `ckpt=8` (default) | 9.12 / 9.59 / 9.09 | 9.12 | **107.7 MB/s** |
+
+**1.19x**, closing the gap from 1.26x to **1.02x**.
+
+**Resume was verified against a real interruption**, since the push resume test
+does not cover this path at all. A pull killed with `SIGKILL` mid-file left the
+staging file and published nothing; the re-run reported **335,544,320 bytes
+resumed -- exactly 40 chunks, a multiple of the batch size** -- moved 646 MB of
+982 MB logical, produced SHA-256-identical output, and left no staging behind.
+
+**Gap worth closing:** there is still no automated test for pull resume. The
+existing `test_durable_resume_skips_verified_ranges` exercises push only.
+
 ### 4.64 — The ext4 gap closed itself, and the rsync comparison was never fair
 
 - [x] **Investigated 2026-08-31. No code change needed.** The ext4 push gap

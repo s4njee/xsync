@@ -104,6 +104,7 @@ static BATCH_BYTES: OnceLock<u64> = OnceLock::new();
 static BATCH_FILES: OnceLock<usize> = OnceLock::new();
 static APPLY_WORKERS: OnceLock<usize> = OnceLock::new();
 static LARGE_CHUNKS: OnceLock<usize> = OnceLock::new();
+static CHECKPOINT_CHUNKS: OnceLock<usize> = OnceLock::new();
 
 /// Read an environment variable as `T`, clamped to `min..=max`.
 ///
@@ -232,6 +233,25 @@ pub fn large_chunks_in_flight() -> usize {
     })
 }
 
+/// Chunks a receiver may write before flushing them and checkpointing.
+///
+/// Overridden by `XSYNC_CHECKPOINT_CHUNKS`. **This is a durability/throughput
+/// trade, not a tuning knob**: it is the amount of work an interrupted
+/// transfer may have to redo. At the default of 8 that is 64 MB.
+///
+/// The invariant it must not break is ordering, not frequency -- staged chunks
+/// are flushed *before* the checkpoint that records them, so a resume never
+/// trusts a range that exists only in page cache. `1` restores the per-chunk
+/// behaviour exactly.
+///
+/// Measured on a macOS receiver: the three barriers cost ~21 ms per 8 MB chunk
+/// against ~71 ms of wire time, which was the whole of pull's remaining gap to
+/// rsync (4.65).
+#[must_use]
+pub fn checkpoint_chunks() -> usize {
+    *CHECKPOINT_CHUNKS.get_or_init(|| bounded("XSYNC_CHECKPOINT_CHUNKS", 8, 1, 64))
+}
+
 /// The values actually in effect, for recording beside a measurement.
 ///
 /// Reports what the process resolved, not what the environment said, so a
@@ -258,6 +278,7 @@ pub fn is_tuned() -> bool {
     max_pipelined_frames() != MAX_PIPELINED_FRAMES
         || batch_target_size() != BATCH_TARGET_SIZE
         || max_batch_files() != MAX_BATCH_FILES
+        || checkpoint_chunks() != 8
         || large_chunks_in_flight()
             != usize::try_from(DEFAULT_UNACKNOWLEDGED_WINDOW as u64 / LARGE_FILE_CHUNK)
                 .unwrap_or(1)

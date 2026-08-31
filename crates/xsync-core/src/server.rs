@@ -5517,6 +5517,8 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 // than we have outstanding requests.
                 let window = crate::tuning::large_chunks_in_flight();
                 let ranges: Vec<ByteRange> = missing;
+                // Ranges written but not yet flushed or checkpointed.
+                let mut staged: Vec<ByteRange> = Vec::new();
                 let mut issued = 0usize;
                 let mut done = 0usize;
                 while done < ranges.len() {
@@ -5557,17 +5559,28 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     };
 
                     let hash = blake3::Hash::from_bytes(digest);
-                    sink.write_chunk_with_retry(file, offset, length, &hash, |_attempt| {
+                    sink.write_chunk_deferred(file, offset, length, &hash, |_attempt| {
                         Ok(data.clone())
                     })?;
+                    staged.push(ByteRange { offset, length });
 
-                    // The checkpoint stays per chunk and stays *before* the
-                    // range is counted as done. Pipelining changes when the
-                    // request was issued, never the order of verify, write, and
-                    // durably record -- an interrupted pull must still resume
-                    // from a range that is actually on disk.
-                    track.push(ByteRange { offset, length });
-                    resume_journal.checkpoint(&identity, &track)?;
+                    // Flush and checkpoint every `checkpoint_chunks` chunks
+                    // rather than every chunk. The barriers cost ~21 ms per
+                    // 8 MB against ~71 ms of wire time, which was the whole of
+                    // pull's remaining gap to rsync (4.65).
+                    //
+                    // What must not change is the *order*: staged bytes are
+                    // flushed before the checkpoint that records them, so a
+                    // resume can never trust a range that exists only in page
+                    // cache. Batching only widens how much an interruption
+                    // redoes -- 64 MB at the default -- it never lets the
+                    // journal run ahead of the disk.
+                    let last = done + 1 == ranges.len();
+                    if staged.len() >= crate::tuning::checkpoint_chunks() || last {
+                        sink.sync_staged_chunks(file)?;
+                        track.append(&mut staged);
+                        resume_journal.checkpoint(&identity, &track)?;
+                    }
 
                     let range_ack = decoder
                         .read(&mut reader)
