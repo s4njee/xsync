@@ -2062,10 +2062,10 @@ make both the default.
 
 ### 4.66 — The receiver writes large-file chunks inline, and slow storage pays for it
 
-- [ ] On a Raspberry Pi 5 receiver, large-file push runs at **85.5 MB/s against
-  rsync's 111.8** -- a 1.31x gap that does not appear on a fast NVMe host. The
-  receiver's disk write happens *in* the receive loop, so it never overlaps the
-  network.
+- [ ] On a Raspberry Pi 5 receiver, large-file push runs at **83.4 MB/s against
+  rsync's 100.0 measured to durability** -- a **1.20x** gap that does not appear
+  on a fast NVMe host. The receiver's disk write happens *in* the receive loop,
+  so it never overlaps the network.
 
 **Measured 2026-08-31, Mac -> orion, after orion was moved onto router1** (so
 this is a switched gigabit path, not the mesh). Corpora: congress-100k
@@ -2104,6 +2104,38 @@ explains only 0.46 s of it (346 MB/s at every 8 MB, 413 MB/s at once-at-end).
 The receive loop verifies and writes each chunk before reading the next, so on
 any destination slower than the wire the two costs add instead of overlapping.
 mars hides this because its NVMe is roughly 8x faster than the link.
+
+**Replicated, with the destination filesystem as the variable** (three rounds,
+alternating, every run verifying exit status and landed count):
+
+| arm | runs (s) | median | throughput |
+|---|---|---:|---:|
+| rsync -> ext4 | 8.77 / 8.82 / 8.71 | 8.77 | 111.9 MB/s |
+| rsync -> tmpfs | 8.73 / 8.72 / 8.84 | 8.73 | 112.5 MB/s |
+| xsync -> ext4 | 11.48 / 11.66 / 11.53 | 11.53 | 85.2 MB/s |
+| xsync -> tmpfs | 9.07 / 9.06 / 9.06 | 9.06 | **108.3 MB/s** |
+
+**rsync is entirely insensitive to the destination filesystem** (8.77 vs 8.73)
+while xsync loses 2.47 s to it. That is the whole finding in one line.
+
+**The gap is smaller than first filed, because 4.64 applies here too.** orion is
+a Linux receiver, so rsync defers writeback -- ~318 MB still dirty at exit,
+against xsync's ~1.6 MB. (Less than mars's 2.4 GB: orion has 4 GB of RAM and
+flushes sooner.) Timing to durability instead:
+
+| arm | transfer | to durable | tail | dirty at exit |
+|---|---:|---:|---:|---:|
+| rsync | 8.77 s (112.0 MB/s) | 9.82 s (**100.0 MB/s**) | 1.06 s | ~318 MB |
+| xsync | 11.47 s (85.6 MB/s) | 11.77 s (**83.4 MB/s**) | 0.30 s | ~1.6 MB |
+
+So the honest gap is **1.20x**, not the 1.31x the raw transfer numbers imply.
+It is still a real gap -- unlike 4.64 on mars, deferral does not account for all
+of it -- but a fifth of what looked like the problem was rsync doing less work.
+
+**And the shape of the remaining gap is specific:** xsync to tmpfs reaches
+108.3 MB/s, which is *faster* than rsync's 100.0 MB/s to durability. xsync is
+not slower at moving or committing bytes; it is slower only because it stops to
+write them. Remove the serialization and it is already ahead.
 
 **AC**
 
