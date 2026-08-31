@@ -1217,6 +1217,52 @@ transfer that is waiting on the cipher.
 
 **Still deliberately not pursued**: multi-process sharding and GPU hashing.
 
+### 4.51 — Overlap planning with transfer *(medium priority)*
+
+- [ ] Transfer start is gated on plan completeness per kind, so scanning and
+  classification are dead time on the wire. Measured with `--dry-run`, which
+  performs exactly that work and stops:
+
+| | freya → orion | macOS → freya |
+|---|---:|---:|
+| scan + plan, no transfer | **0.79 s** | **1.45 s** |
+| full transfer | 7.53 s | 7.70 s |
+| share before the first byte | **10.5%** | **19%** |
+
+**This is the largest identified slice left.** 4.28 sized the other three
+candidates: multiplexed streams and hash parallelism are dead, and parallel
+compression is worth 5–9%. After 4.15, 4.25 and 4.26 there is no step change
+remaining, and two ~10% items are what is on the table.
+
+**Why it is not free.** The sender cannot classify an entry until the
+destination index says whether it exists and differs, and that index arrives
+from the peer. What *can* overlap is the source scan and the local half of
+planning against the destination scan's arrival, and then the transfer of
+already-classified entries while later ones are still being decided.
+
+`classify_stream` already exists and streams entries through a callback rather
+than materialising a `Plan`, so the shape is present; the push path calls
+`try_plan_with_fingerprint` and waits for a complete `Plan` instead.
+
+**AC**
+
+- The push path consumes classifications as they are produced and begins
+  sending `New`/`Changed` files before the whole tree is classified.
+- Ordering guarantees that currently hold are stated and preserved:
+  directories are created before their children, and `--delete` still runs
+  after a successful transfer, not interleaved with it.
+- The dry-run share is re-measured afterwards on both pairs. Success is
+  recovering a real part of the 10.5%/19%, not merely moving the work.
+- Failure semantics unchanged: a scan error must still abort before anything
+  is published, which is harder once publication starts early — this is the
+  main risk and should be tested explicitly.
+- Measured with the usual discipline: verified runs, warmup discarded,
+  alternating arms, on the Linux pair first so no OS difference intrudes.
+
+**Not to be confused with** the sender read-ahead in 4.15, which overlaps
+reading with sending *inside* the transfer phase. This overlaps the phase
+boundary itself.
+
 ## Phase 10 — Benchmarkability
 
 Written 2026-08-29, after asking where this cycle's knowledge actually came
