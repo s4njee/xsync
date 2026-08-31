@@ -238,32 +238,79 @@ Recorded so they are not resurrected from older notes:
 
 ---
 
-## Does the sender matter? A 3 × 2 matrix
+## Against rsync
+
+`BENCHMARKv2.md` recorded "rsync wins, and compression is why" — `rsync -az` at
+11.0 s against an xsync that was 1.57× behind it. That was before the sender
+overlap (4.15), the receiver pool (4.26) and small-file striping (4.25). The
+picture has changed, but not uniformly, and the exceptions are the interesting
+part.
+
+All figures congress-100k unless noted, two reps, warmup discarded, verified.
+
+| sender → receiver | rsync -a | rsync -az | xsync | best |
+|---|---:|---:|---:|---|
+| macOS → freya | 20.24 s | 24.76 s | **8.00 s** | xsync **2.5×** |
+| macOS → freya, *no-op re-sync* | 6.52 s | — | **2.07 s** | xsync **3.2×** |
+| macOS → freya, *cb7* | 80.2 s | 195.3 s | **59.0 s** | xsync **1.36×** |
+| freya → orion | 9.86 s | 8.08 s | **7.81 s** | xsync **1.03×** |
+| orion → freya | **9.41 s** | 16.60 s | 10.67 s | **rsync -a 1.13×** |
+
+### Three things this says
+
+**The sender platform decides the margin.** xsync is 2.5× ahead from macOS, at
+parity from a fast Linux box, and slightly *behind* from a Pi. rsync's cost
+profile is far more sender-sensitive than ours: macOS rsync is remarkably slow
+here, and that — not xsync being fast — is most of the 2.5×.
+
+**`-z` is a liability, not a feature, outside compressible data.** rsync
+compresses unconditionally when asked. On cb7 — largely `node_modules` and
+already-compressed assets — `-az` costs **2.4×** over `-a` (195 s against 80 s).
+On the Pi it costs **1.8×** (16.6 s against 9.4 s) because zlib outruns the CPU.
+xsync's sample-and-skip heuristic avoids both traps automatically, which is
+where a good part of the cb7 and Pi-receiver margins come from.
+
+**The one loss is not compression.** rsync -a beating xsync from the Pi looked
+like our default compression taxing a weak CPU. It is not:
+`xsync --no-compress` measured **10.68 s** against the compressed **10.70 s** —
+indistinguishable. The remaining ~13% is elsewhere, and the honest note is that
+xsync computes and verifies a BLAKE3 digest for every file, which `rsync -a`
+does not do at all. We are doing strictly more work and landing within 13%.
+
+
+---
+
+## Does the sender matter? A 3 × 3 matrix
 
 Every result above used the same macOS client, so "the OS is worth 3.6×" was
 really a statement about *receivers*. Varying the sender deliberately — an
 M1 Max, a 32-thread 7950X and a 4-core Pi 5, each pushing the same two corpora
-to the same two receivers on one machine — separates the two roles.
+to three receivers — separates the two roles. Two of the receivers are the same
+physical machine, differing only in OS.
 
 Two reps each, warmup discarded, every run verified.
 
 **congress-100k** — 109,615 files, 850 MB, mean 7.9 KB
 
-| sender | → WSL2 ext4 | → Windows NTFS |
-|---|---:|---:|
-| freya (7950X) | 14.24, 14.19 → **14.21 s** | 50.12, 50.77 → **50.45 s** |
-| macOS (M1 Max) | 15.70, 15.54 → **15.62 s** | 52.00, 51.88 → **51.94 s** |
-| orion (Pi 5) | 17.03, 17.03 → **17.03 s** | 51.60, 56.40 → **54.00 s** |
-| *sender spread* | *1.20×* | *1.07×* |
+| sender | → orion (Pi 5) | → WSL2 ext4 | → Windows NTFS |
+|---|---:|---:|---:|
+| freya (7950X) | 7.45, 7.57 → **7.51 s** | 14.24, 14.19 → **14.21 s** | 50.12, 50.77 → **50.45 s** |
+| macOS (M1 Max) | 9.34, 9.39 → **9.37 s** | 15.70, 15.54 → **15.62 s** | 52.00, 51.88 → **51.94 s** |
+| orion (Pi 5) | — | 17.03, 17.03 → **17.03 s** | 51.60, 56.40 → **54.00 s** |
+| *sender spread* | *1.25×* | *1.20×* | *1.07×* |
 
 **cb7** — 62,621 entries, 5.6 GB, mean 99 KB
 
-| sender | → WSL2 ext4 | → Windows NTFS |
-|---|---:|---:|
-| freya | 62.21, 61.31 → **61.76 s** | 96.58, 95.11 → **95.84 s** |
-| macOS | 65.92, 66.07 → **66.00 s** | 98.10, 96.11 → **97.10 s** |
-| orion | 117.98, 116.35 → **117.16 s** | 142.45, 141.67 → **142.06 s** |
-| *sender spread* | *1.90×* | *1.48×* |
+| sender | → orion (Pi 5) | → WSL2 ext4 | → Windows NTFS |
+|---|---:|---:|---:|
+| freya | 75.81, 75.40 → **75.61 s** | 62.21, 61.31 → **61.76 s** | 96.58, 95.11 → **95.84 s** |
+| macOS | 103.24, 98.59 → **100.92 s** | 65.92, 66.07 → **66.00 s** | 98.10, 96.11 → **97.10 s** |
+| orion | — | 117.98, 116.35 → **117.16 s** | 142.45, 141.67 → **142.06 s** |
+| *sender spread* | *1.33×* | *1.90×* | *1.48×* |
+
+**The Pi is the fastest receiver in the fleet on small files** — 7.51 s from
+freya, against 8.46 s for freya receiving from the same sender. On cb7 it drops
+behind, but that is its 62 MB/s link rather than its CPU.
 
 ### The sender scales with bytes; the receiver scales with file count
 

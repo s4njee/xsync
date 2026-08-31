@@ -752,8 +752,9 @@ Angles, cheapest first:
   instead of the sequential `spawn_server_child` loop (ties into 4.7/V3.18).
 - **Cipher choice**: aes-gcm vs chacha20-poly1305 on hosts with and without
   hardware AES (Pi 5 has none). Only matters if the raw-vs-ssh delta is large.
-- **Out of scope for v1**: QUIC or a native TLS daemon transport — that is the
-  v2 daemon conversation, and this story's numbers are its justification.
+- **Out of scope for v1**: QUIC or a native TLS daemon transport. Phase 12 now
+  breaks that work into decision-sized stories; this story's numbers and 4.50's
+  faster link are their baseline.
 
 **AC**: a table in `docs/` giving files/s and MB/s for raw-TCP vs SSH on the
 same pair, the explanation for the 5.3 ms RTT, and a go/no-go on multiplexed
@@ -1868,6 +1869,160 @@ not bandwidth-bound, so the adapter change may pay off there first.
   will not scale with bandwidth, and that is how SSH crypto and xsync's chunked
   path get told apart.
 - The 1 GbE figures are kept, not replaced. They are what most users have.
+
+## Phase 12 — Native authenticated transport and daemon
+
+SSH remains the shipping carrier until this phase clears both its security and
+measurement gates. The goal is not to replace one mature security protocol with
+home-grown crypto. The candidates are **QUIC (TLS 1.3 over UDP)** and **TLS 1.3
+over TCP**, using maintained implementations and carrying the existing native
+sync protocol. Pick one; do not ship and maintain both unless the measurements
+show distinct regimes that justify two stacks.
+
+This phase depends on 4.17 for the raw-TCP/SSH decomposition and benefits from
+4.50's 2.5 GbE link. D6 in `DEPLOYMENT.md` owns service packaging; these stories
+own the network protocol, trust model, and transfer integration.
+
+### 4.51 — Choose QUIC or TLS-over-TCP with a transport spike
+
+- [ ] **R.** Put the same bounded request/response and bulk byte streams over
+  one QUIC connection and one TLS-over-TCP connection. This is a carrier test,
+  not permission to fork the sync protocol or invent a new framing format.
+
+**Experiment**
+
+- Reuse the v2 handshake and representative encoded frames through a narrow
+  transport adapter. Include one control flow plus 1, 4, 8 and 16 concurrent
+  logical data streams over a **single authenticated connection**.
+- Measure connection setup, first job, 100 repeated tiny jobs, congress-100k,
+  and the large-file corpus on the 1 GbE and 2.5 GbE paths. Record wall time,
+  throughput, CPU, memory, wire bytes and connection/process count beside the
+  SSH and raw-TCP baselines from 4.17/4.50.
+- Sweep 0/20/80/150 ms added RTT and controlled loss/reordering using 4.42.
+  QUIC's UDP path must also be tried through a network where UDP is blocked;
+  that failure is a product condition, not a lab anomaly.
+- Build and run on macOS, Linux and Windows. Dependency review includes
+  maintenance health, platform backends, binary cost, `unsafe` surface and the
+  workspace's Rust-version floor. No custom TLS, certificate validation or
+  congestion control.
+
+**Decision gate / AC**
+
+- One short decision record selects QUIC, TLS-over-TCP, or **neither**, with raw
+  results and a stated reason. A second implementation survives only if it wins
+  a measured regime the selected one cannot serve.
+- The chosen carrier supports cancellation, backpressure and independent
+  logical streams without head-of-line blocking between a slow file and the
+  control path. If TLS-over-TCP wins, the record explains why connection-level
+  head-of-line blocking is acceptable.
+- The spike is throwaway unless it clears the identity design in 4.52. A fast
+  unauthenticated socket is not progress toward the daemon.
+
+### 4.52 — Peer identity, pairing and root authorization
+
+- [ ] Define who a daemon trusts and what an authenticated peer may touch before
+  opening a non-loopback listener. Encryption without authorization would turn
+  `xs --server <root>` into a network-exposed filesystem API.
+
+**AC**
+
+- Mutual authentication is mandatory. The design specifies key generation,
+  storage, peer naming, rotation, revocation and recovery on macOS, Linux and
+  Windows. Private keys never live in the ordinary job config or logs.
+- First pairing requires an explicit local act or an already-authenticated SSH
+  bootstrap. There is no silent trust-on-first-use, shared default secret,
+  anonymous write mode or `--insecure` path that can become a permanent setup.
+- Authorization is allow-list based: a peer receives named roots and explicit
+  read, write, delete and browse capabilities. Paths are resolved beneath the
+  authorized root with the same collision, symlink and containment rules as the
+  SSH server; a client cannot nominate an arbitrary absolute server path.
+- Protocol negotiation is authenticated and fail-closed. Tests cover the wrong
+  peer, expired/revoked credentials, replayed pairing material, key replacement,
+  unauthorized roots/operations and allocation-amplification attempts before
+  filesystem mutation.
+- The threat model and credential locations are documented, including which
+  local users can administer peers and read daemon state. V3.30/D8.2 consume
+  this rather than maintaining a contradictory daemon security story.
+
+### 4.53 — One daemon connection, many isolated sync sessions
+
+- [ ] Turn the selected carrier into a long-lived, unprivileged daemon endpoint
+  while keeping the existing one-shot `--server` state machine usable over SSH.
+
+**AC**
+
+- A connection has one authenticated peer identity and can carry repeated sync
+  jobs plus control and data streams. Every job gets a fresh root authorization,
+  options, cancellation scope, accounting record and cleanup boundary; state
+  from one job cannot bleed into the next.
+- `--streams N` means N logical data streams on one native connection, not N
+  handshakes or N daemon processes. Control traffic remains responsive under a
+  saturated bulk transfer, and per-job and per-peer limits bound streams,
+  outstanding bytes, queued work, open files and idle time.
+- Push, pull, browse, resume, progress and structured failures preserve their
+  current application-protocol semantics. Carrier shutdown maps to stable
+  transport errors rather than EOF guesses, and a cancelled or disconnected
+  job leaves no published partial file or abandoned lock.
+- The daemon runs as the logged-in user by default and never requires root to
+  serve per-user data. Its foreground mode is fully testable without a service
+  manager; systemd, launchd and Windows service/tray installation remain D6.1–D6.3.
+- Graceful shutdown drains or cancels jobs within a bounded deadline. Crash and
+  restart tests prove journal/resume recovery and credential state are not
+  corrupted.
+
+### 4.54 — Make carrier selection explicit and fallback safe
+
+- [ ] Integrate the daemon without overloading today's `--transport` meaning.
+  That flag currently chooses the native xsync protocol versus the rsync wire
+  fallback; SSH versus the new daemon is a separate **carrier** decision.
+
+**AC**
+
+- CLI/config syntax distinguishes application protocol from carrier, has an
+  explicit host/port form including IPv6, and defines precedence without
+  breaking existing `host:path` SSH commands. Native-daemon use is opt-in until
+  4.55 passes.
+- Auto-selection may fall back from an unreachable/blocked daemon to SSH only
+  before a job starts. It never falls back on an identity, authorization,
+  downgrade, protocol-corruption or mid-transfer failure, and it never repeats
+  a mutating job on another carrier by guessing that the first did nothing.
+- No unauthenticated LAN discovery is required. If discovery is later added,
+  advertisements are hints only and the pinned peer identity remains the
+  authority.
+- Human output and JSON report the application protocol, carrier, endpoint,
+  authenticated peer, negotiated wire version, reuse versus new connection and
+  fallback reason. They do not expose keys, tokens or full certificate bodies.
+- SSH remains available as an explicit carrier and continues to pass its
+  existing integration suite. A daemon-only peer produces an actionable error,
+  not an attempted remote shell command.
+
+### 4.55 — Native transport conformance, failure and performance gate
+
+- [ ] Treat the native daemon as a new security boundary and delivery path, not
+  as complete when a happy-path copy succeeds.
+
+**AC**
+
+- The same oracle-backed corpus matrix runs over pipe, SSH and the selected
+  native carrier for push, pull, browse, resume, filters, metadata, sparse files,
+  deletion and every supported stream count. Landed trees and structured final
+  reports are equivalent apart from declared carrier fields.
+- Deterministic failure tests inject handshake timeout, malformed frames,
+  certificate/key rejection, stream reset, connection loss, daemon kill,
+  cancellation, ENOSPC and restart during staging/publish. Each case has a
+  bounded exit, stable error class and proven cleanup/recovery result.
+- Protocol fuzzing runs both before and after authentication, with allocation,
+  frame, stream and idle limits asserted. A security review covers dependency
+  defaults, downgrade resistance, replay/0-RTT policy and denial-of-service
+  exposure; mutating requests are never accepted as replayable early data.
+- Interleaved, verified A/Bs against SSH run on both retained links and the RTT
+  regimes from 4.51. To become the default carrier, the daemon must make
+  repeated tiny-job latency at least **2× better**, improve large-file
+  throughput or CPU cost by at least **20%** where SSH is the measured ceiling,
+  and regress no retained small-file cell by more than **5%**.
+- If the performance gate misses, the secure explicit carrier may remain for
+  daemon/index functionality, but SSH stays the default and the result is
+  recorded as such. If the security or failure gate misses, it does not ship.
 
 ## Phase 4 — Carried forward
 
