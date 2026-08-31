@@ -46,7 +46,8 @@
 
 use std::sync::OnceLock;
 
-use crate::server::MAX_PIPELINED_FRAMES;
+use crate::protocol::DEFAULT_UNACKNOWLEDGED_WINDOW;
+use crate::server::{LARGE_FILE_CHUNK, MAX_PIPELINED_FRAMES};
 use crate::strategy::{BATCH_TARGET_SIZE, MAX_BATCH_FILES};
 
 /// Lower bound on the pipelining window.
@@ -102,6 +103,7 @@ static PIPELINED_FRAMES: OnceLock<usize> = OnceLock::new();
 static BATCH_BYTES: OnceLock<u64> = OnceLock::new();
 static BATCH_FILES: OnceLock<usize> = OnceLock::new();
 static APPLY_WORKERS: OnceLock<usize> = OnceLock::new();
+static LARGE_CHUNKS: OnceLock<usize> = OnceLock::new();
 
 /// Read an environment variable as `T`, clamped to `min..=max`.
 ///
@@ -209,6 +211,27 @@ pub fn apply_worker_count() -> usize {
     })
 }
 
+/// 8 MB file chunks the sender may leave unacknowledged.
+///
+/// Overridden by `XSYNC_LARGE_CHUNKS_IN_FLIGHT`. The default is the negotiated
+/// unacknowledged byte window divided by the chunk size -- four chunks, 32 MB.
+///
+/// This is a *byte* budget expressed in chunks, deliberately not the frame
+/// window [`max_pipelined_frames`] uses. These frames are 8 MB each rather than
+/// ack-sized, so 2048 of them in flight would be gigabytes.
+///
+/// **`1` reproduces the pre-4.60 lockstep exactly**, which makes it the control
+/// arm for measuring what pipelining is worth on a given link.
+#[must_use]
+pub fn large_chunks_in_flight() -> usize {
+    *LARGE_CHUNKS.get_or_init(|| {
+        let default = usize::try_from(DEFAULT_UNACKNOWLEDGED_WINDOW as u64 / LARGE_FILE_CHUNK)
+            .unwrap_or(1)
+            .max(1);
+        bounded("XSYNC_LARGE_CHUNKS_IN_FLIGHT", default, 1, 32)
+    })
+}
+
 /// The values actually in effect, for recording beside a measurement.
 ///
 /// Reports what the process resolved, not what the environment said, so a
@@ -220,6 +243,10 @@ pub fn snapshot() -> Vec<(&'static str, String)> {
         ("batch_bytes", batch_target_size().to_string()),
         ("batch_files", max_batch_files().to_string()),
         ("apply_workers", apply_worker_count().to_string()),
+        (
+            "large_chunks_in_flight",
+            large_chunks_in_flight().to_string(),
+        ),
     ]
 }
 
@@ -231,6 +258,10 @@ pub fn is_tuned() -> bool {
     max_pipelined_frames() != MAX_PIPELINED_FRAMES
         || batch_target_size() != BATCH_TARGET_SIZE
         || max_batch_files() != MAX_BATCH_FILES
+        || large_chunks_in_flight()
+            != usize::try_from(DEFAULT_UNACKNOWLEDGED_WINDOW as u64 / LARGE_FILE_CHUNK)
+                .unwrap_or(1)
+                .max(1)
 }
 
 #[cfg(test)]

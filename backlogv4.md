@@ -2062,6 +2062,7 @@ make both the default.
 
 ### 4.60 — The large-file path has no pipelining, and rsync is 1.8x faster *(PRIORITY)*
 
+- [x] **Push path fixed 2026-08-31.** Pull is unfixed; see below.
 - [ ] `run_client_push`'s large-file loop sends one 8 MB chunk and then blocks
   on two acknowledgements before reading the next. `max_pipelined_frames()` --
   the window every other send path uses -- is never consulted here. Transfer and
@@ -2134,6 +2135,56 @@ costs an SSH connection each.
   link, not a percentage.
 - Re-run on 10 GbE once the X540 lands, since that is where the remaining
   per-chunk cost becomes visible.
+
+**Delivered (push).** The loop now keeps a bounded number of chunks in flight
+and drains acknowledgements at a low-water mark. Depth is a *byte* budget
+expressed in chunks -- `DEFAULT_UNACKNOWLEDGED_WINDOW / LARGE_FILE_CHUNK` = 4,
+32 MB -- deliberately not the frame window the batch path uses, because these
+frames are 8 MB each rather than ack-sized. Overridable as
+`XSYNC_LARGE_CHUNKS_IN_FLIGHT`; **`1` reproduces the old lockstep exactly** and
+is the control arm below.
+
+The durability contract is unchanged. All chunk acks are drained to zero before
+`LargeFileFinish` is sent. That is required for two reasons, and the second is a
+silent-corruption hazard rather than a performance one: the receiver commits on
+Finish, and a straggling chunk ack is itself a `Message::Ack`, so it would have
+satisfied the Finish ack check without complaint.
+
+**Measured, tmpfs destination to remove receiver-disk variance, rsync
+interleaved as a drift anchor.** Two corpora, agreeing within 2%:
+
+| arm | 4.32 GiB | 0.98 GiB |
+|---|---:|---:|
+| rsync | 114.0 MB/s | 111.3 MB/s |
+| xsync, `=1` (old lockstep) | 86.9 MB/s | 87.0 MB/s |
+| xsync, `=4` (new default) | **102.2 MB/s** | **102.8 MB/s** |
+| xsync, `=16` | 101.9 MB/s | -- |
+
+- **1.18x on tmpfs**, and **1.32x to ext4** (62.1 -> 81.9 MB/s), where the
+  receiver's disk write is also serialized.
+- **Depth 4 and 16 are indistinguishable.** 32 MB in flight already saturates,
+  so the negotiated window is the right default and needs no tuning. A deeper
+  window is not where the remaining gap lives.
+- Remaining gap to rsync: **1.11x on tmpfs**, 1.37x to ext4.
+
+**A methodology note worth keeping.** A depth sweep run *sequentially*, without
+an anchor, produced non-monotonic nonsense -- depth 4 measured 68.97 s minutes
+after the same configuration measured 52.70 s. Repeated multi-GB writes leave
+ext4 writeback in varying states. Anchoring on rsync and destroying the disk
+variable with tmpfs turned the same experiment into tight, reproducible
+numbers. Sequential sweeps of this workload cannot be trusted.
+
+**Still open.**
+
+1. **`run_client_pull` has the same lockstep loop** (a second copy of this code
+   at the pull site). Downloads did not get this fix.
+2. **The remaining 1.11x on tmpfs.** Candidates, unmeasured: the whole file is
+   read into memory before any chunk is sent (`source_reader.read` returns
+   `stable.bytes` for the entire file), so disk read and network never overlap
+   *between* files either; and BLAKE3 is computed inline per chunk in the send
+   loop.
+3. **The ext4 gap is larger than the tmpfs gap**, so receiver-side write
+   serialization remains worth attacking separately.
 
 **Watch for** the 8 MB chunk buffer: the loop does `stable.bytes[start..end]
 .to_vec()` per chunk, and appears to hold the whole file in memory. Pipelining N

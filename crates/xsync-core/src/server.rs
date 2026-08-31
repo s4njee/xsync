@@ -3565,6 +3565,12 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
 /// without a rebuild, rather than referring to this constant directly.
 pub const MAX_PIPELINED_FRAMES: usize = 2048;
 
+/// Bytes per chunk when a file is larger than one data segment.
+///
+/// Named because the pipelining depth in [`crate::tuning::large_chunks_in_flight`]
+/// is derived from it and the negotiated byte window; the two must agree.
+pub const LARGE_FILE_CHUNK: u64 = 8 * 1024 * 1024;
+
 /// Write buffer for transport streams.
 ///
 /// `BufWriter::new` defaults to 8 KB, which on a small-file corpus holds barely
@@ -4420,8 +4426,22 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
 
                 // Send only the chunks that are not yet durably verified.
                 let missing =
-                    crate::journal::missing_chunks(file.size, 8 * 1024 * 1024, &verified_ranges);
+                    crate::journal::missing_chunks(file.size, LARGE_FILE_CHUNK, &verified_ranges);
                 let mut sent_bytes = 0u64;
+                // Chunks go out without stopping for each acknowledgement.
+                // Before 4.60 this loop wrote one 8 MB chunk and blocked on
+                // both of its acks, so the wire sat idle while the receiver
+                // hashed and wrote, and the receiver sat idle while the next
+                // chunk crossed. Measured against rsync over the same ssh on a
+                // switched gigabit link that cost 1.8x, with *neither* end near
+                // saturation -- which is what waiting looks like, not working.
+                //
+                // The depth is a byte budget expressed in chunks, deliberately
+                // not the frame window used elsewhere: these frames are 8 MB
+                // each, so 2048 in flight would be gigabytes.
+                let chunk_window = crate::tuning::large_chunks_in_flight();
+                let mut inflight_frames = 0usize;
+                let mut inflight_chunks = 0usize;
                 for range in missing {
                     let start = usize::try_from(range.offset).unwrap_or(0);
                     let len = usize::try_from(range.length).unwrap_or(0);
@@ -4453,19 +4473,23 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     )?;
                     report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
 
-                    let ack1 = decoder
-                        .read(&mut reader)
-                        .map_err(|e| map_transport_error(e, 0))?;
-                    let ack2 = decoder
-                        .read(&mut reader)
-                        .map_err(|e| map_transport_error(e, 0))?;
-                    if !matches!(ack1.message, Message::Ack { .. })
-                        || !matches!(ack2.message, Message::Ack { .. })
-                    {
-                        return Err(ServerError::UnexpectedMessage(
-                            "expected Ack for LargeFileRange/Segment".to_owned(),
-                        ));
+                    inflight_frames += 2;
+                    inflight_chunks += 1;
+                    if inflight_chunks >= chunk_window {
+                        writer.flush()?;
+                        // Drain to half depth rather than to empty, so the wire
+                        // stays busy while the receiver catches up. `drain_acks`
+                        // surfaces a remote `Error` frame as `RemoteError` and
+                        // rejects anything that is not an `Ack`, so pipelining
+                        // does not weaken the checking the two blocking reads
+                        // used to do.
+                        let low_water = (chunk_window / 2) * 2;
+                        drain_acks(&mut decoder, &mut reader, &mut inflight_frames, low_water)?;
+                        inflight_chunks = inflight_frames / 2;
                     }
+                    // Progress counts bytes *sent* rather than acknowledged.
+                    // The two differ by at most `chunk_window` chunks, and all
+                    // of them are acknowledged below before the file finishes.
                     emit(LocalEvent::Progress {
                         path: file.path.to_string(),
                         stream: 0,
@@ -4473,6 +4497,15 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
                         total: file.size,
                     });
                 }
+                // Every chunk must be acknowledged before LargeFileFinish goes
+                // out. Two reasons, and the second is a silent-corruption
+                // hazard: the receiver commits on Finish, so the durability the
+                // resume journal assumes requires the chunks durable first --
+                // and a straggling chunk ack is itself a `Message::Ack`, so it
+                // would satisfy the Finish ack check below without complaint.
+                writer.flush()?;
+                drain_acks(&mut decoder, &mut reader, &mut inflight_frames, 0)?;
+
                 retransmitted_bytes_total = retransmitted_bytes_total.saturating_add(sent_bytes);
                 checkpoint_bytes_total =
                     checkpoint_bytes_total.saturating_add(resumed_bytes.saturating_add(sent_bytes));
