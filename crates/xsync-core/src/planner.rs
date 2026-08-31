@@ -489,7 +489,12 @@ pub fn try_plan_with_fingerprint(
     for entry in source_entries {
         source_spool.push(entry)?;
     }
-    try_plan_spooled_with_fingerprint(source_spool, destination, compare_fingerprint, compare_modes)
+    try_plan_spooled_with_fingerprint(
+        source_spool,
+        destination,
+        compare_fingerprint,
+        compare_modes,
+    )
 }
 
 /// Classify a source spool after both source and destination discovery have
@@ -553,9 +558,13 @@ pub fn classify_stream(
     }
     let mut source = source_spool.finish()?;
     let mut destination = destination.finish()?;
-    classify_cursors(&mut source, &mut destination, false, compare_modes, |entry, action| {
-        callback(entry, action)
-    })
+    classify_cursors(
+        &mut source,
+        &mut destination,
+        false,
+        compare_modes,
+        |entry, action| callback(entry, action),
+    )
 }
 
 /// Share of a destination that may be deleted before the run is refused.

@@ -2170,9 +2170,7 @@ mod tests {
     #[test]
     fn the_rsync_fallback_still_accepts_an_exclude_only_filter() {
         let options = xsync_core::local::LocalSyncOptions {
-            filter: Some(
-                xsync_core::filter::from_exclude_patterns(&["*.tmp".to_owned()]).unwrap(),
-            ),
+            filter: Some(xsync_core::filter::from_exclude_patterns(&["*.tmp".to_owned()]).unwrap()),
             ..Default::default()
         };
         assert!(xsync_core::rsync::validate_options(&options).is_ok());

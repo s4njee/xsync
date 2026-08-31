@@ -39,9 +39,9 @@ use crate::planner::{try_plan_with_fingerprint, DestinationIndex, IndexConfig, P
 use crate::protocol::{
     common_capabilities, encode_frame, encode_frame_with_compression, negotiate_compression,
     negotiate_protocol_version, ByteRange, CompressionMode, EntryRecord, FrameDecoder, Message,
-    MetadataOperation, ProtocolError, Role, CAP_BROWSE_V2, CAP_FILTER_RULES,
-    CAP_UNIX_MODES, CAP_VERSION_NEGOTIATION, CAP_ZSTD,
-    DEFAULT_UNACKNOWLEDGED_WINDOW, MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
+    MetadataOperation, ProtocolError, Role, CAP_BROWSE_V2, CAP_FILTER_RULES, CAP_UNIX_MODES,
+    CAP_VERSION_NEGOTIATION, CAP_ZSTD, DEFAULT_UNACKNOWLEDGED_WINDOW, MAX_COLLECTION_COUNT,
+    MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
 };
 use crate::protocol_v2::{self, V2CodecError, V2Frame, V2Message};
 use crate::protocol_v2::{BrowseEntry, MutationStatus};
@@ -1292,31 +1292,30 @@ impl Server {
 
         // 2. Receive SessionConfig from client.
         let frame = self.decoder.read(&mut reader)?;
-        let (paranoid, delete, checksum, dry_run, exclude_patterns, filter_rules) = match
-            frame.message
-        {
-            Message::SessionConfig {
-                paranoid,
-                delete,
-                checksum,
-                dry_run,
-                exclude_patterns,
-                filter_rules,
-                ..
-            } => (
-                paranoid,
-                delete,
-                checksum,
-                dry_run,
-                exclude_patterns,
-                filter_rules,
-            ),
-            other => {
-                return Err(ServerError::UnexpectedMessage(format!(
-                    "expected SessionConfig, got {other:?}"
-                )))
-            }
-        };
+        let (paranoid, delete, checksum, dry_run, exclude_patterns, filter_rules) =
+            match frame.message {
+                Message::SessionConfig {
+                    paranoid,
+                    delete,
+                    checksum,
+                    dry_run,
+                    exclude_patterns,
+                    filter_rules,
+                    ..
+                } => (
+                    paranoid,
+                    delete,
+                    checksum,
+                    dry_run,
+                    exclude_patterns,
+                    filter_rules,
+                ),
+                other => {
+                    return Err(ServerError::UnexpectedMessage(format!(
+                        "expected SessionConfig, got {other:?}"
+                    )))
+                }
+            };
         server_log(format_args!(
             "received session config: frame_id={}, data_only={}, paranoid={}, delete={}, checksum={}, dry_run={}, excludes={}",
             frame.message_id,
@@ -3355,8 +3354,7 @@ fn plan_small_file_batches(small_files: &[FileEntry]) -> Vec<std::ops::Range<usi
     for (index, file) in small_files.iter().enumerate() {
         let count = index - start;
         if count > 0
-            && (count >= MAX_BATCH_FILES
-                || bytes.saturating_add(file.size) > BATCH_TARGET_SIZE)
+            && (count >= MAX_BATCH_FILES || bytes.saturating_add(file.size) > BATCH_TARGET_SIZE)
         {
             batches.push(start..index);
             start = index;
@@ -3400,8 +3398,7 @@ fn load_small_file_batch(
     prefix: &str,
     workers: usize,
 ) -> Vec<Result<Vec<u8>, String>> {
-    let mut loaded: Vec<Result<Vec<u8>, String>> =
-        files.iter().map(|_| Ok(Vec::new())).collect();
+    let mut loaded: Vec<Result<Vec<u8>, String>> = files.iter().map(|_| Ok(Vec::new())).collect();
     if workers <= 1 || files.len() <= 1 {
         for (slot, file) in loaded.iter_mut().zip(files) {
             *slot = read_small_file(source_reader, file, prefix);
@@ -3451,8 +3448,7 @@ fn send_small_files_batched<R: Read, W: Write, F: FnMut(LocalEvent)>(
     std::thread::scope(|scope| -> Result<(), ServerError> {
         // One batch in flight plus one being built: enough to keep the disk and
         // the wire both busy without holding the corpus in memory.
-        let (sender, receiver) =
-            std::sync::mpsc::sync_channel::<Vec<Result<Vec<u8>, String>>>(1);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<Result<Vec<u8>, String>>>(1);
         let batch_ranges = &batches;
         scope.spawn(move || {
             for range in batch_ranges.clone() {
@@ -3527,7 +3523,12 @@ fn send_small_files_batched<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 outstanding += 1;
                 if outstanding >= MAX_PIPELINED_FRAMES {
                     writer.flush()?;
-                    drain_acks(decoder, reader, &mut outstanding, MAX_PIPELINED_FRAMES * 3 / 4)?;
+                    drain_acks(
+                        decoder,
+                        reader,
+                        &mut outstanding,
+                        MAX_PIPELINED_FRAMES * 3 / 4,
+                    )?;
                 }
             }
             writer.flush()?;
@@ -5393,7 +5394,9 @@ fn filter_from_wire(
         patterns.push(text.to_owned());
     }
     crate::filter::from_exclude_patterns(&patterns).map_err(|error| {
-        ServerError::FilterUnrepresentable(format!("peer sent an unusable exclude pattern: {error}"))
+        ServerError::FilterUnrepresentable(format!(
+            "peer sent an unusable exclude pattern: {error}"
+        ))
     })
 }
 
@@ -6115,7 +6118,6 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
         cwriter.flush()?;
         drain_acks(&mut cdec, &mut creader, &mut pending, 0)?;
     }
-
 
     // ---- Partition files ----
     // Small/medium files: striped across the data sessions (4.25).
@@ -7519,11 +7521,7 @@ impl ApplyPool {
 }
 
 /// Write, verify and publish one received file.
-fn publish_received_file(
-    sink: &Sink,
-    job: &ApplyJob,
-    paranoid: bool,
-) -> Result<(), ServerError> {
+fn publish_received_file(sink: &Sink, job: &ApplyJob, paranoid: bool) -> Result<(), ServerError> {
     sink.write_file_with_retry(&job.entry, &job.hash, |_attempt| Ok(job.data.clone()))?;
     if paranoid {
         let committed = sink.path_for(&job.entry.path)?;
@@ -8646,7 +8644,7 @@ mod tests {
                     paranoid: false,
                     dry_run: false,
                     exclude_patterns: Vec::new(),
-            filter_rules: Vec::new(),
+                    filter_rules: Vec::new(),
                 },
             )
             .unwrap(),
@@ -8729,7 +8727,7 @@ mod tests {
                     paranoid: false,
                     dry_run: false,
                     exclude_patterns: Vec::new(),
-            filter_rules: Vec::new(),
+                    filter_rules: Vec::new(),
                 },
             )
             .unwrap(),

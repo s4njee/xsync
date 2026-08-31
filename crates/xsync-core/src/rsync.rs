@@ -319,7 +319,11 @@ pub fn validate_options(options: &LocalSyncOptions) -> Result<(), RsyncError> {
     // This path applies `exclude_patterns` only. Include rules mean nothing
     // without their position among the excludes, so honouring the excludes
     // alone would silently transfer a wider set of files than was asked for.
-    if options.filter.as_ref().is_some_and(crate::filter::FilterSet::has_includes) {
+    if options
+        .filter
+        .as_ref()
+        .is_some_and(crate::filter::FilterSet::has_includes)
+    {
         return Err(RsyncError::UnsupportedOption(
             "--include (the rsync fallback carries exclude patterns only)",
         ));
