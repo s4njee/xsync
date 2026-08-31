@@ -2016,6 +2016,60 @@ a false drift conclusion on top of it. Only interleaved same-session A/Bs with
 per-run verification have survived contact with reality this cycle. 4.21 must
 make both the default.
 
+### 4.58 — The rsync-fallback tests are flaky
+
+- [ ] `test_auto_falls_back_to_rsync_for_remote_source_when_xsync_is_missing`
+  fails roughly **40% of the time** under the full parallel suite and passes
+  every time when run alone. Measured at `3e810898` with no local changes: two
+  of five runs failed, one of them with two failures.
+
+The observed error is `remote rsync exited unsuccessfully (status 10): rsync:
+[sender] write error: Broken pipe (32)` — a teardown race, not a wrong result.
+
+**This probably also explains the musl CI failure.**
+`test_auto_does_not_fallback_on_host_key_or_native_protocol_failure` was
+reported as musl-specific, counting two backend invocations where the test
+demands one. It is in the same family — same fake-rsh harness, same
+marker-file invocation counting — and a flaky sibling is a much cheaper
+explanation than a real musl divergence in fallback safety. Confirm which
+before treating it as a platform bug.
+
+**Why it matters beyond the noise.** These tests assert that `auto` does *not*
+silently switch transports when the native protocol misbehaves. A test that
+fails 40% of the time for unrelated reasons cannot enforce that property,
+because a real regression is indistinguishable from the usual noise.
+
+**AC**
+- The failure is diagnosed, not retried away. `#[serial]` is acceptable only
+  once the actual race is understood and named.
+- 50 consecutive full-suite runs with no failure.
+- The musl question is resolved either way and recorded.
+
+### 4.59 — A sender window smaller than the receiver's apply pool deadlocks
+
+- [x] Fixed in the same change that exposed it, but recorded because the
+  invariant is cross-process and cannot be checked at run time.
+
+The receiver acknowledges a file only on durable rename, so it can hold up to
+`capacity` jobs un-acked, where `capacity = apply_workers * 8`. If the sender's
+pipelining window is no larger, the sender blocks waiting for acks the receiver
+is waiting for more work to produce. Both stop. Measured with capacity 64: a
+window of 32 lands 31 files and hangs indefinitely; 64 completes.
+
+**This was reachable before any of the new tuning knobs existed.**
+`XSYNC_APPLY_WORKERS` had no upper bound, so `=1000` built a pool of 8,000
+un-acked jobs and deadlocked against the stock 2048-frame window.
+
+Now held structurally in `tuning.rs`: a floor of 512 on the window, a ceiling
+of 32 on workers, and a compile-time assertion the two cannot overlap.
+
+**Still open, and worth deciding before the daemon phase.** The guard is a
+static bound, not a check. Two ends can still be built from different commits
+with different constants, which is exactly the mixed-version case R1.4 in
+`backlog-release.md` says a rollout guarantees. If the window and the pool
+capacity were exchanged during negotiation, this would be a checkable
+invariant rather than a maintained coincidence.
+
 ### 4.50 — A 2.5 GbE point-to-point link, and what it is for
 
 - [ ] Every cross-host number in this project was taken over a 1 GbE link
