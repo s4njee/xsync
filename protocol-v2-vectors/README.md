@@ -15,3 +15,7 @@ The decoded meaning is a compact, human-readable description of the fields in
 wire order. Payload bytes are little-endian as specified by `protocol.md`.
 Lines beginning with `#` are comments. Vector revisions are protocol changes;
 the consuming f2 copy must record the source revision when it is imported.
+
+Types 36–41 (`CAP_BROWSE_META`) were added for Kestrel XS-B2. f2's copied
+fixture has not been updated; that is a named release blocker, not a wire
+incompatibility. An f2 build without those types does not advertise the bit.

@@ -31,7 +31,7 @@ fn corpus_valid_vectors_decode() {
         );
         count += 1;
     }
-    assert_eq!(count, 9);
+    assert_eq!(count, 16);
 }
 
 #[test]

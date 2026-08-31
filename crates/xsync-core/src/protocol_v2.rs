@@ -289,6 +289,31 @@ pub enum V2Message {
         file: u64,
         error: Vec<u8>,
     },
+    /// Set Unix permission bits on one path (follows a final symlink).
+    SetPermissionsRequest { path: Vec<u8>, mode: u32 },
+    /// Return the result of setting permission bits.
+    SetPermissionsResponse {
+        related_id: u64,
+        status: MutationStatus,
+        error: Vec<u8>,
+    },
+    /// Set modification time on one path (follows a final symlink).
+    SetMtimeRequest { path: Vec<u8>, mtime_ns: i64 },
+    /// Return the result of setting modification time.
+    SetMtimeResponse {
+        related_id: u64,
+        status: MutationStatus,
+        error: Vec<u8>,
+    },
+    /// Read one symlink's target without following it.
+    ReadLinkRequest { path: Vec<u8> },
+    /// Return a symlink target, or missing/error.
+    ReadLinkResponse {
+        related_id: u64,
+        status: StatStatus,
+        target: Vec<u8>,
+        error: Vec<u8>,
+    },
 }
 
 /// A complete, uncompressed v2 browse frame.
@@ -492,6 +517,12 @@ fn message_type(message: &V2Message) -> u8 {
         V2Message::PublishReady { .. } => 33,
         V2Message::PublishChunk { .. } => 34,
         V2Message::PublishResponse { .. } => 35,
+        V2Message::SetPermissionsRequest { .. } => 36,
+        V2Message::SetPermissionsResponse { .. } => 37,
+        V2Message::SetMtimeRequest { .. } => 38,
+        V2Message::SetMtimeResponse { .. } => 39,
+        V2Message::ReadLinkRequest { .. } => 40,
+        V2Message::ReadLinkResponse { .. } => 41,
     }
 }
 
@@ -589,6 +620,16 @@ pub fn encode(message: &V2Message) -> Result<Vec<u8>, V2CodecError> {
             error,
         }
         | V2Message::CreateDirectoryResponse {
+            related_id,
+            status,
+            error,
+        }
+        | V2Message::SetPermissionsResponse {
+            related_id,
+            status,
+            error,
+        }
+        | V2Message::SetMtimeResponse {
             related_id,
             status,
             error,
@@ -732,6 +773,30 @@ pub fn encode(message: &V2Message) -> Result<Vec<u8>, V2CodecError> {
             }
             writer.utf8_blob(error, MAX_ERROR, "publish error")?;
         }
+        V2Message::SetPermissionsRequest { path, mode } => {
+            writer.blob(path, MAX_PATH, "path")?;
+            writer.u32(*mode);
+        }
+        V2Message::SetMtimeRequest { path, mtime_ns } => {
+            writer.blob(path, MAX_PATH, "path")?;
+            writer.i64(*mtime_ns);
+        }
+        V2Message::ReadLinkRequest { path } => writer.blob(path, MAX_PATH, "path")?,
+        V2Message::ReadLinkResponse {
+            related_id,
+            status,
+            target,
+            error,
+        } => {
+            validate_read_link_fields(*status, target, error)?;
+            writer.u64(*related_id);
+            writer.u8(*status as u8);
+            if *status == StatStatus::Ok {
+                writer.blob(target, MAX_PATH, "symlink target")?;
+            } else if *status == StatStatus::Error {
+                writer.utf8_blob(error, MAX_ERROR, "error message")?;
+            }
+        }
     }
     if writer.bytes.len() > MAX_PAYLOAD {
         return Err(V2CodecError::Bound {
@@ -831,7 +896,7 @@ pub fn decode(message_type: u8, payload: &[u8]) -> Result<V2Message, V2CodecErro
             source: reader.blob(MAX_PATH, "source path")?,
             destination: reader.blob(MAX_PATH, "destination path")?,
         },
-        23 | 25 => {
+        23 | 25 | 37 | 39 => {
             let related_id = reader.u64()?;
             let status = MutationStatus::decode(reader.u8()?)?;
             let error = if status == MutationStatus::Ok {
@@ -844,18 +909,27 @@ pub fn decode(message_type: u8, payload: &[u8]) -> Result<V2Message, V2CodecErro
             {
                 return Err(V2CodecError::InvalidMutationFields);
             }
-            if message_type == 23 {
-                V2Message::RenameResponse {
+            match message_type {
+                23 => V2Message::RenameResponse {
                     related_id,
                     status,
                     error,
-                }
-            } else {
-                V2Message::CreateDirectoryResponse {
+                },
+                25 => V2Message::CreateDirectoryResponse {
                     related_id,
                     status,
                     error,
-                }
+                },
+                37 => V2Message::SetPermissionsResponse {
+                    related_id,
+                    status,
+                    error,
+                },
+                _ => V2Message::SetMtimeResponse {
+                    related_id,
+                    status,
+                    error,
+                },
             }
         }
         24 => V2Message::CreateDirectoryRequest {
@@ -958,6 +1032,33 @@ pub fn decode(message_type: u8, payload: &[u8]) -> Result<V2Message, V2CodecErro
                 error,
             }
         }
+        36 => V2Message::SetPermissionsRequest {
+            path: reader.blob(MAX_PATH, "path")?,
+            mode: reader.u32()?,
+        },
+        38 => V2Message::SetMtimeRequest {
+            path: reader.blob(MAX_PATH, "path")?,
+            mtime_ns: reader.i64()?,
+        },
+        40 => V2Message::ReadLinkRequest {
+            path: reader.blob(MAX_PATH, "path")?,
+        },
+        41 => {
+            let related_id = reader.u64()?;
+            let status = StatStatus::decode(reader.u8()?)?;
+            let (target, error) = match status {
+                StatStatus::Ok => (reader.blob(MAX_PATH, "symlink target")?, Vec::new()),
+                StatStatus::Missing => (Vec::new(), Vec::new()),
+                StatStatus::Error => (Vec::new(), reader.utf8_blob(MAX_ERROR, "error message")?),
+            };
+            validate_read_link_fields(status, &target, &error)?;
+            V2Message::ReadLinkResponse {
+                related_id,
+                status,
+                target,
+                error,
+            }
+        }
         value => {
             return Err(V2CodecError::InvalidEnum {
                 field: "message type",
@@ -979,6 +1080,19 @@ fn validate_page_size(page_size: u32) -> Result<(), V2CodecError> {
         });
     }
     Ok(())
+}
+
+fn validate_read_link_fields(
+    status: StatStatus,
+    target: &[u8],
+    error: &[u8],
+) -> Result<(), V2CodecError> {
+    match status {
+        StatStatus::Ok if error.is_empty() => Ok(()),
+        StatStatus::Missing if target.is_empty() && error.is_empty() => Ok(()),
+        StatStatus::Error if target.is_empty() && !error.is_empty() => Ok(()),
+        _ => Err(V2CodecError::InvalidStatFields),
+    }
 }
 
 fn validate_stat_fields(
@@ -1444,5 +1558,73 @@ mod tests {
                 message
             );
         }
+    }
+
+    #[test]
+    fn browse_meta_messages_round_trip() {
+        let messages = [
+            V2Message::SetPermissionsRequest {
+                path: b"a".to_vec(),
+                mode: 0o644,
+            },
+            V2Message::SetPermissionsResponse {
+                related_id: 4,
+                status: MutationStatus::Ok,
+                error: Vec::new(),
+            },
+            V2Message::SetMtimeRequest {
+                path: b"a".to_vec(),
+                mtime_ns: 1_000_000_000,
+            },
+            V2Message::SetMtimeResponse {
+                related_id: 5,
+                status: MutationStatus::PermissionDenied,
+                error: b"permission denied".to_vec(),
+            },
+            V2Message::ReadLinkRequest {
+                path: b"a".to_vec(),
+            },
+            V2Message::ReadLinkResponse {
+                related_id: 6,
+                status: StatStatus::Ok,
+                target: b"b".to_vec(),
+                error: Vec::new(),
+            },
+            V2Message::ReadLinkResponse {
+                related_id: 7,
+                status: StatStatus::Missing,
+                target: Vec::new(),
+                error: Vec::new(),
+            },
+            V2Message::ReadLinkResponse {
+                related_id: 8,
+                status: StatStatus::Error,
+                target: Vec::new(),
+                error: b"not a symlink".to_vec(),
+            },
+        ];
+        for message in messages {
+            assert_eq!(
+                decode(message_type(&message), &encode(&message).unwrap()).unwrap(),
+                message
+            );
+        }
+        assert!(matches!(
+            encode(&V2Message::SetPermissionsResponse {
+                related_id: 1,
+                status: MutationStatus::Error,
+                error: Vec::new(),
+            }),
+            Err(V2CodecError::InvalidMutationFields)
+        ));
+        assert!(matches!(
+            encode(&V2Message::ReadLinkResponse {
+                related_id: 1,
+                status: StatStatus::Error,
+                target: Vec::new(),
+                error: Vec::new(),
+            }),
+            Err(V2CodecError::InvalidStatFields)
+        ));
     }
 }

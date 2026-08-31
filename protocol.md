@@ -159,6 +159,12 @@ never enters the v1 sync state machine.
 | 33 | PublishReady | related request ID `u64` |
 | 34 | PublishChunk | related request ID `u64`, offset `u64`, data |
 | 35 | PublishResponse | related request ID `u64`, publish status `u8`, current identity, error message |
+| 36 | SetPermissionsRequest | path, mode `u32` |
+| 37 | SetPermissionsResponse | related request ID `u64`, mutation status `u8`, error message |
+| 38 | SetMtimeRequest | path, mtime ns `i64` |
+| 39 | SetMtimeResponse | related request ID `u64`, mutation status `u8`, error message |
+| 40 | ReadLinkRequest | path |
+| 41 | ReadLinkResponse | related request ID `u64`, stat status `u8`, symlink target, error message |
 
 The envelope message ID remains unique for every frame. Response messages also
 carry `related request ID` because a long-lived session may have more than one
@@ -226,6 +232,24 @@ final response or a `BrowseError` with the cancellation code.
   deterministic temporary path, and atomically renamed into place.
 - Keepalive frames carry no filesystem state and are valid only while the
   session is established. An unknown nonce is a protocol error.
+- Types 36–41 (`SetPermissions`, `SetMtime`, `ReadLink`) are gated on
+  `CAP_BROWSE_META` (`1 << 6`). A peer that does not advertise the bit must
+  never be sent these types: v2 is fail-closed on an unknown type byte, so an
+  older `xs` would abort the session. The bit is ignored by an older handshake
+  decoder, which is why the older peer degrades rather than errors. A server
+  that does not advertise the bit and still receives one of these types treats
+  it as an unexpected session message.
+- `SetPermissionsRequest` carries a Unix mode `u32`; the server applies
+  `mode & 0o7777`. `SetMtimeRequest` carries signed nanoseconds. Both follow a
+  final symlink, matching SFTP `SETSTAT`. Intermediate symlink components are
+  rejected as a traversal escape, as with `StatRequest`.
+- `ReadLinkRequest` does not follow the final symlink. Status values reuse the
+  frozen `StatResponse` codes (`0 ok`, `1 missing`, `2 error`). `ok` carries
+  the raw target blob (empty is a valid target); `missing` carries nothing;
+  `error` carries a bounded UTF-8 message and is used both for a non-symlink
+  and for a filesystem failure. A non-zero mutation status on types 37 and 39
+  carries a bounded UTF-8 error message; status `ok` carries no message, as
+  with rename and mkdir.
 - The existing 16 MiB encoded and decoded payload caps, checked length
   arithmetic, reserved-field rules, and compression rules apply unchanged.
 
@@ -242,9 +266,14 @@ final response or a `BrowseError` with the cancellation code.
 - Browse errors are per-request and do not terminate the session unless the
   error is a framing, bounds, duplicate-ID, or other protocol error.
 
-This table is the v2 freeze for Stories 9.1, 9.2, 11.1, 12.1, and 12.2. Additional
+This table is the v2 freeze for Stories 9.1, 9.2, 11.1, 12.1, and 12.2,
+amended with types 36–41 (`CAP_BROWSE_META`) for Kestrel XS-B2. Additional
 session controls receive new type assignments in a later protocol revision or
-an explicitly amended v2 table; they must not reuse these numbers.
+an explicitly amended v2 table; they must not reuse these numbers. The f2
+copied-vector fixture has not been updated for types 36–41; that consumer
+change is an explicit blocker for an xsync *release* that advertises
+`CAP_BROWSE_META`, not for Kestrel consuming a path-dep. An f2 build without
+the types never advertises the bit and never sends them.
 
 Malformed compression, a compressed output larger than the declared bounded
 length, or a declared decompressed length over 16 MiB is rejected before any

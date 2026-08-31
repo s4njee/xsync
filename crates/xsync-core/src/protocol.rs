@@ -69,9 +69,18 @@ pub const CAP_FILTER_RULES: u32 = 1 << 4;
 /// advertise this.
 pub const CAP_UNIX_MODES: u32 = 1 << 5;
 
+/// Peer understands browse v2 metadata verbs (types 36–41).
+///
+/// `SetPermissionsRequest`, `SetMtimeRequest`, and `ReadLinkRequest` are
+/// fail-closed on a decoder that does not know them, so they are sent only
+/// when this bit is advertised. An older `xs` without the bit never receives
+/// those types; the client degrades to another backend instead of erroring
+/// the session.
+pub const CAP_BROWSE_META: u32 = 1 << 6;
+
 /// Capability bits with a defined meaning in the current contract.
 pub const KNOWN_CAPABILITIES: u32 =
-    CAP_DATA_ONLY | CAP_ZSTD | CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+    CAP_DATA_ONLY | CAP_ZSTD | CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION | CAP_BROWSE_META;
 
 /// Select the session grammar before the first non-handshake frame.
 #[must_use]
@@ -2106,6 +2115,11 @@ mod tests {
             common_capabilities(v2 | CAP_ZSTD, v2 | CAP_ZSTD),
             v2 | CAP_ZSTD
         );
+        assert_eq!(
+            common_capabilities(v2 | CAP_BROWSE_META, v2 | CAP_BROWSE_META),
+            v2 | CAP_BROWSE_META
+        );
+        assert_eq!(common_capabilities(v2 | CAP_BROWSE_META, v2), v2);
         assert_eq!(common_capabilities(v2, u32::MAX) & !KNOWN_CAPABILITIES, 0);
     }
 

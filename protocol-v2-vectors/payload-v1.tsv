@@ -8,6 +8,13 @@ keepalive	control	19	2a00000000000000	nonce=42
 keepalive-ack	control	20	2a00000000000000	nonce=42
 browse-error	response	21	0700000000000000020003000000626164	related_id=7, code=2, message="bad"
 publish-request-edited-size	request	32	01000000fe6300000000000000fcffffffffffffff070000000000000008000000000000007b00000000000000abababababababababababababababababababababababababababababababab	path=[fe], fetched_identity=(size=99,mtime=-4,device=7,file=8), replacement_size=123, replacement_digest=[ab;32]
+set-permissions-request	request	36	0100000061a4010000	path=[61], mode=420
+set-permissions-response-ok	response	37	040000000000000000	related_id=4, status=ok
+set-mtime-request	request	38	010000006100ca9a3b00000000	path=[61], mtime_ns=1000000000
+set-mtime-response-ok	response	39	050000000000000000	related_id=5, status=ok
+read-link-request	request	40	0100000061	path=[61]
+read-link-response-ok	response	41	0600000000000000000100000062	related_id=6, status=ok, target=[62]
+read-link-response-missing	response	41	070000000000000001	related_id=7, status=missing
 
 # Deliberately malformed payloads. The final field names the fail-closed rule.
 unknown-type	malformed	255		invalid message type

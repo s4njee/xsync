@@ -41,6 +41,7 @@ ignored as specified by `protocol.md`.
 | 1 | `CAP_ZSTD` | Existing zstd payload support |
 | 2 | `CAP_BROWSE_V2` | Endpoint can use the v2 browse message set |
 | 3 | `CAP_VERSION_NEGOTIATION` | Endpoint understands this handshake contract |
+| 6 | `CAP_BROWSE_META` | Endpoint understands browse types 36–41 (chmod, mtime, readlink) |
 
 The v1 implementation advertises `CAP_VERSION_NEGOTIATION` after this change,
 but does not advertise `CAP_BROWSE_V2`. A v2 implementation advertises both

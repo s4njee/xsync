@@ -39,12 +39,12 @@ use crate::planner::{try_plan_with_fingerprint, DestinationIndex, IndexConfig, P
 use crate::protocol::{
     common_capabilities, encode_frame, encode_frame_with_compression, negotiate_compression,
     negotiate_protocol_version, ByteRange, CompressionMode, EntryRecord, FrameDecoder, Message,
-    MetadataOperation, ProtocolError, Role, CAP_BROWSE_V2, CAP_FILTER_RULES, CAP_UNIX_MODES,
-    CAP_VERSION_NEGOTIATION, CAP_ZSTD, DEFAULT_UNACKNOWLEDGED_WINDOW, MAX_COLLECTION_COUNT,
-    MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
+    MetadataOperation, ProtocolError, Role, CAP_BROWSE_META, CAP_BROWSE_V2, CAP_FILTER_RULES,
+    CAP_UNIX_MODES, CAP_VERSION_NEGOTIATION, CAP_ZSTD, DEFAULT_UNACKNOWLEDGED_WINDOW,
+    MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
 };
 use crate::protocol_v2::{self, V2CodecError, V2Frame, V2Message};
-use crate::protocol_v2::{BrowseEntry, MutationStatus};
+use crate::protocol_v2::{BrowseEntry, MutationStatus, StatStatus};
 use crate::scanner::{
     fingerprint_from_metadata, permission_mode, scan, scan_with_filter, EntryKind as ScanEntryKind,
     FileEntry, FileIdentity, ScanError, SourceFingerprint,
@@ -297,7 +297,7 @@ pub fn probe_session<R: Read, W: Write>(
     mut writer: W,
     job_id: [u8; 16],
 ) -> Result<ProbedConnection<R, W>, ServerError> {
-    let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+    let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION | CAP_BROWSE_META;
     let handshake = Message::Handshake {
         role: Role::Session,
         capabilities,
@@ -600,6 +600,117 @@ impl<R: Read, W: Write> BrowseSession<R, W> {
             }
             other => Err(ServerError::UnexpectedMessage(format!(
                 "expected CreateDirectoryResponse, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Whether the peer advertised [`CAP_BROWSE_META`] (chmod/mtime/readlink).
+    #[must_use]
+    pub const fn supports_browse_meta(&self) -> bool {
+        self.remote_capabilities & CAP_BROWSE_META != 0
+    }
+
+    /// Set Unix permission bits on a remote path (follows a final symlink).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::UnexpectedMessage`] without sending when the peer
+    /// does not advertise [`CAP_BROWSE_META`], so an older decoder is never
+    /// sent type 36. Remote refusals are [`ServerError::RemoteError`].
+    pub fn set_permissions(&mut self, path: Vec<u8>, mode: u32) -> Result<(), ServerError> {
+        if !self.supports_browse_meta() {
+            return Err(ServerError::UnexpectedMessage(
+                "peer does not advertise CAP_BROWSE_META".to_owned(),
+            ));
+        }
+        let response = self.request(&V2Message::SetPermissionsRequest { path, mode })?;
+        match response.message {
+            V2Message::SetPermissionsResponse {
+                status: MutationStatus::Ok,
+                ..
+            } => Ok(()),
+            V2Message::SetPermissionsResponse { status, error, .. } => {
+                Err(ServerError::RemoteError {
+                    code: status as u16,
+                    message: String::from_utf8_lossy(&error).into_owned(),
+                })
+            }
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected SetPermissionsResponse, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Set modification time on a remote path (follows a final symlink).
+    ///
+    /// `mtime_ns` is signed nanoseconds since the Unix epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::UnexpectedMessage`] without sending when the peer
+    /// does not advertise [`CAP_BROWSE_META`]. Remote refusals are
+    /// [`ServerError::RemoteError`].
+    pub fn set_mtime(&mut self, path: Vec<u8>, mtime_ns: i64) -> Result<(), ServerError> {
+        if !self.supports_browse_meta() {
+            return Err(ServerError::UnexpectedMessage(
+                "peer does not advertise CAP_BROWSE_META".to_owned(),
+            ));
+        }
+        let response = self.request(&V2Message::SetMtimeRequest { path, mtime_ns })?;
+        match response.message {
+            V2Message::SetMtimeResponse {
+                status: MutationStatus::Ok,
+                ..
+            } => Ok(()),
+            V2Message::SetMtimeResponse { status, error, .. } => Err(ServerError::RemoteError {
+                code: status as u16,
+                message: String::from_utf8_lossy(&error).into_owned(),
+            }),
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected SetMtimeResponse, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Read a remote symlink's target without following it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::UnexpectedMessage`] without sending when the peer
+    /// does not advertise [`CAP_BROWSE_META`]. A missing path is
+    /// [`ServerError::InvalidPath`]; a non-symlink or filesystem error is
+    /// [`ServerError::RemoteError`].
+    pub fn read_link(&mut self, path: Vec<u8>) -> Result<Vec<u8>, ServerError> {
+        if !self.supports_browse_meta() {
+            return Err(ServerError::UnexpectedMessage(
+                "peer does not advertise CAP_BROWSE_META".to_owned(),
+            ));
+        }
+        let missing = String::from_utf8_lossy(&path).into_owned();
+        let response = self.request(&V2Message::ReadLinkRequest { path })?;
+        match response.message {
+            V2Message::ReadLinkResponse {
+                status: StatStatus::Ok,
+                target,
+                ..
+            } => Ok(target),
+            V2Message::ReadLinkResponse {
+                status: StatStatus::Missing,
+                ..
+            } => Err(ServerError::RemoteError {
+                code: StatStatus::Missing as u16,
+                message: format!("not found: {missing}"),
+            }),
+            V2Message::ReadLinkResponse {
+                status: StatStatus::Error,
+                error,
+                ..
+            } => Err(ServerError::RemoteError {
+                code: StatStatus::Error as u16,
+                message: String::from_utf8_lossy(&error).into_owned(),
+            }),
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected ReadLinkResponse, got {other:?}"
             ))),
         }
     }
@@ -1094,28 +1205,66 @@ fn mkdir_status(error: &io::Error) -> MutationStatus {
     }
 }
 
+#[derive(Clone, Copy)]
+enum MutationKind {
+    Rename,
+    CreateDirectory,
+    SetPermissions,
+    SetMtime,
+}
+
 fn mutation_response(
     related_id: u64,
     result: Result<(), (MutationStatus, String)>,
-    rename: bool,
+    kind: MutationKind,
 ) -> V2Message {
     let (status, error) = match result {
         Ok(()) => (MutationStatus::Ok, Vec::new()),
         Err((status, error)) => (status, error.into_bytes()),
     };
-    if rename {
-        V2Message::RenameResponse {
+    match kind {
+        MutationKind::Rename => V2Message::RenameResponse {
             related_id,
             status,
             error,
-        }
-    } else {
-        V2Message::CreateDirectoryResponse {
+        },
+        MutationKind::CreateDirectory => V2Message::CreateDirectoryResponse {
             related_id,
             status,
             error,
-        }
+        },
+        MutationKind::SetPermissions => V2Message::SetPermissionsResponse {
+            related_id,
+            status,
+            error,
+        },
+        MutationKind::SetMtime => V2Message::SetMtimeResponse {
+            related_id,
+            status,
+            error,
+        },
     }
+}
+
+fn meta_status(error: &io::Error) -> MutationStatus {
+    match error.kind() {
+        io::ErrorKind::PermissionDenied => MutationStatus::PermissionDenied,
+        io::ErrorKind::NotFound => MutationStatus::ParentMissing,
+        _ => MutationStatus::Error,
+    }
+}
+
+#[cfg(unix)]
+fn set_path_permissions(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_path_permissions(path: &Path, mode: u32) -> io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(mode & 0o222 == 0);
+    fs::set_permissions(path, permissions)
 }
 
 fn publish_changed_response(related_id: u64, current: Option<(u64, i64, u64, u64)>) -> V2Message {
@@ -1177,6 +1326,7 @@ impl Server {
             capabilities: CAP_ZSTD
                 | CAP_VERSION_NEGOTIATION
                 | CAP_FILTER_RULES
+                | CAP_BROWSE_META
                 | if cfg!(unix) { CAP_UNIX_MODES } else { 0 },
         }
     }
@@ -1465,6 +1615,33 @@ impl Server {
                 V2Message::CreateDirectoryRequest { path } => {
                     Some(self.browse_create_directory_response(&path, frame.message_id))
                 }
+                V2Message::SetPermissionsRequest { path, mode } => {
+                    if self.capabilities & CAP_BROWSE_META == 0 {
+                        return Err(ServerError::UnexpectedMessage(
+                            "v2 session received a browse-meta message without CAP_BROWSE_META"
+                                .to_owned(),
+                        ));
+                    }
+                    Some(self.browse_set_permissions_response(&path, mode, frame.message_id))
+                }
+                V2Message::SetMtimeRequest { path, mtime_ns } => {
+                    if self.capabilities & CAP_BROWSE_META == 0 {
+                        return Err(ServerError::UnexpectedMessage(
+                            "v2 session received a browse-meta message without CAP_BROWSE_META"
+                                .to_owned(),
+                        ));
+                    }
+                    Some(self.browse_set_mtime_response(&path, mtime_ns, frame.message_id))
+                }
+                V2Message::ReadLinkRequest { path } => {
+                    if self.capabilities & CAP_BROWSE_META == 0 {
+                        return Err(ServerError::UnexpectedMessage(
+                            "v2 session received a browse-meta message without CAP_BROWSE_META"
+                                .to_owned(),
+                        ));
+                    }
+                    Some(self.browse_read_link_response(&path, frame.message_id))
+                }
                 V2Message::DeleteRequest { path } => {
                     active_requests.insert(frame.message_id);
                     Some(self.browse_delete(
@@ -1522,6 +1699,9 @@ impl Server {
                 | V2Message::StatResponse { .. }
                 | V2Message::RenameResponse { .. }
                 | V2Message::CreateDirectoryResponse { .. }
+                | V2Message::SetPermissionsResponse { .. }
+                | V2Message::SetMtimeResponse { .. }
+                | V2Message::ReadLinkResponse { .. }
                 | V2Message::DeleteProgress { .. }
                 | V2Message::DeleteResponse { .. }
                 | V2Message::FetchStart { .. }
@@ -2130,7 +2310,7 @@ impl Server {
             fs::rename(source, destination)
                 .map_err(|error| (rename_status(&error), error.to_string()))
         })();
-        mutation_response(related_id, result, true)
+        mutation_response(related_id, result, MutationKind::Rename)
     }
 
     fn browse_create_directory_response(&self, path: &[u8], related_id: u64) -> V2Message {
@@ -2141,7 +2321,68 @@ impl Server {
                 .map_err(|error| mutation_failure(&error))?;
             fs::create_dir(path).map_err(|error| (mkdir_status(&error), error.to_string()))
         })();
-        mutation_response(related_id, result, false)
+        mutation_response(related_id, result, MutationKind::CreateDirectory)
+    }
+
+    fn browse_set_permissions_response(
+        &self,
+        path: &[u8],
+        mode: u32,
+        related_id: u64,
+    ) -> V2Message {
+        let result = (|| -> Result<(), (MutationStatus, String)> {
+            let path =
+                browse_stat_path(&self.root, path).map_err(|error| mutation_failure(&error))?;
+            set_path_permissions(&path, mode & 0o7777)
+                .map_err(|error| (meta_status(&error), error.to_string()))
+        })();
+        mutation_response(related_id, result, MutationKind::SetPermissions)
+    }
+
+    fn browse_set_mtime_response(&self, path: &[u8], mtime_ns: i64, related_id: u64) -> V2Message {
+        let result = (|| -> Result<(), (MutationStatus, String)> {
+            let path =
+                browse_stat_path(&self.root, path).map_err(|error| mutation_failure(&error))?;
+            let seconds = mtime_ns.div_euclid(1_000_000_000);
+            let nanos = u32::try_from(mtime_ns.rem_euclid(1_000_000_000)).unwrap_or(0);
+            set_file_mtime(&path, FileTime::from_unix_time(seconds, nanos))
+                .map_err(|error| (meta_status(&error), error.to_string()))
+        })();
+        mutation_response(related_id, result, MutationKind::SetMtime)
+    }
+
+    fn browse_read_link_response(&self, path: &[u8], related_id: u64) -> V2Message {
+        let native = match browse_stat_path(&self.root, path) {
+            Ok(path) => path,
+            Err(error) => {
+                return V2Message::ReadLinkResponse {
+                    related_id,
+                    status: StatStatus::Error,
+                    target: Vec::new(),
+                    error: error.to_string().into_bytes(),
+                };
+            }
+        };
+        match fs::read_link(&native) {
+            Ok(target) => V2Message::ReadLinkResponse {
+                related_id,
+                status: StatStatus::Ok,
+                target: native_path_bytes(target.as_os_str()),
+                error: Vec::new(),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => V2Message::ReadLinkResponse {
+                related_id,
+                status: StatStatus::Missing,
+                target: Vec::new(),
+                error: Vec::new(),
+            },
+            Err(error) => V2Message::ReadLinkResponse {
+                related_id,
+                status: StatStatus::Error,
+                target: Vec::new(),
+                error: error.to_string().into_bytes(),
+            },
+        }
     }
 
     /// A data-only receiver session (multi-stream Story 4.2): skips the
@@ -8156,6 +8397,230 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn browse_meta_verbs_chmod_mtime_and_read_link() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("file"), b"data").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("file", temp.path().join("link")).unwrap();
+        let server = Server::new(temp.path());
+
+        assert_eq!(
+            server.browse_set_permissions_response(b"file", 0o600, 1),
+            V2Message::SetPermissionsResponse {
+                related_id: 1,
+                status: MutationStatus::Ok,
+                error: Vec::new(),
+            }
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(temp.path().join("file"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let mtime_ns = 1_700_000_000i64 * 1_000_000_000;
+        assert_eq!(
+            server.browse_set_mtime_response(b"file", mtime_ns, 2),
+            V2Message::SetMtimeResponse {
+                related_id: 2,
+                status: MutationStatus::Ok,
+                error: Vec::new(),
+            }
+        );
+        let modified = fs::metadata(temp.path().join("file"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(modified, 1_700_000_000);
+
+        assert!(matches!(
+            server.browse_set_permissions_response(b"missing", 0o644, 3),
+            V2Message::SetPermissionsResponse {
+                related_id: 3,
+                status: MutationStatus::ParentMissing,
+                error,
+            } if !error.is_empty()
+        ));
+        assert!(matches!(
+            server.browse_set_permissions_response(b"../escape", 0o644, 4),
+            V2Message::SetPermissionsResponse {
+                status: MutationStatus::Error,
+                ..
+            }
+        ));
+
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                server.browse_read_link_response(b"link", 5),
+                V2Message::ReadLinkResponse {
+                    related_id: 5,
+                    status: StatStatus::Ok,
+                    target: b"file".to_vec(),
+                    error: Vec::new(),
+                }
+            );
+            assert!(matches!(
+                server.browse_read_link_response(b"file", 6),
+                V2Message::ReadLinkResponse {
+                    related_id: 6,
+                    status: StatStatus::Error,
+                    target,
+                    error,
+                } if target.is_empty() && !error.is_empty()
+            ));
+            assert_eq!(
+                server.browse_read_link_response(b"missing-link", 7),
+                V2Message::ReadLinkResponse {
+                    related_id: 7,
+                    status: StatStatus::Missing,
+                    target: Vec::new(),
+                    error: Vec::new(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn browse_meta_messages_are_rejected_without_the_capability_bit() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("file"), b"data").unwrap();
+        let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+        let handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [21; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let mut input = encode_frame(1, &handshake).unwrap();
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(
+                2,
+                &V2Message::SetPermissionsRequest {
+                    path: b"file".to_vec(),
+                    mode: 0o600,
+                },
+            )
+            .unwrap(),
+        );
+        let mut output = Vec::new();
+        let error = Server::new_with_capabilities(temp.path(), capabilities)
+            .run(Cursor::new(input), &mut output)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("CAP_BROWSE_META"),
+            "expected capability refusal, got {error}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(temp.path().join("file"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_ne!(mode, 0o600, "chmod must not apply without the capability");
+        }
+    }
+
+    #[test]
+    fn browse_session_does_not_send_meta_verbs_to_an_older_peer() {
+        let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+        let server_handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [22; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let mut peer_bytes = encode_frame(1000, &server_handshake).unwrap();
+        peer_bytes.extend_from_slice(
+            &encode_frame(
+                1001,
+                &Message::Ack {
+                    acknowledged_id: 1,
+                    acknowledged_type: 1,
+                },
+            )
+            .unwrap(),
+        );
+        let mut session =
+            BrowseSession::connect(Cursor::new(peer_bytes), Vec::new(), [7; 16]).unwrap();
+        assert!(!session.supports_browse_meta());
+        let error = session
+            .set_permissions(b"file".to_vec(), 0o600)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("CAP_BROWSE_META"),
+            "expected local refusal, got {error}"
+        );
+        let (_reader, writer) = session.into_parts();
+        let mut sent = Cursor::new(writer);
+        let mut decoder = FrameDecoder::new();
+        assert!(matches!(
+            decoder.read(&mut sent).unwrap().message,
+            Message::Handshake {
+                role: Role::Session,
+                ..
+            }
+        ));
+        assert_eq!(
+            sent.position() as usize,
+            sent.get_ref().len(),
+            "no v2 frame may be sent to an older peer"
+        );
+    }
+
+    #[test]
+    fn session_handshake_advertises_browse_meta_by_default() {
+        let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION | CAP_BROWSE_META;
+        let handshake = Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [23; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        };
+        let input = encode_frame(1, &handshake).unwrap();
+        let mut output = Vec::new();
+        Server::new(tempdir().unwrap().path())
+            .run(Cursor::new(input), &mut output)
+            .unwrap();
+        let mut decoder = FrameDecoder::new();
+        let mut cursor = Cursor::new(output);
+        match decoder.read(&mut cursor).unwrap().message {
+            Message::Handshake {
+                role: Role::Session,
+                capabilities: advertised,
+                ..
+            } => assert_ne!(
+                advertised & CAP_BROWSE_META,
+                0,
+                "default session server must advertise CAP_BROWSE_META"
+            ),
+            other => panic!("expected handshake, got {other:?}"),
+        }
     }
 
     #[test]

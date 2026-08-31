@@ -8,6 +8,12 @@ the receiver (4.26) — what is actually slow, and why?**
 
 ---
 
+> **Read `docs/network-topology.md` before comparing hosts.** Mac and mars
+> share an ethernet switch; freya and orion sit behind a ~800 Mbit/s mesh
+> backhaul. Measured 2026-08-31: switched 904 Mbit/s at 1.0 ms RTT, mesh
+> 792 Mbit/s at 3.9 ms. Throughput ceilings taken against freya or orion are
+> mesh ceilings, not gigabit ones.
+
 ## What changed since v2
 
 Both halves of the small-file path were serialized. Both are now fixed, and
