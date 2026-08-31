@@ -273,6 +273,11 @@ pub struct LocalSyncOptions {
     pub dry_run: bool,
     /// Remove destination-only entries after all transfers succeed.
     pub delete: bool,
+    /// Upper bound on entries `--delete` may remove.
+    ///
+    /// `None` applies the automatic safety threshold instead; `Some(n)` is an
+    /// explicit authorization for up to `n` removals.
+    pub max_delete: Option<usize>,
     /// Re-read clone output and verify content hashes.
     pub paranoid: bool,
     /// Classify regular files by BLAKE3 content rather than metadata.
@@ -313,6 +318,7 @@ impl Default for LocalSyncOptions {
             directory_clones: true,
             dry_run: false,
             delete: false,
+            max_delete: None,
             paranoid: false,
             checksum: false,
             cloud_files: CloudFilesPolicy::Download,
@@ -385,6 +391,9 @@ impl LocalSyncReport {
 /// Errors that prevent a local job from safely reaching per-entry transfer.
 #[derive(Debug, thiserror::Error)]
 pub enum LocalSyncError {
+    /// A `--delete` run was refused before removing anything.
+    #[error("{0}")]
+    DeleteRefused(String),
     /// The source root could not be inspected.
     #[error("cannot inspect source root '{}': {source}", path.display())]
     SourceRoot {
@@ -662,6 +671,10 @@ where
 
         if options.delete && !report.partial_failure() {
             protect_cloud_skipped(&mut plan, &cloud_skipped);
+            // Gate before the first removal, so a refusal costs only the
+            // transfer that already happened.
+            crate::planner::authorize_deletions(&plan, options.max_delete)
+                .map_err(|refused| LocalSyncError::DeleteRefused(refused.to_string()))?;
             delete_extraneous(&destination_sink, &plan, &mut report, &mut emit);
         }
 
@@ -2296,6 +2309,7 @@ mod tests {
 
     fn options() -> LocalSyncOptions {
         LocalSyncOptions {
+            max_delete: None,
             filter: None,
             explain_filter: false,
             local_workers: 2,

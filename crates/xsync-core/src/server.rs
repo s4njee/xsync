@@ -112,6 +112,7 @@ impl ServerError {
             Self::Bootstrap(_) => "bootstrap",
             Self::RemoteShellMismatch => "remote-shell",
             Self::FilterUnrepresentable(_) => "filter-unrepresentable",
+            Self::DeleteRefused(_) => "delete-refused",
             Self::Transport { .. } => "transport",
             Self::PeerDisconnected => "peer-disconnected",
         }
@@ -162,6 +163,10 @@ pub enum ServerError {
     /// rather than approximated into a wider transfer.
     #[error("{0}")]
     FilterUnrepresentable(String),
+
+    /// A `--delete` run was refused before removing anything.
+    #[error("{0}")]
+    DeleteRefused(String),
     /// The remote server reported an error.
     #[error("remote error (code {code}): {message}")]
     RemoteError {
@@ -4254,6 +4259,9 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         // Deletions update parent directory mtimes, so perform them before the
         // final directory metadata pass.
         if options.delete && !report.partial_failure() {
+            // Gate before the first removal on every route.
+            crate::planner::authorize_deletions(&plan, options.max_delete)
+                .map_err(|refused| ServerError::DeleteRefused(refused.to_string()))?;
             let mut to_delete = Vec::new();
             to_delete.extend(plan.files.extraneous.clone());
             to_delete.extend(plan.symlinks.extraneous.clone());
@@ -5245,6 +5253,9 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
 
         // Delete extraneous entries if enabled.
         if options.delete && !report.partial_failure() {
+            // Gate before the first removal on every route.
+            crate::planner::authorize_deletions(&plan, options.max_delete)
+                .map_err(|refused| ServerError::DeleteRefused(refused.to_string()))?;
             for entry in &plan.files.extraneous {
                 match sink.delete_entry(entry) {
                     Ok(()) => emit(LocalEvent::Deleted {
@@ -6434,6 +6445,9 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
 
         // Deletes, deepest first.
         if options.delete && !report.partial_failure() {
+            // Gate before the first removal on every route.
+            crate::planner::authorize_deletions(&plan, options.max_delete)
+                .map_err(|refused| ServerError::DeleteRefused(refused.to_string()))?;
             let mut to_delete = Vec::new();
             to_delete.extend(plan.files.extraneous.clone());
             to_delete.extend(plan.symlinks.extraneous.clone());

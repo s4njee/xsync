@@ -2186,9 +2186,18 @@ the highest-value open items once the above is done.
 - **V3.20 — worker count should follow the storage, not the core count.** Four
   platforms of data will make this decidable. A runtime probe is the only option
   that fits all measured hosts.
-- **V3.11 — make `--delete` survivable.** Still marked P0 in v3: permanent
-  removal with no undo, no maximum and no confirmation. The only item here that
-  is a data-loss risk rather than a performance or ergonomics question.
+- **V3.11 — make `--delete` survivable.** *Partly done 2026-08-30.* The
+  catastrophic case is closed: a run that would remove **at least half of a
+  destination of 100 or more entries** is now refused before the first removal,
+  on every route — local, single-stream push, multi-stream push and pull.
+  `--max-delete N` caps the set and doubles as the explicit authorisation, so
+  one flag both restrains and permits. Verified: 500 local files and 400 remote
+  files survived an unauthorised `--delete` (exit 1), and proceeded with
+  `--max-delete`. Five planner tests cover the accident, explicit
+  authorisation, an over-limit refusal, the small-destination floor, and a
+  proportionate 20% prune that must *not* be blocked.
+  **Still open from the v3 AC**: a `--backup`/trash mode, interactive
+  confirmation, and delete summaries in the JSON output.
 - **Same-filesystem fast path** (v3, unstarted): where both ends are the same
   filesystem, per-file work can be bypassed.
 - **Verify-only mode** (v3): answer "are these two trees identical?" without

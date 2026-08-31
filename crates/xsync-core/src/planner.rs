@@ -558,6 +558,111 @@ pub fn classify_stream(
     })
 }
 
+/// Share of a destination that may be deleted before the run is refused.
+///
+/// The accident this exists to prevent is a mirror job whose *source* failed to
+/// mount: the scan finds nothing, every destination entry classifies as
+/// extraneous, and `--delete` wipes the backup. A source that legitimately lost
+/// most of its contents is rare; a source that failed to appear is not.
+const SUSPICIOUS_DELETE_SHARE: f64 = 0.5;
+
+/// Below this many entries the share test is not applied.
+///
+/// Small destinations hit high percentages honestly — emptying a four-file
+/// directory is 100% and completely ordinary.
+const SUSPICIOUS_DELETE_FLOOR: usize = 100;
+
+/// What a `--delete` run would remove, and how much of the destination that is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeletionAudit {
+    /// Entries that would be removed.
+    pub to_delete: usize,
+    /// Destination entries the plan knows about, deletions included.
+    pub destination_entries: usize,
+}
+
+impl DeletionAudit {
+    /// Fraction of the known destination this deletion would remove.
+    #[must_use]
+    pub fn share(&self) -> f64 {
+        if self.destination_entries == 0 {
+            return 0.0;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        {
+            self.to_delete as f64 / self.destination_entries as f64
+        }
+    }
+}
+
+/// Why a deletion set was refused.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum DeletionRefused {
+    /// More entries than `--max-delete` allows.
+    #[error("--delete would remove {to_delete} entries, over the --max-delete limit of {limit}; nothing was deleted")]
+    OverLimit {
+        /// Entries the run wanted to remove.
+        to_delete: usize,
+        /// The limit the user set.
+        limit: usize,
+    },
+    /// A suspicious share of the destination, with no explicit authorization.
+    #[error(
+        "--delete would remove {to_delete} of {destination_entries} destination entries ({percent:.0}%); \
+         refusing without authorization. If the source is intentionally this much smaller, re-run with \
+         --max-delete {to_delete} (or higher). A source that failed to mount looks exactly like this."
+    )]
+    Suspicious {
+        /// Entries the run wanted to remove.
+        to_delete: usize,
+        /// Destination entries the plan knows about.
+        destination_entries: usize,
+        /// Share, as a percentage, for the message.
+        percent: f64,
+    },
+}
+
+/// Decide whether a plan's deletions may proceed.
+///
+/// Called before the first removal on every route, so a refusal costs nothing
+/// but the transfer that already happened.
+///
+/// # Errors
+///
+/// Returns [`DeletionRefused`] when the set exceeds `--max-delete`, or when it
+/// covers a suspicious share of the destination and no limit was given.
+pub fn authorize_deletions(
+    plan: &Plan,
+    max_delete: Option<usize>,
+) -> Result<DeletionAudit, DeletionRefused> {
+    let kinds = [&plan.files, &plan.directories, &plan.symlinks, &plan.other];
+    let to_delete: usize = kinds.iter().map(|k| k.extraneous.len()).sum();
+    let destination_entries: usize = kinds
+        .iter()
+        .map(|k| k.extraneous.len() + k.unchanged.len() + k.changed.len() + k.metadata.len())
+        .sum();
+    let audit = DeletionAudit {
+        to_delete,
+        destination_entries,
+    };
+    if let Some(limit) = max_delete {
+        // An explicit limit is also an explicit authorization: honour it and
+        // skip the share test entirely.
+        if to_delete > limit {
+            return Err(DeletionRefused::OverLimit { to_delete, limit });
+        }
+        return Ok(audit);
+    }
+    if to_delete >= SUSPICIOUS_DELETE_FLOOR && audit.share() >= SUSPICIOUS_DELETE_SHARE {
+        return Err(DeletionRefused::Suspicious {
+            to_delete,
+            destination_entries,
+            percent: audit.share() * 100.0,
+        });
+    }
+    Ok(audit)
+}
+
 /// The classification applied to one source or destination entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Classification {
@@ -1584,6 +1689,77 @@ mod tests {
             difference(&source, &destination, false, true),
             Difference::Content
         );
+    }
+
+    fn plan_with(extraneous: usize, kept: usize) -> Plan {
+        let mut plan = Plan::default();
+        for i in 0..extraneous {
+            plan.files
+                .extraneous
+                .push(entry(&format!("gone{i}"), EntryKind::File, 1, 1));
+        }
+        for i in 0..kept {
+            plan.files
+                .unchanged
+                .push(entry(&format!("kept{i}"), EntryKind::File, 1, 1));
+        }
+        plan
+    }
+
+    /// The accident this guard exists for: the source fails to mount, so every
+    /// destination entry classifies as extraneous and `--delete` wipes a backup.
+    #[test]
+    fn a_source_that_vanished_is_refused_rather_than_mirrored() {
+        let plan = plan_with(500, 0);
+        let err = authorize_deletions(&plan, None).unwrap_err();
+        assert!(
+            matches!(err, DeletionRefused::Suspicious { to_delete: 500, .. }),
+            "{err:?}"
+        );
+    }
+
+    /// An explicit limit is an explicit authorization, and suppresses the share
+    /// test — otherwise a deliberate large prune could never be expressed.
+    #[test]
+    fn an_explicit_limit_authorizes_a_large_deletion() {
+        let plan = plan_with(500, 0);
+        let audit = authorize_deletions(&plan, Some(500)).expect("authorized");
+        assert_eq!(audit.to_delete, 500);
+    }
+
+    #[test]
+    fn a_limit_below_the_deletion_set_refuses() {
+        let plan = plan_with(500, 0);
+        let err = authorize_deletions(&plan, Some(100)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DeletionRefused::OverLimit {
+                    to_delete: 500,
+                    limit: 100
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Small destinations reach high percentages honestly; emptying a handful of
+    /// files is ordinary and must not require a flag.
+    #[test]
+    fn a_small_destination_is_below_the_floor_and_proceeds() {
+        let plan = plan_with(8, 0);
+        let audit = authorize_deletions(&plan, None).expect("under the floor");
+        assert_eq!(audit.to_delete, 8);
+    }
+
+    /// A large but proportionate prune is not the accident and must not be
+    /// blocked: 200 of 1,000 is 20%, well under the share threshold.
+    #[test]
+    fn a_proportionate_prune_of_a_large_destination_proceeds() {
+        let plan = plan_with(200, 800);
+        let audit = authorize_deletions(&plan, None).expect("under the share");
+        assert_eq!(audit.to_delete, 200);
+        assert!((audit.share() - 0.2).abs() < 1e-9, "{}", audit.share());
     }
 
     fn disk_config(root: &Path, budget: usize) -> IndexConfig {

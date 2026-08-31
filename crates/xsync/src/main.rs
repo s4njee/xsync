@@ -176,6 +176,14 @@ struct Cli {
     #[arg(long)]
     delete: bool,
 
+    /// Refuse `--delete` beyond N entries; also authorises that many
+    ///
+    /// Without it, a run that would remove at least half of a destination of
+    /// 100 entries or more is refused: that is what a source failing to mount
+    /// looks like. Passing this flag is the explicit acknowledgement.
+    #[arg(long, value_name = "N")]
+    max_delete: Option<usize>,
+
     /// Exclude files matching the GLOB pattern (repeatable; matched against the relative path).
     #[arg(long, value_name = "GLOB")]
     exclude: Vec<String>,
@@ -829,6 +837,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<RunOutcome, CliError> {
         on_path_collision: cli.on_path_collision.into(),
         dry_run: cli.dry_run,
         delete: cli.delete,
+        max_delete: cli.max_delete,
         checksum: cli.checksum,
         bootstrap: cli.bootstrap.into(),
         cloud_files: match cli.cloud_files {
