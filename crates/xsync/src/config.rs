@@ -533,7 +533,12 @@ mod tests {
         let home = home_directory();
         let expanded = expand_home("~/Documents");
         if let Some(home) = home {
-            assert_eq!(expanded, format!("{}/Documents", home.display()));
+            // `$HOME` may itself be `/` -- it is under `cross`, whose test
+            // container runs as root. `expand_home` collapses the separator;
+            // the expectation has to do the same or it asserts `//Documents`.
+            let base = home.to_string_lossy().into_owned();
+            let separator = if base.ends_with('/') { "" } else { "/" };
+            assert_eq!(expanded, format!("{base}{separator}Documents"));
         }
         assert_eq!(expand_home("mars:~/Documents"), "mars:~/Documents");
         assert_eq!(expand_home("/absolute/~/x"), "/absolute/~/x");

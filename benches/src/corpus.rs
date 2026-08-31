@@ -675,6 +675,15 @@ fn mutate_content(path: &Path) -> Result<(), CorpusError> {
 }
 
 fn mutate_metadata(path: &Path, seed: u64) -> Result<(), CorpusError> {
+    // The mtime is set first because the Windows arm below marks the file
+    // read-only, and `set_file_mtime` needs write access to open it: doing the
+    // permission change first fails with "Access is denied".
+    let time = FileTime::from_unix_time(normalized_seconds(seed) + 60, 0);
+    set_file_mtime(path, time).map_err(|source| CorpusError::Io {
+        operation: "change churn mtime",
+        path: path.to_path_buf(),
+        source,
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -703,12 +712,7 @@ fn mutate_metadata(path: &Path, seed: u64) -> Result<(), CorpusError> {
             source,
         })?;
     }
-    let time = FileTime::from_unix_time(normalized_seconds(seed) + 60, 0);
-    set_file_mtime(path, time).map_err(|source| CorpusError::Io {
-        operation: "change churn mtime",
-        path: path.to_path_buf(),
-        source,
-    })
+    Ok(())
 }
 
 fn normalize_tree(root: &Path, seed: u64) -> Result<(), CorpusError> {
