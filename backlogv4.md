@@ -1217,7 +1217,7 @@ transfer that is waiting on the cipher.
 
 **Still deliberately not pursued**: multi-process sharding and GPU hashing.
 
-### 4.51 — Overlap planning with transfer *(medium priority)*
+### 4.56 — Overlap planning with transfer *(medium priority)*
 
 - [ ] Transfer start is gated on plan completeness per kind, so scanning and
   classification are dead time on the wire. Measured with `--dry-run`, which
