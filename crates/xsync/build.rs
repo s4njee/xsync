@@ -94,6 +94,11 @@ fn build_date() -> String {
 
 /// Civil date from a Unix timestamp, without pulling in a date library for one
 /// string. Days-from-epoch to y/m/d via Howard Hinnant's algorithm.
+///
+/// `doe`/`doy` (day-of-era, day-of-year) are the published names for these
+/// quantities. Renaming them to satisfy `similar_names` would make the code
+/// harder to check against the algorithm it came from, not easier.
+#[allow(clippy::similar_names)]
 fn format_utc_date(seconds: i64) -> String {
     let days = seconds.div_euclid(86_400);
     let z = days + 719_468;

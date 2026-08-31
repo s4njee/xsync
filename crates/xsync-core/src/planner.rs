@@ -544,7 +544,7 @@ pub fn classify_stream(
     source_entries: impl IntoIterator<Item = FileEntry>,
     destination: DestinationIndex,
     compare_modes: bool,
-    mut callback: impl FnMut(FileEntry, Classification) -> Result<(), PlannerError>,
+    callback: impl FnMut(FileEntry, Classification) -> Result<(), PlannerError>,
 ) -> Result<(), PlannerError> {
     let config = destination.config();
     let mut source_spool = PlanningSpool::with_config(IndexConfig {
@@ -563,7 +563,7 @@ pub fn classify_stream(
         &mut destination,
         false,
         compare_modes,
-        |entry, action| callback(entry, action),
+        callback,
     )
 }
 
