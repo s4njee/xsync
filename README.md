@@ -115,7 +115,7 @@ Windows MSVC. It also enforces `cargo fmt` and a 1.88 MSRV. The whole workspace 
 | local → remote (push) | Works over SSH, native sync protocol v2 |
 | remote → local (pull) | Works over SSH, native sync protocol v2 |
 | remote → remote | **Not supported** — rejected at argument parsing |
-| rsync-protocol fallback | Push only, GNU rsync protocol 32 only |
+| rsync-protocol fallback | Push and pull, GNU rsync protocol 32 only |
 | Multi-stream striping | Implemented, 1–16 streams, **default 1** |
 | Durable chunk resume | Implemented for large files |
 | Browse/mutate session (v2) | Implemented as a **library API**; no CLI exposure |
@@ -871,7 +871,8 @@ protocol — it does not require a local `rsync` executable, and it is not a dis
 
 The boundaries are narrow and deliberate:
 
-- **Push only.** Pulling from a remote always requires a native `xs` on the far end.
+- **Push and pull.** Both directions speak to the remote GNU sender or receiver
+  directly; neither requires a local `rsync` executable or a remote `xs`.
 - **GNU rsync advertising protocol 32 only** (3.4.x / 3.5.x). macOS's `/usr/bin/rsync` is
   openrsync protocol 29 and is rejected with an explicit message. A newer GNU rsync that
   negotiates down to 32 is accepted.
@@ -1637,7 +1638,7 @@ prevents a class of user-caused disaster that no amount of correctness work addr
 | rsync daemon (`rsync://`, `rsyncd.conf`, modules, auth) | Missing | An entire subsystem: anonymous and authenticated modules, per-module paths, chroot, host allow/deny. Large surface, and questionable whether xsync should reimplement it versus offering a modern authenticated daemon (already planned for v2). |
 | `--port`, `--address`, `--sockopts` | Missing | Daemon-only. |
 | `--protocol` | Missing | |
-| rsync wire compatibility | **Partial** | Push only, GNU protocol 32 only. openrsync 29 and OpenBSD 27 are research targets. |
+| rsync wire compatibility | **Partial** | Push and pull, GNU protocol 32 only. openrsync 29 and OpenBSD 27 are research targets. |
 
 ---
 

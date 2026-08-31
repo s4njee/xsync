@@ -203,6 +203,63 @@ fn test_native_rsync_fallback_needs_no_local_rsync_executable() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("transport: rsync"));
 }
 
+#[test]
+fn test_native_rsync_fallback_pulls_from_reference_sender_without_local_rsync() {
+    let source = tempdir().unwrap();
+    populate_test_tree(source.path());
+    for name in [
+        "space name",
+        "quote'name",
+        "-leading-dash",
+        "semi;dollar$bracket[glob]",
+    ] {
+        fs::write(source.path().join(name), name.as_bytes()).unwrap();
+    }
+    let expected = tempdir().unwrap();
+    let actual = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), false) else {
+        return;
+    };
+
+    assert!(Command::new(reference_rsync().unwrap())
+        .arg("-rlptW")
+        .arg("--protocol=32")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("fakehost:{}/", source.path().display()))
+        .arg(format!("{}/", expected.path().display()))
+        .status()
+        .unwrap()
+        .success());
+
+    let output = Command::new(xsync_bin())
+        .env("PATH", "/definitely/no/local/rsync")
+        .arg("--transport")
+        .arg("rsync")
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("fakehost:{}/", source.path().display()))
+        .arg(format!("{}/", actual.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "native rsync pull codec failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut expected_entries = build_manifest(expected.path()).unwrap().entries;
+    let mut actual_entries = build_manifest(actual.path()).unwrap().entries;
+    for (expected, actual) in expected_entries.iter_mut().zip(&mut actual_entries) {
+        if expected.kind != xsync_bench::manifest::ManifestKind::File {
+            expected.mtime.nanoseconds = 0;
+            actual.mtime.nanoseconds = 0;
+        }
+    }
+    assert_eq!(expected_entries, actual_entries);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("transport: rsync"));
+}
+
 /// A deeply nested tree with directories interleaved among files in the file
 /// list. The synthetic corpora the rsync transport was previously exercised
 /// against are shallow, and a shallow tree hides an ordering divergence: the
@@ -317,6 +374,35 @@ fn test_auto_falls_back_only_when_remote_xsync_is_missing() {
     assert_eq!(fs::read(dst.path().join("file.txt")).unwrap(), b"fallback");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("trying supported rsync fallback"));
+}
+
+#[test]
+fn test_auto_falls_back_to_rsync_for_remote_source_when_xsync_is_missing() {
+    let source = tempdir().unwrap();
+    fs::write(source.path().join("file.txt"), b"fallback pull").unwrap();
+    let destination = tempdir().unwrap();
+    let scripts = tempdir().unwrap();
+    let Some(fake_rsh) = write_fake_rsync_rsh(scripts.path(), true) else {
+        return;
+    };
+
+    let output = Command::new(xsync_bin())
+        .arg("-e")
+        .arg(&fake_rsh)
+        .arg(format!("fakehost:{}/", source.path().display()))
+        .arg(format!("{}/", destination.path().display()))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(destination.path().join("file.txt")).unwrap(),
+        b"fallback pull"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("trying supported rsync fallback"));
 }
 
 #[test]

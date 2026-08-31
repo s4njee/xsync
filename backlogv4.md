@@ -1296,10 +1296,9 @@ boundary itself.
 
 ### 4.57 — The rsync fallback cannot pull
 
-- [ ] `rsync.rs` implements `sync_push` and nothing else. `--transport rsync`
-  (and the `auto` fallback that selects it when a peer has no `xs`) therefore
-  **works for uploads and fails for downloads**, which is half the operations a
-  general-purpose client performs.
+- [x] `rsync.rs` now implements `sync_pull` alongside `sync_push`.
+  `--transport rsync` and the `auto` fallback therefore work for both uploads
+  and downloads when a peer has no `xs`.
 
 **Why it matters more than it looks.** The rsync transport is what makes `xs`
 usable against hosts the user does not administer: it speaks the rsync wire
@@ -1328,6 +1327,14 @@ its traffic straight to a per-file protocol.
 **Explicitly out of scope**: making the rsync transport reach feature parity
 with the native one. It is a compatibility rung, not a second first-class
 backend, and it should stay small enough to stay correct.
+
+**Delivered:** `sync_pull` now drives GNU rsync protocol 32's sender-side
+session without a local rsync executable. It reads and re-sorts the remote file
+list using GNU's index ordering, requests whole-file literals, preserves the
+v1 recursive file/directory/symlink subset, and completes the sender's
+three-phase goodbye. Explicit rsync and `auto` fallback both select it for
+remote-to-local transfers. Integration coverage drives a real GNU sender with
+the local `rsync` hidden from `PATH`.
 
 ## Phase 10 — Benchmarkability
 

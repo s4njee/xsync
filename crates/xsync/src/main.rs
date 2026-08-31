@@ -863,39 +863,71 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<RunOutcome, CliError> {
     let dest_authority = dest.authority();
 
     let report = if src.is_remote() {
-        if cli.transport == TransportArg::Rsync {
-            return Err(CliError::Transport(
-                "rsync transport currently supports local-to-remote only; install xsync remotely for remote-to-local"
-                    .to_owned(),
-            ));
-        }
-        let mut selection = native_selection(
-            if cli.transport == TransportArg::Xsync {
-                "explicit --transport=xsync"
-            } else {
-                "remote-to-local requires the native xsync receiver"
-            },
-            !cli.no_compress,
-        );
-        render_selection(&selection, progress_json, quiet);
-        xsync_core::server::sync_pull_server(
-            &src.path,
-            src.trailing_slash,
-            std::path::Path::new(&dest.path),
-            dest.trailing_slash,
-            &options,
-            cli.rsh.as_deref(),
-            src_authority.as_deref(),
-            |event| {
-                render_event(
-                    &mut progress,
-                    event,
-                    progress_json,
-                    quiet,
-                    Some(&mut selection),
+        let host = src_authority
+            .as_deref()
+            .expect("remote source has authority");
+        match cli.transport {
+            TransportArg::Xsync => {
+                let mut selection =
+                    native_selection("explicit --transport=xsync", !cli.no_compress);
+                render_selection(&selection, progress_json, quiet);
+                xsync_core::server::sync_pull_server(
+                    &src.path,
+                    src.trailing_slash,
+                    std::path::Path::new(&dest.path),
+                    dest.trailing_slash,
+                    &options,
+                    cli.rsh.as_deref(),
+                    Some(host),
+                    |event| {
+                        render_event(
+                            &mut progress,
+                            event,
+                            progress_json,
+                            quiet,
+                            Some(&mut selection),
+                        );
+                    },
+                )?
+            }
+            TransportArg::Rsync => run_rsync_pull(cli, &src, &dest, &options, host)?,
+            TransportArg::Auto => {
+                let mut selection = native_selection("native receiver available", !cli.no_compress);
+                let mut selection_emitted = false;
+                let native = xsync_core::server::sync_pull_server(
+                    &src.path,
+                    src.trailing_slash,
+                    std::path::Path::new(&dest.path),
+                    dest.trailing_slash,
+                    &options,
+                    cli.rsh.as_deref(),
+                    Some(host),
+                    |event| {
+                        if !selection_emitted {
+                            render_selection(&selection, progress_json, quiet);
+                            selection_emitted = true;
+                        }
+                        render_event(
+                            &mut progress,
+                            event,
+                            progress_json,
+                            quiet,
+                            Some(&mut selection),
+                        );
+                    },
                 );
-            },
-        )?
+                match native {
+                    Ok(report) => report,
+                    Err(xsync_core::server::ServerError::MissingRemoteXsync) => {
+                        if !quiet {
+                            eprintln!("warning: remote xsync unavailable; trying supported rsync fallback");
+                        }
+                        run_rsync_pull(cli, &src, &dest, &options, host)?
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
     } else if dest.is_remote() {
         let host = dest_authority
             .as_deref()
@@ -1058,6 +1090,57 @@ fn run_rsync_push(
         std::path::Path::new(&src.path),
         src.trailing_slash,
         &dest.path,
+        dest.trailing_slash,
+        options,
+        cli.rsh.as_deref(),
+        host,
+        &peer,
+        |event| {
+            render_event(
+                &mut progress,
+                event,
+                cli.progress_json,
+                cli.quiet,
+                Some(&mut selection),
+            );
+        },
+    )
+    .map_err(Into::into)
+}
+
+fn run_rsync_pull(
+    cli: &Cli,
+    src: &xsync_core::path::PathSpec,
+    dest: &xsync_core::path::PathSpec,
+    options: &xsync_core::local::LocalSyncOptions,
+    host: &str,
+) -> Result<xsync_core::local::LocalSyncReport, CliError> {
+    let mut progress = ProgressRenderer::new();
+    if cli.checksum {
+        return Err(CliError::Transport(
+            "rsync transport does not support --checksum in v1 (rsync MD4 is not BLAKE3)"
+                .to_owned(),
+        ));
+    }
+    if cli.compress_level.is_some() {
+        return Err(CliError::Transport(
+            "rsync transport does not support compression in v1".to_owned(),
+        ));
+    }
+    xsync_core::rsync::validate_options(options)?;
+    let peer = xsync_core::rsync::probe_remote(cli.rsh.as_deref(), host)?;
+    xsync_core::rsync::validate_peer(&peer)?;
+    let reason = if cli.transport == TransportArg::Auto {
+        "remote xsync executable unavailable"
+    } else {
+        "explicit --transport=rsync"
+    };
+    let mut selection = peer.selection(reason);
+    render_selection(&selection, cli.progress_json, cli.quiet);
+    xsync_core::rsync::sync_pull(
+        &src.path,
+        src.trailing_slash,
+        std::path::Path::new(&dest.path),
         dest.trailing_slash,
         options,
         cli.rsh.as_deref(),

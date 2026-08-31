@@ -1,4 +1,4 @@
-//! Native whole-file sender for the rsync receiver wire protocol.
+//! Native whole-file rsync wire transport.
 //!
 //! This is intentionally a bounded GNU protocol-32 sender. No local rsync
 //! executable is launched or required.
@@ -30,9 +30,12 @@ const MAX_MULTIPLEX_PAYLOAD: usize = 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
 const DATA_CHUNK_BYTES: usize = 32 * 1024;
 const XMIT_TOP_DIR: u32 = 1 << 0;
+const XMIT_SAME_MODE: u32 = 1 << 1;
 const XMIT_SAME_UID: u32 = 1 << 3;
 const XMIT_SAME_GID: u32 = 1 << 4;
+const XMIT_SAME_NAME: u32 = 1 << 5;
 const XMIT_LONG_NAME: u32 = 1 << 6;
+const XMIT_SAME_TIME: u32 = 1 << 7;
 const XMIT_MOD_NSEC: u32 = 1 << 13;
 const XMIT_NO_CONTENT_DIR: u32 = 1 << 8;
 const CF_INC_RECURSE: u32 = 1 << 0;
@@ -40,6 +43,7 @@ const CF_CHKSUM_SEED_FIX: u32 = 1 << 5;
 const CF_VARINT_FLIST_FLAGS: u32 = 1 << 7;
 const ITEM_BASIS_TYPE_FOLLOWS: u16 = 1 << 11;
 const ITEM_XNAME_FOLLOWS: u16 = 1 << 12;
+const ITEM_IS_NEW: u16 = 1 << 13;
 const ITEM_TRANSFER: u16 = 1 << 15;
 const NDX_DONE: i32 = -1;
 const NDX_DEL_STATS: i32 = -3;
@@ -153,6 +157,32 @@ struct WireEntry {
     mode: u32,
     link_target: Vec<u8>,
     top_level: bool,
+}
+
+#[derive(Debug)]
+struct PullEntry {
+    path: Vec<u8>,
+    kind: WireKind,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: u32,
+    mode: u32,
+    link_target: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct PullRequest {
+    index: usize,
+    destination: PathBuf,
+    is_new: bool,
+}
+
+#[derive(Debug)]
+struct PullPlan {
+    root: PathBuf,
+    requests: Vec<PullRequest>,
+    directories: Vec<(PathBuf, i64, u32, u32)>,
+    symlinks: Vec<(PathBuf, Vec<u8>, i64, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,6 +637,146 @@ pub fn sync_push<F: FnMut(LocalEvent)>(
     }
 }
 
+/// Pull a remote source through the native rsync-wire receiver.
+///
+/// The remote process is the GNU rsync sender; this function implements the
+/// bounded whole-file receiver locally and never executes a local `rsync`.
+///
+/// # Errors
+/// Returns on destination, protocol, transport, or remote sender failure.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_pull<F: FnMut(LocalEvent)>(
+    source: &str,
+    source_trailing_slash: bool,
+    destination: &Path,
+    destination_trailing_slash: bool,
+    options: &LocalSyncOptions,
+    rsh: Option<&str>,
+    host: &str,
+    peer: &RsyncPeer,
+    mut emit: F,
+) -> Result<LocalSyncReport, RsyncError> {
+    validate_options(options)?;
+    validate_peer(peer)?;
+    let command_args = sender_argv(source, source_trailing_slash, options)?;
+    let command_refs: Vec<&[u8]> = command_args.iter().map(Vec::as_slice).collect();
+    let mut child = remote_command(rsh, host, &command_refs)?
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(RsyncError::Io)?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| RsyncError::Protocol("remote rsync stdin was not piped".to_owned()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RsyncError::Protocol("remote rsync stdout was not piped".to_owned()))?;
+    let stderr_thread = child
+        .stderr
+        .take()
+        .map(|pipe| std::thread::spawn(move || read_bounded(pipe)));
+
+    let mut reader = BufReader::new(CountingReader::new(stdout));
+    let mut writer = BufWriter::new(stdin);
+    let result = run_pull_session(
+        &mut reader,
+        &mut writer,
+        destination,
+        destination_trailing_slash,
+        options,
+        &mut emit,
+    );
+    let wire_bytes = reader.get_ref().bytes;
+    drop(reader);
+    drop(writer);
+    let status = finish_child(&mut child, stderr_thread);
+
+    match (result, status) {
+        (Err(session), Err(remote)) => Err(RsyncError::Protocol(format!("{session}; {remote}"))),
+        (Ok(_), Err(err)) | (Err(err), Ok(())) => Err(err),
+        (Ok(mut report), Ok(())) => {
+            report.wire_bytes = wire_bytes;
+            emit_finished(&report, &mut emit);
+            Ok(report)
+        }
+    }
+}
+
+/// Drive the native rsync-wire receiver over caller-provided I/O.
+///
+/// This is the pull counterpart to [`sync_push_io`]. The reader must provide
+/// the remote GNU sender's stdout and the writer must feed its stdin.
+///
+/// # Errors
+/// Returns on destination, protocol, or transport failure.
+pub fn sync_pull_io<R: Read, W: Write, F: FnMut(LocalEvent)>(
+    destination: &Path,
+    destination_trailing_slash: bool,
+    options: &LocalSyncOptions,
+    peer: &RsyncPeer,
+    reader: R,
+    writer: W,
+    mut emit: F,
+) -> Result<LocalSyncReport, RsyncError> {
+    validate_options(options)?;
+    validate_peer(peer)?;
+    let mut reader = BufReader::new(CountingReader::new(reader));
+    let mut writer = BufWriter::new(writer);
+    let mut report = run_pull_session(
+        &mut reader,
+        &mut writer,
+        destination,
+        destination_trailing_slash,
+        options,
+        &mut emit,
+    )?;
+    report.wire_bytes = reader.get_ref().bytes;
+    emit_finished(&report, &mut emit);
+    Ok(report)
+}
+
+/// `rsync --server --sender` argv for a source rooted at `source`.
+///
+/// # Errors
+/// Returns [`RsyncError::UnsupportedOption`] when `options` cannot be
+/// expressed on this backend.
+pub fn sender_argv(
+    source: &str,
+    source_trailing_slash: bool,
+    options: &LocalSyncOptions,
+) -> Result<Vec<Vec<u8>>, RsyncError> {
+    validate_options(options)?;
+    let mut command_args = vec![
+        b"rsync".to_vec(),
+        b"--server".to_vec(),
+        b"--sender".to_vec(),
+        b"-lptrW".to_vec(),
+        b"-e.Cv".to_vec(),
+        b"--dirs".to_vec(),
+        b"--force".to_vec(),
+        b"--no-inc-recursive".to_vec(),
+    ];
+    command_args.extend(
+        options
+            .exclude_patterns
+            .iter()
+            .map(|pattern| format!("--exclude={pattern}").into_bytes()),
+    );
+    if options.dry_run {
+        command_args.push(b"--dry-run".to_vec());
+    }
+    command_args.push(b".".to_vec());
+    let mut source_arg = source.as_bytes().to_vec();
+    if source_trailing_slash && !source_arg.ends_with(b"/") {
+        source_arg.push(b'/');
+    }
+    command_args.push(source_arg);
+    Ok(command_args)
+}
+
 fn parse_version_probe(stdout: &[u8]) -> Result<RsyncPeer, RsyncError> {
     let text = String::from_utf8_lossy(stdout);
     let first = text.lines().next().unwrap_or_default();
@@ -778,6 +948,630 @@ fn run_session<R: Read, W: Write, F: FnMut(LocalEvent)>(
         }
     }
     Ok(report)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_pull_session<R: Read, W: Write, F: FnMut(LocalEvent)>(
+    reader: &mut R,
+    writer: &mut W,
+    destination: &Path,
+    destination_trailing_slash: bool,
+    options: &LocalSyncOptions,
+    emit: &mut F,
+) -> Result<LocalSyncReport, RsyncError> {
+    write_i32(writer, RSYNC_WIRE_VERSION)?;
+    writer.flush()?;
+    let remote_version = read_raw_i32(reader)?;
+    if remote_version != RSYNC_WIRE_VERSION {
+        return Err(RsyncError::UnsupportedPeer(format!(
+            "sender negotiated wire protocol {remote_version}; expected {RSYNC_WIRE_VERSION}"
+        )));
+    }
+    let compat_flags = read_varint_raw(reader)?;
+    let required = CF_CHKSUM_SEED_FIX | CF_VARINT_FLIST_FLAGS;
+    if compat_flags & CF_INC_RECURSE != 0 || compat_flags & required != required {
+        return Err(RsyncError::UnsupportedPeer(format!(
+            "incompatible GNU capability flags 0x{compat_flags:x}"
+        )));
+    }
+    write_vstring(writer, b"md5")?;
+    writer.flush()?;
+    let checksum_choices = read_vstring_raw(reader)?;
+    if !checksum_choices
+        .split(|byte| *byte == b' ')
+        .any(|name| name == b"md5")
+    {
+        return Err(RsyncError::UnsupportedPeer(format!(
+            "sender checksum list '{}' does not include md5",
+            String::from_utf8_lossy(&checksum_choices)
+        )));
+    }
+    let _checksum_seed = read_raw_i32(reader)?;
+
+    // A server in sender mode unconditionally reads the client filter list
+    // before emitting its file list. The v1 transport carries its excludes on
+    // the server argv, so the wire list is deliberately empty.
+    let mut output = MultiplexWriter::new(writer);
+    write_i32(&mut output, 0)?;
+    output.flush()?;
+
+    let mut input = MultiplexReader::new(reader);
+    let mut entries = read_pull_file_list(&mut input)?;
+    // The sender sorts its in-memory file list after writing it, just as a
+    // GNU receiver does after reading it. Index requests must therefore use
+    // this ordering rather than the traversal order on the wire.
+    entries.sort_by(rsync_pull_name_cmp);
+    let PullPlan {
+        root,
+        requests,
+        directories: directory_metadata,
+        symlinks,
+    } = plan_pull(
+        &entries,
+        destination,
+        destination_trailing_slash,
+        options.dry_run,
+    )?;
+    let planned_files = entries
+        .iter()
+        .filter(|entry| entry.kind == WireKind::File)
+        .count();
+    let planned_bytes = entries
+        .iter()
+        .filter(|entry| entry.kind == WireKind::File)
+        .map(|entry| entry.size)
+        .sum();
+    emit(LocalEvent::Started {
+        local_workers: 1,
+        streams: 1,
+    });
+    emit(LocalEvent::Planned {
+        files: planned_files,
+        bytes: planned_bytes,
+    });
+
+    if options.dry_run {
+        for entry in &entries {
+            emit(LocalEvent::Action {
+                path: display_wire_path(&entry.path),
+                action: "create",
+            });
+        }
+    } else {
+        prepare_pull_destination(&root, &directory_metadata, &symlinks)?;
+    }
+
+    let mut report = LocalSyncReport {
+        local_workers: 1,
+        streams: 1,
+        ..LocalSyncReport::default()
+    };
+    let mut output_indexes = IndexEncoder::default();
+    let mut input_indexes = IndexDecoder::default();
+    let mut request_by_index: Vec<Option<&PullRequest>> = vec![None; entries.len()];
+    for request in &requests {
+        request_by_index[request.index] = Some(request);
+    }
+
+    // GNU's sender has three transfer phases for protocol 32. Only phase zero
+    // carries file requests in this whole-file subset; the other two drain
+    // metadata/redo phases and are still required for a clean goodbye.
+    for phase in 0..3 {
+        if phase == 0 && !options.dry_run {
+            for request in &requests {
+                output_indexes.write(
+                    &mut output,
+                    i32::try_from(request.index)
+                        .map_err(|_| RsyncError::Protocol("file index exceeds i32".to_owned()))?,
+                )?;
+                RequestAttributes {
+                    flags: ITEM_TRANSFER | if request.is_new { ITEM_IS_NEW } else { 0 },
+                    basis_type: None,
+                    comparison_name: None,
+                }
+                .write(&mut output)?;
+                for _ in 0..4 {
+                    write_i32(&mut output, 0)?;
+                }
+                output.flush()?;
+            }
+        }
+        output_indexes.write(&mut output, NDX_DONE)?;
+        output.flush()?;
+
+        loop {
+            let index = input_indexes.read(&mut input)?;
+            if index == NDX_DONE {
+                break;
+            }
+            if index == NDX_DEL_STATS {
+                for _ in 0..5 {
+                    let _ = input.read_varint()?;
+                }
+                continue;
+            }
+            if phase != 0 || options.dry_run {
+                return Err(RsyncError::Protocol(format!(
+                    "sender returned file index {index} outside the transfer phase"
+                )));
+            }
+            let index = usize::try_from(index).map_err(|_| {
+                RsyncError::Protocol("sender returned a negative file index".to_owned())
+            })?;
+            let request = request_by_index
+                .get(index)
+                .and_then(|request| *request)
+                .ok_or_else(|| {
+                    RsyncError::Protocol(format!("sender returned unrequested file index {index}"))
+                })?;
+            let _attributes = RequestAttributes::read(&mut input)?;
+            receive_pull_file(
+                &mut input,
+                &request.destination,
+                entries[index].size,
+                entries[index].mtime,
+                entries[index].mtime_nsec,
+                entries[index].mode,
+            )?;
+            report.transferred_files = report.transferred_files.saturating_add(1);
+            report.transferred_bytes = report.transferred_bytes.saturating_add(entries[index].size);
+            report.physical_bytes = report.physical_bytes.saturating_add(entries[index].size);
+            report.byte_copies = report.byte_copies.saturating_add(1);
+            emit(LocalEvent::Transferred {
+                path: display_wire_path(&entries[index].path),
+                bytes: entries[index].size,
+                physical_bytes: entries[index].size,
+                method: TransferMethod::ByteCopy,
+            });
+        }
+    }
+
+    // `read_final_goodbye()` on the server expects a done marker, echoes one,
+    // and then consumes the final done marker from its receiver peer.
+    output_indexes.write(&mut output, NDX_DONE)?;
+    output.flush()?;
+    expect_done(&mut input_indexes, &mut input, "sender final goodbye")?;
+    output_indexes.write(&mut output, NDX_DONE)?;
+    output.flush()?;
+
+    if !options.dry_run {
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.kind == WireKind::File
+                && request_by_index.get(index).is_some_and(Option::is_none)
+            {
+                report.skipped_files = report.skipped_files.saturating_add(1);
+                emit(LocalEvent::Skipped {
+                    path: display_wire_path(&entry.path),
+                    bytes: entry.size,
+                });
+            }
+        }
+        apply_pull_directory_metadata(&directory_metadata)?;
+    }
+    Ok(report)
+}
+
+#[allow(clippy::too_many_lines)]
+fn read_pull_file_list<R: Read>(
+    reader: &mut MultiplexReader<'_, R>,
+) -> Result<Vec<PullEntry>, RsyncError> {
+    let mut entries = Vec::new();
+    let mut last_name = Vec::new();
+    let mut last_mode = 0u32;
+    let mut last_mtime = 0i64;
+    loop {
+        let flags = reader.read_varint()?;
+        if flags == 0 {
+            let io_error = reader.read_varint()?;
+            if io_error != 0 {
+                return Err(RsyncError::RemoteExit {
+                    status: String::new(),
+                    message: format!("sender reported file-list I/O error 0x{io_error:x}"),
+                });
+            }
+            return Ok(entries);
+        }
+        if entries.len() >= MAX_FILE_LIST_ENTRIES {
+            return Err(RsyncError::Protocol(format!(
+                "file list exceeds {MAX_FILE_LIST_ENTRIES} entries"
+            )));
+        }
+        let shared = if flags & XMIT_SAME_NAME != 0 {
+            usize::from(reader.read_u8()?)
+        } else {
+            0
+        };
+        if shared > last_name.len() {
+            return Err(RsyncError::Protocol(
+                "file-list shared name prefix exceeds prior name".to_owned(),
+            ));
+        }
+        let suffix_len = if flags & XMIT_LONG_NAME != 0 {
+            usize::try_from(reader.read_varint()?).map_err(|_| {
+                RsyncError::Protocol("file-list name length exceeds usize".to_owned())
+            })?
+        } else {
+            usize::from(reader.read_u8()?)
+        };
+        if shared.saturating_add(suffix_len) > MAX_PATH_BYTES {
+            return Err(RsyncError::Protocol(format!(
+                "file-list name length exceeds {MAX_PATH_BYTES}"
+            )));
+        }
+        let mut path = last_name[..shared].to_vec();
+        let mut suffix = vec![0u8; suffix_len];
+        reader.read_data_exact(&mut suffix)?;
+        path.extend_from_slice(&suffix);
+        validate_pull_wire_path(&path)?;
+        last_name.clone_from(&path);
+
+        let size = read_varlong(reader, 3)?;
+        let mtime = if flags & XMIT_SAME_TIME != 0 {
+            last_mtime
+        } else {
+            i64::try_from(read_varlong(reader, 4)?)
+                .map_err(|_| RsyncError::Protocol("file-list mtime exceeds i64".to_owned()))?
+        };
+        last_mtime = mtime;
+        let mtime_nsec = if flags & XMIT_MOD_NSEC != 0 {
+            reader.read_varint()?
+        } else {
+            0
+        };
+        if mtime_nsec >= 1_000_000_000 {
+            return Err(RsyncError::Protocol(
+                "file-list mtime nanoseconds are invalid".to_owned(),
+            ));
+        }
+        let mode = if flags & XMIT_SAME_MODE != 0 {
+            last_mode
+        } else {
+            reader.read_i32()?.cast_unsigned()
+        };
+        last_mode = mode;
+        let kind = match mode & 0o170_000 {
+            0o100_000 => WireKind::File,
+            0o040_000 => WireKind::Directory,
+            0o120_000 => WireKind::Symlink,
+            _ => {
+                return Err(RsyncError::Protocol(format!(
+                    "unsupported source mode 0o{mode:o} for {}",
+                    display_wire_path(&path)
+                )));
+            }
+        };
+        let link_target = if kind == WireKind::Symlink {
+            let length = usize::try_from(reader.read_varint()?).map_err(|_| {
+                RsyncError::Protocol("symlink target length exceeds usize".to_owned())
+            })?;
+            if length > MAX_SYMLINK_TARGET_BYTES {
+                return Err(RsyncError::Protocol(format!(
+                    "symlink target length exceeds {MAX_SYMLINK_TARGET_BYTES}"
+                )));
+            }
+            let mut target = vec![0u8; length];
+            reader.read_data_exact(&mut target)?;
+            if target.contains(&0) {
+                return Err(RsyncError::Protocol(
+                    "symlink target contains NUL".to_owned(),
+                ));
+            }
+            target
+        } else {
+            Vec::new()
+        };
+        entries.push(PullEntry {
+            path,
+            kind,
+            size,
+            mtime,
+            mtime_nsec,
+            mode,
+            link_target,
+        });
+    }
+}
+
+fn plan_pull(
+    entries: &[PullEntry],
+    destination: &Path,
+    destination_trailing_slash: bool,
+    dry_run: bool,
+) -> Result<PullPlan, RsyncError> {
+    let Some(root_entry) = entries.first() else {
+        return Ok(PullPlan {
+            root: destination.to_path_buf(),
+            requests: Vec::new(),
+            directories: Vec::new(),
+            symlinks: Vec::new(),
+        });
+    };
+    let root_name = root_entry.path.as_slice();
+    let root = if root_name == b"." {
+        destination.to_path_buf()
+    } else if root_entry.kind == WireKind::Directory
+        || destination_trailing_slash
+        || fs::symlink_metadata(destination).is_ok_and(|metadata| metadata.is_dir())
+    {
+        destination.join(wire_os_string(root_name)?)
+    } else {
+        destination.to_path_buf()
+    };
+    let mut requests = Vec::new();
+    let mut directories = Vec::new();
+    let mut symlinks = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let relative = pull_relative_path(root_name, &entry.path)?;
+        let path = if relative.is_empty() {
+            root.clone()
+        } else {
+            root.join(wire_os_string(&relative)?)
+        };
+        match entry.kind {
+            WireKind::Directory => {
+                directories.push((path, entry.mtime, entry.mtime_nsec, entry.mode));
+            }
+            WireKind::Symlink => symlinks.push((
+                path,
+                entry.link_target.clone(),
+                entry.mtime,
+                entry.mtime_nsec,
+            )),
+            WireKind::File => {
+                let is_new = !matches!(fs::symlink_metadata(&path), Ok(metadata) if metadata.is_file() && pull_metadata_matches(&metadata, entry));
+                if is_new && !dry_run {
+                    let absent = fs::symlink_metadata(&path).is_err();
+                    requests.push(PullRequest {
+                        index,
+                        destination: path,
+                        is_new: absent,
+                    });
+                }
+            }
+        }
+    }
+    Ok(PullPlan {
+        root,
+        requests,
+        directories,
+        symlinks,
+    })
+}
+
+fn pull_relative_path(root: &[u8], path: &[u8]) -> Result<Vec<u8>, RsyncError> {
+    if root == b"." {
+        return if path == b"." {
+            Ok(Vec::new())
+        } else {
+            Ok(path.to_vec())
+        };
+    }
+    if path == root {
+        return Ok(Vec::new());
+    }
+    let Some(relative) = path
+        .strip_prefix(root)
+        .and_then(|path| path.strip_prefix(b"/"))
+    else {
+        return Err(RsyncError::Protocol(format!(
+            "file-list entry '{}' is outside root '{}'",
+            display_wire_path(path),
+            display_wire_path(root)
+        )));
+    };
+    Ok(relative.to_vec())
+}
+
+fn prepare_pull_destination(
+    root: &Path,
+    directories: &[(PathBuf, i64, u32, u32)],
+    symlinks: &[(PathBuf, Vec<u8>, i64, u32)],
+) -> Result<(), RsyncError> {
+    let mut directories = directories.to_vec();
+    directories.sort_by_key(|(path, ..)| path.components().count());
+    for (directory, ..) in directories {
+        ensure_pull_directory(&directory)?;
+    }
+    // A root without a directory entry is a direct file/symlink destination;
+    // its parent is the only directory we may create implicitly.
+    if !root.exists() {
+        if let Some(parent) = root.parent() {
+            ensure_pull_directory(parent)?;
+        }
+    }
+    for (path, target, mtime, nsec) in symlinks {
+        create_pull_symlink(path, target, *mtime, *nsec)?;
+    }
+    Ok(())
+}
+
+fn apply_pull_directory_metadata(
+    directories: &[(PathBuf, i64, u32, u32)],
+) -> Result<(), RsyncError> {
+    for (path, mtime, nsec, mode) in directories.iter().rev() {
+        apply_pull_metadata(path, *mtime, *nsec, *mode, false)?;
+    }
+    Ok(())
+}
+
+fn ensure_pull_directory(path: &Path) -> Result<(), RsyncError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            if metadata.is_dir() {
+                fs::remove_dir_all(path).map_err(RsyncError::Io)?;
+            } else {
+                fs::remove_file(path).map_err(RsyncError::Io)?;
+            }
+            fs::create_dir(path).map_err(RsyncError::Io)
+        }
+        Ok(_) => Err(RsyncError::Protocol(format!(
+            "cannot replace special destination object '{}'",
+            path.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(RsyncError::Io)
+        }
+        Err(error) => Err(RsyncError::Io(error)),
+    }
+}
+
+fn receive_pull_file<R: Read>(
+    reader: &mut MultiplexReader<'_, R>,
+    destination: &Path,
+    expected_size: u64,
+    mtime: i64,
+    mtime_nsec: u32,
+    mode: u32,
+) -> Result<(), RsyncError> {
+    let sums = [
+        reader.read_i32()?,
+        reader.read_i32()?,
+        reader.read_i32()?,
+        reader.read_i32()?,
+    ];
+    if sums != [0; 4] {
+        return Err(RsyncError::Protocol(
+            "sender returned delta tokens despite --whole-file".to_owned(),
+        ));
+    }
+    if let Some(parent) = destination.parent() {
+        ensure_pull_directory(parent)?;
+    }
+    let temporary = destination.with_extension("xsync-rsync-part");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    let mut digest = Md5::new();
+    let mut received = 0u64;
+    loop {
+        let count = reader.read_i32()?;
+        if count == 0 {
+            break;
+        }
+        if count < 0 {
+            return Err(RsyncError::Protocol(
+                "sender emitted matched tokens despite --whole-file".to_owned(),
+            ));
+        }
+        let count = usize::try_from(count).expect("positive i32 fits usize");
+        if count > DATA_CHUNK_BYTES {
+            return Err(RsyncError::Protocol(format!(
+                "literal token {count} exceeds {DATA_CHUNK_BYTES}"
+            )));
+        }
+        let mut bytes = vec![0u8; count];
+        reader.read_data_exact(&mut bytes)?;
+        file.write_all(&bytes)?;
+        digest.update(&bytes);
+        received = received.saturating_add(u64::try_from(count).expect("usize fits u64"));
+    }
+    let mut remote_digest = [0u8; 16];
+    reader.read_data_exact(&mut remote_digest)?;
+    if received != expected_size {
+        return Err(RsyncError::Protocol(format!(
+            "sender sent {received} bytes for '{}' but file list declared {expected_size}",
+            destination.display()
+        )));
+    }
+    if digest.finalize().as_slice() != remote_digest {
+        return Err(RsyncError::Protocol(format!(
+            "sender checksum mismatch for '{}'",
+            destination.display()
+        )));
+    }
+    drop(file);
+    fs::rename(&temporary, destination)?;
+    apply_pull_metadata(destination, mtime, mtime_nsec, mode, false)
+}
+
+fn apply_pull_metadata(
+    path: &Path,
+    mtime: i64,
+    mtime_nsec: u32,
+    mode: u32,
+    symlink: bool,
+) -> Result<(), RsyncError> {
+    #[cfg(unix)]
+    if !symlink {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))?;
+    }
+    let time = filetime::FileTime::from_unix_time(mtime, mtime_nsec);
+    if symlink {
+        #[cfg(unix)]
+        filetime::set_symlink_file_times(path, time, time)?;
+    } else {
+        filetime::set_file_mtime(path, time)?;
+    }
+    Ok(())
+}
+
+fn create_pull_symlink(
+    path: &Path,
+    target: &[u8],
+    mtime: i64,
+    mtime_nsec: u32,
+) -> Result<(), RsyncError> {
+    #[cfg(unix)]
+    {
+        if let Ok(existing) = fs::symlink_metadata(path) {
+            if existing.is_dir() && !existing.file_type().is_symlink() {
+                fs::remove_dir_all(path)?;
+            } else {
+                fs::remove_file(path)?;
+            }
+        }
+        std::os::unix::fs::symlink(wire_os_string(target)?, path)?;
+        apply_pull_metadata(path, mtime, mtime_nsec, 0, true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, target, mtime, mtime_nsec);
+        Err(RsyncError::UnsupportedOption(
+            "symlink pulls on this platform",
+        ))
+    }
+}
+
+fn pull_metadata_matches(metadata: &Metadata, entry: &PullEntry) -> bool {
+    if metadata.len() != entry.size {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.mtime() == entry.mtime
+            && u32::try_from(metadata.mtime_nsec()).unwrap_or(0) == entry.mtime_nsec
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = entry;
+        false
+    }
+}
+
+fn validate_pull_wire_path(path: &[u8]) -> Result<(), RsyncError> {
+    if path == b"." {
+        return Ok(());
+    }
+    validate_wire_path(path)
+}
+
+#[cfg(unix)]
+fn wire_os_string(bytes: &[u8]) -> Result<OsString, RsyncError> {
+    if bytes.contains(&0) {
+        return Err(RsyncError::InvalidPath("NUL in wire path".to_owned()));
+    }
+    Ok(OsString::from_vec(bytes.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn wire_os_string(bytes: &[u8]) -> Result<OsString, RsyncError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| RsyncError::InvalidPath("non-UTF-8 wire path".to_owned()))?;
+    Ok(OsString::from(text))
 }
 
 fn expect_done<R: Read>(
@@ -1009,8 +1803,21 @@ fn scan_source(source: &Path, trailing_slash: bool) -> Result<Vec<WireEntry>, Rs
 /// its name carried a trailing `/`; and entries that share a parent directory
 /// put non-directories ahead of directories.
 fn rsync_name_cmp(left: &WireEntry, right: &WireEntry) -> std::cmp::Ordering {
-    let (left_parent, left_name) = split_wire_name(&left.path);
-    let (right_parent, right_name) = split_wire_name(&right.path);
+    rsync_path_cmp(&left.path, left.kind, &right.path, right.kind)
+}
+
+fn rsync_pull_name_cmp(left: &PullEntry, right: &PullEntry) -> std::cmp::Ordering {
+    rsync_path_cmp(&left.path, left.kind, &right.path, right.kind)
+}
+
+fn rsync_path_cmp(
+    left_path: &[u8],
+    left_kind: WireKind,
+    right_path: &[u8],
+    right_kind: WireKind,
+) -> std::cmp::Ordering {
+    let (left_parent, left_name) = split_wire_name(left_path);
+    let (right_parent, right_name) = split_wire_name(right_path);
     // rsync interns directory names and takes a shortcut when two entries
     // share one, which is what makes the file-before-directory rule apply
     // within a directory but not across directories.
@@ -1018,13 +1825,13 @@ fn rsync_name_cmp(left: &WireEntry, right: &WireEntry) -> std::cmp::Ordering {
     let mut left = NameCursor::new(
         left_parent,
         left_name,
-        left.kind == WireKind::Directory,
+        left_kind == WireKind::Directory,
         shared_parent,
     );
     let mut right = NameCursor::new(
         right_parent,
         right_name,
-        right.kind == WireKind::Directory,
+        right_kind == WireKind::Directory,
         shared_parent,
     );
     loop {
@@ -1296,6 +2103,27 @@ impl<W: Write> Write for MultiplexWriter<'_, W> {
 struct CountingWriter<W> {
     inner: W,
     bytes: u64,
+}
+
+struct CountingReader<R> {
+    inner: R,
+    bytes: u64,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, bytes: 0 }
+    }
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(bytes)?;
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(count).expect("usize fits u64"));
+        Ok(count)
+    }
 }
 
 impl<W> CountingWriter<W> {
@@ -1621,6 +2449,46 @@ fn read_varint_raw<R: Read>(reader: &mut R) -> Result<u32, RsyncError> {
     decode_varint(first[0], |bytes| {
         reader.read_exact(bytes).map_err(RsyncError::Io)
     })
+}
+
+fn read_varlong<R: Read>(
+    reader: &mut MultiplexReader<'_, R>,
+    minimum: usize,
+) -> Result<u64, RsyncError> {
+    if !(1..=8).contains(&minimum) {
+        return Err(RsyncError::Protocol(
+            "invalid varlong minimum width".to_owned(),
+        ));
+    }
+    let first = reader.read_u8()?;
+    let extra = match first {
+        0x00..=0x7f => 0,
+        0x80..=0xbf => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        0xf8..=0xfb => 5,
+        0xfc..=0xfd => 6,
+        0xfe => 7,
+        0xff => 8,
+    };
+    if minimum + extra > 8 {
+        return Err(RsyncError::Protocol(
+            "varlong exceeds 64-bit range".to_owned(),
+        ));
+    }
+    let mut bytes = [0u8; 8];
+    if minimum > 1 {
+        reader.read_data_exact(&mut bytes[..minimum - 1])?;
+    }
+    if extra > 0 {
+        reader.read_data_exact(&mut bytes[minimum - 1..minimum - 1 + extra])?;
+        let bit = 1u8 << (8 - extra);
+        bytes[minimum + extra - 1] = first & (bit - 1);
+    } else {
+        bytes[minimum - 1] = first;
+    }
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn decode_varint<F>(first: u8, mut read_exact: F) -> Result<u32, RsyncError>
