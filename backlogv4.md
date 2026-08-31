@@ -896,12 +896,16 @@ directories always classify as `changed` rather than `unchanged`. Harmless today
 means the mode-repair count under-reports directories on cross-platform runs,
 and any future work that trusts `directories.unchanged` should know.
 
-### 4.20 — Partial failure exits 0
+### 4.20 — Partial failure exits 0 *(already fixed; verified 2026-08-30)*
 
-- [ ] `failed_entries` is counted, shown in the summary line and the JSON
-  `finished` event — and never consulted by `main`'s exit path. A run that
-  failed to read 10,000 of 100,000 files prints "10000 failed" and exits
-  success. Any script or cron job wrapping xsync currently cannot tell.
+- [x] Stale. `main` returns `RunOutcome::Partial` when `report.partial_failure()`
+  is set, which maps to **exit 23** — rsync's partial-transfer convention. A run
+  with one unreadable source file prints `… 1 failed, partial failure` and exits
+  23, while a clean run exits 0.
+
+Filed on a reading of the code that was already out of date. Kept as a closed
+entry rather than deleted, because "the exit code lies" is the sort of claim
+that gets repeated from notes.
 
 **AC**: nonzero exit (distinct from usage=2 and hard-failure=1, in the spirit
 of rsync's 23 "partial transfer") whenever `failed_entries > 0`; documented in
