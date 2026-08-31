@@ -8,6 +8,12 @@ the receiver (4.26) — what is actually slow, and why?**
 
 ---
 
+> **rsync comparisons are not like-for-like unless they measure time-to-durable.**
+> rsync leaves ~2.4 GB of a 4.32 GiB transfer unwritten in the receiver's page
+> cache at exit; xsync leaves ~2.6 MB, because it `sync_data`s each chunk.
+> Transfer time therefore flatters rsync. Measured to durability, xsync is at
+> 113.5 MB/s against rsync's 109.9 (4.64).
+
 > **Read `docs/network-topology.md` before comparing hosts.** Mac and mars
 > share an ethernet switch; freya and orion sit behind a ~800 Mbit/s mesh
 > backhaul. Measured 2026-08-31: switched 904 Mbit/s at 1.0 ms RTT, mesh

@@ -2060,6 +2060,59 @@ a false drift conclusion on top of it. Only interleaved same-session A/Bs with
 per-run verification have survived contact with reality this cycle. 4.21 must
 make both the default.
 
+### 4.64 — The ext4 gap closed itself, and the rsync comparison was never fair
+
+- [x] **Investigated 2026-08-31. No code change needed.** The ext4 push gap
+  (81.9 MB/s against rsync's 112.4) was measured *before* 4.63 landed. With
+  streaming and pipelining both in, ext4 is at the link ceiling.
+
+| corpus | arm | runs | median |
+|---|---|---|---:|
+| 0.98 GiB | rsync -> ext4 | 8.75 / 8.72 / 8.70 | 112.6 MB/s |
+| 0.98 GiB | xsync -> ext4 | 8.79 / 8.75 / 8.78 | 111.8 MB/s |
+| 4.32 GiB | rsync -> ext4 | 38.20 / 37.63 / 37.64 | 114.7 MB/s |
+| 4.32 GiB | xsync -> ext4 | 38.39 / 37.76 / 38.28 | 112.8 MB/s |
+
+The larger corpus was run deliberately: mars has 30 GB of RAM, so a 1 GiB
+transfer lands entirely in page cache and could have hidden a writeback
+problem. It did not -- the result holds at 4.32 GiB. Verified by SHA-256 across
+all 10 files.
+
+**The more important finding is that these two tools were never doing the same
+work.** Dirty pages left on the receiver at process exit:
+
+| arm | dirty at exit |
+|---|---:|
+| rsync | **~2,400,000 kB** (~2.4 GB) |
+| xsync | **~2,600 kB** (~2.6 MB) |
+
+**rsync returns with 2.4 GB of the transfer still unwritten**, sitting in the
+receiver's page cache. xsync's per-chunk `sync_data` has already put it on
+disk. Every wall-clock comparison in this project has therefore been scoring
+xsync against a tool doing strictly less work.
+
+Timing to the point where the data is actually durable -- transfer, then a
+`sync` on the receiver:
+
+| arm | transfer | to durable | sync tail |
+|---|---:|---:|---:|
+| rsync | 37.69 s (114.5 MB/s) | 39.28 s (**109.9 MB/s**) | 1.00-1.58 s |
+| xsync | 37.85 s (114.1 MB/s) | 38.04 s (**113.5 MB/s**) | 0.17-0.76 s |
+
+**On time-to-durable xsync is ahead of rsync**, 113.5 against 109.9 MB/s, and
+its sync tail is 3-8x shorter because there is almost nothing left to flush.
+
+**What this means for the benchmark protocol.** A wall-clock number for a tool
+that leaves gigabytes unflushed is not comparable to one for a tool that does
+not. Future rsync comparisons should either report time-to-durable, or state
+explicitly that they are comparing transfer time only and that the two arms
+carry different guarantees. The `Dirty:` line in `/proc/meminfo` on the
+receiver is the cheap way to check which situation you are in.
+
+This does not make rsync wrong -- deferring writeback is a legitimate choice,
+and it is what makes its transfer-time number look good. It makes the naive
+comparison wrong.
+
 ### 4.63 — Push buffered the whole file before sending a byte
 
 - [x] **Fixed 2026-08-31. Push is now at parity with rsync and at the link
