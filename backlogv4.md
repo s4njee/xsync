@@ -2186,6 +2186,38 @@ setup 4.14 measured. A receiver-side writer pool buys the same overlap inside
 one session, and would also make the streams default a question about the wire
 rather than about the destination's disk.
 
+**A first attempt at the writer pool failed, and why is worth keeping.** A
+`ChunkPool` modelled directly on `ApplyPool` -- bounded queue, workers writing
+off the decode thread, acknowledgement and journal checkpoint moved to
+completion -- deadlocked. It was reverted.
+
+The cause is a coupling the small-file path does not have. The receiver blocks
+reading the next segment; the sender blocks once its window of unacknowledged
+chunks is full. If the receiver lets more writes accumulate than the sender's
+window permits, no acknowledgement is ever emitted and both sides wait forever.
+`ApplyPool` is safe only by accident of scale: the small-file window is
+`MAX_PIPELINED_FRAMES` (2048) against a pool capacity of 64. **The large-file
+window is four chunks**, so a pool of any useful depth is already larger than
+the window.
+
+Constraining outstanding writes to one -- below the smallest sender window --
+was not sufficient either; `test_durable_resume_skips_verified_ranges` still
+hung. The resume path sends a partial chunk list, and the interaction between
+that, the per-chunk `LargeFileRange` acknowledgement, and deferred segment
+acknowledgement was not run to ground.
+
+**So the real constraint on any fix here is:** the receiver cannot safely run
+ahead of the sender's unacknowledged-chunk window, and it has no way to learn
+what that window is -- `XSYNC_LARGE_CHUNKS_IN_FLIGHT` is a sender-side value
+that is never negotiated. Either the window has to be exchanged during the
+handshake, or the acknowledgement has to stop being the flow-control signal for
+chunk writes. That is a protocol decision, and it is why this is filed rather
+than patched.
+
+Note that `--streams` sidesteps the whole problem: each session keeps its own
+window and its own writes, so concurrency across sessions overlaps disk with
+network without any single receiver running ahead of its sender.
+
 **AC**
 
 - Large-file chunk writes overlap the network receive, as 4.26 already does for
