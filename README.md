@@ -16,8 +16,34 @@ directly.
 
 ---
 
+## Please read this first
+
+**This is an instructive project, not production software.** It exists to explore how a
+file synchroniser actually behaves once you measure it, and to be useful to anyone
+building something similar. It is not a replacement for `rsync` and should not be trusted
+with data you cannot afford to lose.
+
+What that means concretely: the wire protocol is deliberately not frozen and has changed
+several times, `Ctrl-C` has no signal handling and can leave staging files behind, and
+`--delete` has a guard but no undo. None of that is oversight; it is a project that has
+prioritised understanding over hardening.
+
+The parts most likely to be worth your time are the ones that were *wrong first*. The
+backlog and benchmark documents record the measurements that failed as carefully as the
+ones that worked -- hypotheses that looked obvious and turned out to be false, numbers
+that had to be retracted, and comparisons that were not measuring what they appeared to
+be. If you take one thing from this repository, take the methodology: alternate your
+arms, anchor on a control, verify exit status and landed file count, and be suspicious of
+any benchmark where the two tools are not doing the same work.
+
+If you want to sync files today, use `rsync`. If you want to know why it is fast, or to
+build something in this space yourself, this may help.
+
+---
+
 ## Table of contents
 
+0. [Please read this first](#please-read-this-first)
 1. [What this project actually is](#1-what-this-project-actually-is)
 2. [Current status, stated honestly](#2-current-status-stated-honestly)
 3. [Installing and building](#3-installing-and-building)
