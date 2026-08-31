@@ -367,6 +367,125 @@ pub fn probe_remote(rsh: Option<&str>, host: &str) -> Result<RsyncPeer, RsyncErr
     parse_version_probe(&output.stdout)
 }
 
+/// Parse `rsync --version` stdout into a peer identity.
+///
+/// Embeddings that already hold a remote exec channel can probe with that
+/// instead of spawning `ssh`.
+///
+/// # Errors
+/// Returns [`RsyncError::UnsupportedPeer`] when the banner is not GNU rsync
+/// or openrsync, or when it does not advertise a protocol version.
+pub fn parse_version_output(stdout: &[u8]) -> Result<RsyncPeer, RsyncError> {
+    parse_version_probe(stdout)
+}
+
+/// `rsync --server` argv for a receiver rooted at `destination`.
+///
+/// Arguments are unquoted; the caller quotes them for the remote shell.
+///
+/// # Errors
+/// Returns [`RsyncError::UnsupportedOption`] when `options` cannot be
+/// expressed on this backend.
+pub fn server_argv(
+    destination: &str,
+    destination_trailing_slash: bool,
+    options: &LocalSyncOptions,
+) -> Result<Vec<Vec<u8>>, RsyncError> {
+    validate_options(options)?;
+    let mut command_args = vec![
+        b"rsync".to_vec(),
+        b"--server".to_vec(),
+        b"-lptrW".to_vec(),
+        b"-e.Cv".to_vec(),
+        b"--dirs".to_vec(),
+        b"--force".to_vec(),
+        b"--no-inc-recursive".to_vec(),
+    ];
+    command_args.extend(
+        options
+            .exclude_patterns
+            .iter()
+            .map(|pattern| format!("--exclude={pattern}").into_bytes()),
+    );
+    if options.dry_run {
+        command_args.push(b"--dry-run".to_vec());
+    }
+    command_args.push(b".".to_vec());
+    let mut destination_arg = destination.as_bytes().to_vec();
+    if destination_trailing_slash && !destination_arg.ends_with(b"/") {
+        destination_arg.push(b'/');
+    }
+    command_args.push(destination_arg);
+    Ok(command_args)
+}
+
+/// Drive the native rsync-wire sender over caller-provided I/O.
+///
+/// Same codec as [`sync_push`], but does not spawn `ssh` or `rsync`. Used by
+/// embeddings that already hold a transport (a russh exec channel, a test
+/// pipe).
+///
+/// # Errors
+/// Returns on source, protocol, or transport failure.
+pub fn sync_push_io<R: Read, W: Write, F: FnMut(LocalEvent)>(
+    source: &Path,
+    source_trailing_slash: bool,
+    options: &LocalSyncOptions,
+    peer: &RsyncPeer,
+    reader: R,
+    writer: W,
+    mut emit: F,
+) -> Result<LocalSyncReport, RsyncError> {
+    validate_options(options)?;
+    validate_peer(peer)?;
+    let entries = apply_excludes(
+        scan_source(source, source_trailing_slash)?,
+        &options.exclude_patterns,
+    )?;
+    let planned_files = entries.iter().filter(|e| e.kind == WireKind::File).count();
+    let planned_bytes = entries
+        .iter()
+        .filter(|e| e.kind == WireKind::File)
+        .map(|e| e.size)
+        .sum();
+
+    emit(LocalEvent::Started {
+        local_workers: 1,
+        streams: 1,
+    });
+    emit(LocalEvent::Planned {
+        files: planned_files,
+        bytes: planned_bytes,
+    });
+    if options.dry_run {
+        for entry in &entries {
+            emit(LocalEvent::Action {
+                path: display_wire_path(&entry.path),
+                action: "create",
+            });
+        }
+    }
+
+    let mut reader = BufReader::new(reader);
+    let mut writer = CountingWriter::new(BufWriter::new(writer));
+    let mut result = run_session(
+        &mut reader,
+        &mut writer,
+        &entries,
+        &mut emit,
+        options.dry_run,
+    );
+    let wire_bytes = writer.bytes;
+    drop(reader);
+    drop(writer);
+    if let Ok(report) = &mut result {
+        report.wire_bytes = wire_bytes;
+    }
+    let report = result?;
+    emit_finished(&report, &mut emit);
+    Ok(report)
+}
+
 /// Push a local source through the native rsync-wire sender.
 ///
 /// # Errors
