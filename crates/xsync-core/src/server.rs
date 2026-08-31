@@ -3452,14 +3452,17 @@ impl Server {
                             self.compression_level,
                         )?;
 
-                        // Wait for client Ack for segment.
-                        let ack_frame = self.decoder.read(reader)?;
-                        if !matches!(ack_frame.message, Message::Ack { .. }) {
-                            return Err(ServerError::UnexpectedMessage(format!(
-                                "expected Ack for segment, got {:?}",
-                                ack_frame.message
-                            )));
-                        }
+                        // No wait for a per-segment acknowledgement here. It
+                        // used to block until the client had written the chunk
+                        // to disk and checkpointed the resume journal, which
+                        // made the source idle for exactly as long as the
+                        // receiver was busy, and prevented the client from
+                        // requesting ahead at all (4.62).
+                        //
+                        // Backpressure is now the client's request window: it
+                        // has at most `large_chunks_in_flight` requests
+                        // outstanding, so no more than that many segments can
+                        // be in flight toward it.
                     }
 
                     let ack = Message::Ack {
@@ -5456,19 +5459,44 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                 let missing =
                     crate::journal::missing_chunks(file.size, 8 * 1024 * 1024, &verified_ranges);
                 let mut sent_bytes = 0u64;
-                for range in missing {
-                    let offset = range.offset;
-                    let length = range.length;
-                    sent_bytes = sent_bytes.saturating_add(length);
-                    let range_msg = Message::LargeFileRange {
-                        file_id,
-                        range: ByteRange { offset, length },
-                    };
-                    let msg_id = alloc_id();
-                    let b = encode_frame(msg_id, &range_msg)?;
-                    writer.write_all(&b)?;
+                // Requests are issued ahead of the responses. This loop used to
+                // be a full round trip per 8 MB -- request, segment, ack,
+                // range-ack -- with the local write and a journal checkpoint
+                // serialized in the middle, so the source idled for exactly as
+                // long as this side was busy and vice versa. Pull ran at
+                // 29.7 MB/s against rsync's 109.9 on the same link; 4.61 fixed
+                // the quadratic re-read behind it, and this removes the
+                // lockstep (4.62).
+                //
+                // The window is the request depth, and it is also the only
+                // backpressure: the peer cannot have more segments in flight
+                // than we have outstanding requests.
+                let window = crate::tuning::large_chunks_in_flight();
+                let ranges: Vec<ByteRange> = missing;
+                let mut issued = 0usize;
+                let mut done = 0usize;
+                while done < ranges.len() {
+                    while issued < ranges.len() && issued - done < window {
+                        let range_msg = Message::LargeFileRange {
+                            file_id,
+                            range: ByteRange {
+                                offset: ranges[issued].offset,
+                                length: ranges[issued].length,
+                            },
+                        };
+                        let msg_id = alloc_id();
+                        let b = encode_frame(msg_id, &range_msg)?;
+                        writer.write_all(&b)?;
+                        issued += 1;
+                    }
                     writer.flush()?;
 
+                    let offset = ranges[done].offset;
+                    let length = ranges[done].length;
+                    sent_bytes = sent_bytes.saturating_add(length);
+
+                    // The peer answers each request with exactly two frames, in
+                    // order: the segment, then the acknowledgement of the range.
                     let seg_frame = decoder
                         .read(&mut reader)
                         .map_err(|e| map_transport_error(e, 0))?;
@@ -5489,21 +5517,14 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                         Ok(data.clone())
                     })?;
 
-                    // Durably checkpoint this verified range before its ack.
+                    // The checkpoint stays per chunk and stays *before* the
+                    // range is counted as done. Pipelining changes when the
+                    // request was issued, never the order of verify, write, and
+                    // durably record -- an interrupted pull must still resume
+                    // from a range that is actually on disk.
                     track.push(ByteRange { offset, length });
                     resume_journal.checkpoint(&identity, &track)?;
 
-                    // Send Ack for segment.
-                    let ack = Message::Ack {
-                        acknowledged_id: seg_frame.message_id,
-                        acknowledged_type: 4,
-                    };
-                    let msg_id = alloc_id();
-                    let b = encode_frame(msg_id, &ack)?;
-                    writer.write_all(&b)?;
-                    writer.flush()?;
-
-                    // Read range Ack.
                     let range_ack = decoder
                         .read(&mut reader)
                         .map_err(|e| map_transport_error(e, 0))?;
@@ -5513,6 +5534,7 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
                             range_ack.message
                         )));
                     }
+                    done += 1;
                     emit(LocalEvent::Progress {
                         path: file.path.to_string(),
                         stream: 0,

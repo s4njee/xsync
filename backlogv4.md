@@ -2060,6 +2060,53 @@ a false drift conclusion on top of it. Only interleaved same-session A/Bs with
 per-run verification have survived contact with reality this cycle. 4.21 must
 make both the default.
 
+### 4.62 — Pull was lockstep on both sides
+
+- [x] **Fixed 2026-08-31.** The pull path spent a full round trip per 8 MB --
+  request, segment, segment-ack, range-ack -- with the receiver's disk write and
+  a resume-journal checkpoint serialized in the middle. The source idled for
+  exactly as long as the receiver was busy, and vice versa.
+
+**This needed a change on both ends, and it is a wire change.** The server used
+to block inside its `LargeFileRange` handler waiting for the client's
+per-segment `Ack` before it would read another frame. Pipelining requests alone
+would therefore have made it reject a `LargeFileRange` where it expected an
+`Ack`. The segment acknowledgement is gone: the server now answers each request
+with exactly two frames, the segment then the range ack, and never waits.
+
+Backpressure is the client's request window -- the peer cannot have more
+segments in flight than the client has outstanding requests -- so removing the
+ack does not remove the bound. Depth comes from the same
+`XSYNC_LARGE_CHUNKS_IN_FLIGHT` as 4.60, and `1` remains an exact control.
+
+**Mixed versions will not interoperate across this change.** An old client
+still sends segment acks that a new server treats as unexpected frames; a new
+client sends none, and an old server waits forever. Both ends must be deployed
+together, which is the case R1.4 in `backlog-release.md` exists to make
+survivable.
+
+| arm | runs (s) | median | throughput |
+|---|---|---:|---:|
+| rsync pull | 8.90 / 8.72 / 8.73 | 8.73 | 112.5 MB/s |
+| xsync `=1` (control) | 13.53 / 14.02 / 13.62 | 13.62 | 72.1 MB/s |
+| xsync `=4` (default) | 11.38 / 11.21 / 10.91 | 11.21 | **87.6 MB/s** |
+
+**1.21x** from pipelining, on top of 4.61's 2.47x. Every arm verified by
+SHA-256 against the source. Depth 8 and 16 add only ~3.6% (89.7 and 91.5 MB/s),
+so the default stays at 4.
+
+**Pull across the whole day: 29.7 -> 88.3 MB/s, 2.97x.** The gap to rsync
+closes from 3.79x to **1.27x**.
+
+**What the remaining 1.27x probably is, and why it needs a decision rather than
+a patch.** Each chunk still performs three durability barriers before the next
+segment is read: `sink.sync_data`, the journal's `sync_all`, and the parent
+directory's `sync_all`. Measured on this Mac those total **~21 ms**, against
+~70 ms of wire time for 8 MB -- which is close to the residual gap. Reducing
+them means checkpointing less often, and that trades resume granularity for
+throughput. It is a product decision about how much re-transfer an interrupted
+pull may cost, not an optimisation, and should be taken deliberately.
+
 ### 4.61 — Pull re-read and re-hashed the whole file for every 8 MB chunk
 
 - [x] **Fixed 2026-08-31.** The server's `LargeFileRange` handler called
