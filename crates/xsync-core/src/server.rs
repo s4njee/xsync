@@ -51,7 +51,8 @@ use crate::scanner::{
 };
 use crate::sink::{Sink, SinkError, SymlinkTargetKind};
 use crate::source::{SourceReadError, SourceReader};
-use crate::strategy::{BATCH_TARGET_SIZE, MAX_BATCH_FILES, SMALL_FILE_LIMIT};
+use crate::strategy::SMALL_FILE_LIMIT;
+use crate::tuning::{apply_worker_count, APPLY_JOBS_PER_WORKER};
 
 /// Emit server lifecycle diagnostics without contaminating the binary
 /// protocol on stdout. Stderr is intentionally safe for SSH diagnostics.
@@ -3089,12 +3090,12 @@ impl Server {
                             self.compression_level,
                         )?;
                         outstanding += 1;
-                        if outstanding >= MAX_PIPELINED_FRAMES {
+                        if outstanding >= crate::tuning::max_pipelined_frames() {
                             drain_acks(
                                 &mut self.decoder,
                                 reader,
                                 &mut outstanding,
-                                MAX_PIPELINED_FRAMES / 2,
+                                crate::tuning::max_pipelined_frames() / 2,
                             )?;
                         }
                     }
@@ -3307,13 +3308,20 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
     result
 }
 
-/// Frames the client may leave unacknowledged before it drains replies.
+/// Default frames the client may leave unacknowledged before it drains replies.
 ///
 /// The receiver acknowledges every frame and blocks once its own writes fill the
 /// socket buffer, so a client that writes without ever reading can deadlock
 /// against it. An acknowledgement frame is 41 bytes, so this window keeps the
-/// peer's pending replies near 10 KiB — comfortably inside an ordinary pipe or
-/// SSH channel buffer — while still removing the per-file round trip.
+/// peer's pending replies near 84 KiB: inside OpenSSH's 2 MiB channel window,
+/// but *above* Linux's default 64 KiB pipe buffer, so the margin here comes
+/// from the SSH transport rather than from a pipe.
+///
+/// This value was derived at a **5.3 ms** in-session round trip, measured over
+/// a USB gigabit adapter, and the window that keeps a pipe full scales with the
+/// bandwidth-delay product. Read it through
+/// [`crate::tuning::max_pipelined_frames`], which allows a sweep to override it
+/// without a rebuild, rather than referring to this constant directly.
 pub const MAX_PIPELINED_FRAMES: usize = 2048;
 
 /// Write buffer for transport streams.
@@ -3354,7 +3362,8 @@ fn plan_small_file_batches(small_files: &[FileEntry]) -> Vec<std::ops::Range<usi
     for (index, file) in small_files.iter().enumerate() {
         let count = index - start;
         if count > 0
-            && (count >= MAX_BATCH_FILES || bytes.saturating_add(file.size) > BATCH_TARGET_SIZE)
+            && (count >= crate::tuning::max_batch_files()
+                || bytes.saturating_add(file.size) > crate::tuning::batch_target_size())
         {
             batches.push(start..index);
             start = index;
@@ -3521,13 +3530,13 @@ fn send_small_files_batched<R: Read, W: Write, F: FnMut(LocalEvent)>(
                     write_data_frame_buffered(writer, msg_id, &seg_msg, compress, level)?;
                 report.wire_bytes = report.wire_bytes.saturating_add(wire_bytes as u64);
                 outstanding += 1;
-                if outstanding >= MAX_PIPELINED_FRAMES {
+                if outstanding >= crate::tuning::max_pipelined_frames() {
                     writer.flush()?;
                     drain_acks(
                         decoder,
                         reader,
                         &mut outstanding,
-                        MAX_PIPELINED_FRAMES * 3 / 4,
+                        crate::tuning::max_pipelined_frames() * 3 / 4,
                     )?;
                 }
             }
@@ -3937,13 +3946,13 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             let b = encode_frame(msg_id, &meta_msg)?;
             writer.write_all(&b)?;
             pending += 1;
-            if pending >= MAX_PIPELINED_FRAMES {
+            if pending >= crate::tuning::max_pipelined_frames() {
                 writer.flush()?;
                 drain_acks(
                     &mut decoder,
                     &mut reader,
                     &mut pending,
-                    MAX_PIPELINED_FRAMES / 2,
+                    crate::tuning::max_pipelined_frames() / 2,
                 )?;
             }
         }
@@ -3976,13 +3985,13 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             let b = encode_frame(msg_id, &meta_msg)?;
             writer.write_all(&b)?;
             pending += 1;
-            if pending >= MAX_PIPELINED_FRAMES {
+            if pending >= crate::tuning::max_pipelined_frames() {
                 writer.flush()?;
                 drain_acks(
                     &mut decoder,
                     &mut reader,
                     &mut pending,
-                    MAX_PIPELINED_FRAMES / 2,
+                    crate::tuning::max_pipelined_frames() / 2,
                 )?;
             }
         }
@@ -4341,13 +4350,13 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
             let b = encode_frame(msg_id, &meta_msg)?;
             writer.write_all(&b)?;
             pending += 1;
-            if pending >= MAX_PIPELINED_FRAMES {
+            if pending >= crate::tuning::max_pipelined_frames() {
                 writer.flush()?;
                 drain_acks(
                     &mut decoder,
                     &mut reader,
                     &mut pending,
-                    MAX_PIPELINED_FRAMES / 2,
+                    crate::tuning::max_pipelined_frames() / 2,
                 )?;
             }
         }
@@ -4892,9 +4901,10 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
             let mut batch: Vec<&FileEntry> = Vec::new();
             let mut batch_bytes = 0u64;
             while cursor < small_files.len()
-                && batch.len() < MAX_BATCH_FILES
+                && batch.len() < crate::tuning::max_batch_files()
                 && (batch.is_empty()
-                    || batch_bytes.saturating_add(small_files[cursor].size) <= BATCH_TARGET_SIZE)
+                    || batch_bytes.saturating_add(small_files[cursor].size)
+                        <= crate::tuning::batch_target_size())
             {
                 batch_bytes = batch_bytes.saturating_add(small_files[cursor].size);
                 batch.push(small_files[cursor]);
@@ -5426,9 +5436,14 @@ fn send_metadata_repairs<R: Read, W: Write>(
         let id = next_id();
         writer.write_all(&encode_frame(id, &message)?)?;
         pending += 1;
-        if pending >= MAX_PIPELINED_FRAMES {
+        if pending >= crate::tuning::max_pipelined_frames() {
             writer.flush()?;
-            drain_acks(decoder, reader, &mut pending, MAX_PIPELINED_FRAMES / 2)?;
+            drain_acks(
+                decoder,
+                reader,
+                &mut pending,
+                crate::tuning::max_pipelined_frames() / 2,
+            )?;
         }
     }
     writer.flush()?;
@@ -6071,13 +6086,13 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             )?;
             cwriter.write_all(&bytes)?;
             pending += 1;
-            if pending >= MAX_PIPELINED_FRAMES {
+            if pending >= crate::tuning::max_pipelined_frames() {
                 cwriter.flush()?;
                 drain_acks(
                     &mut cdec,
                     &mut creader,
                     &mut pending,
-                    MAX_PIPELINED_FRAMES / 2,
+                    crate::tuning::max_pipelined_frames() / 2,
                 )?;
             }
         }
@@ -6105,13 +6120,13 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             )?;
             cwriter.write_all(&bytes)?;
             pending += 1;
-            if pending >= MAX_PIPELINED_FRAMES {
+            if pending >= crate::tuning::max_pipelined_frames() {
                 cwriter.flush()?;
                 drain_acks(
                     &mut cdec,
                     &mut creader,
                     &mut pending,
-                    MAX_PIPELINED_FRAMES / 2,
+                    crate::tuning::max_pipelined_frames() / 2,
                 )?;
             }
         }
@@ -6418,13 +6433,13 @@ pub fn sync_push_server_streams<F: FnMut(LocalEvent)>(
             )?;
             cwriter.write_all(&bytes)?;
             meta_pending += 1;
-            if meta_pending >= MAX_PIPELINED_FRAMES {
+            if meta_pending >= crate::tuning::max_pipelined_frames() {
                 cwriter.flush()?;
                 drain_acks(
                     &mut cdec,
                     &mut creader,
                     &mut meta_pending,
-                    MAX_PIPELINED_FRAMES / 2,
+                    crate::tuning::max_pipelined_frames() / 2,
                 )?;
             }
         }
@@ -7406,24 +7421,6 @@ impl Drop for ConnectionPermit {
     }
 }
 
-/// How many threads publish received small files.
-///
-/// The receive loop must stay single-threaded — it decodes an ordered stream —
-/// but publishing a file (write temp, verify, set metadata, rename) is
-/// independent per file and was the serialized half of the transfer. Before
-/// this, a Raspberry Pi 5 received within 7% of a 7950X, which is what a
-/// one-thread apply path looks like.
-fn apply_worker_count() -> usize {
-    if let Ok(value) = std::env::var("XSYNC_APPLY_WORKERS") {
-        if let Ok(parsed) = value.parse::<usize>() {
-            return parsed.max(1);
-        }
-    }
-    std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
-        .min(8)
-}
-
 /// One received small file, ready to publish.
 struct ApplyJob {
     message_id: u64,
@@ -7469,7 +7466,7 @@ impl ApplyPool {
             done: done_rx,
             handles,
             in_flight: 0,
-            capacity: workers * 8,
+            capacity: workers * APPLY_JOBS_PER_WORKER,
         }
     }
 

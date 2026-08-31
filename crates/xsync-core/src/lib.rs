@@ -33,6 +33,7 @@ pub mod source;
 pub mod sparse;
 pub mod strategy;
 pub mod transport;
+pub mod tuning;
 
 /// The version of the xsync wire protocol. Bumped on any incompatible change;
 /// `--server` peers reject a mismatch (see plan.md Story 3.1).
