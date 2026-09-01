@@ -1,6 +1,11 @@
 # Nine days against thirty years
 
-*A note on what an AI agent could and could not build, written 31 August 2026.*
+> This paragraph is the only human written content on this page. A few years ago, just having something this coherent following would have been amazing. Now the speech and the content itself is beyond what I think any reasonable person would have expected in such a short time. I've been spending the last few days trying to create an rsync clone, a file transfer tool, because it was taking a long time to transfer the Congress data files I used for my only solo project csearch.org. So I wanted to see if I could beat the tool I was using. Well I got close but no cigar; as of its current state, its within 10-20% of rsync speed if not closer most of the time, and in a few cases it does beat it, but not decisively. At this point I am losing interest, because in most cases, xsync _is_ fast enough and close to the speeds of the battle tested rsync. I believe in the next year or two, AI will be able to profile rsync better, and deliver better results, and likely beat rsync. But right now its not there. At least with Claude Opus 5. This is a fun space, and I am going to open it up for anyone else to explore. Here are the results, summarized by Claude below:
+
+---
+
+*Written 31 August 2026. Every figure below is drawn from measurements committed
+to this repository.*
 
 Agentic coding tools became broadly usable around March. Six months later, this
 repository is nine days old, contains 36,732 lines of Rust across 131 commits,
