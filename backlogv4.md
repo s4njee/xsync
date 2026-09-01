@@ -2737,7 +2737,153 @@ with different constants, which is exactly the mixed-version case R1.4 in
 capacity were exchanged during negotiation, this would be a checkable
 invariant rather than a maintained coincidence.
 
+## Phase 13 — The 10 GbE campaign (blocked on hardware)
+
+The hardware on order: an **Intel X540-T2** PCIe NIC for mars and a **USB 3.2
+RTL8159 USB-C 10GbE adapter** for the Mac, direct-cabled (~10 ft, so cable
+category is a non-issue). The onboard 1 GbE NICs stay connected on both hosts,
+which is what makes every experiment below a link-vs-link A/B with host, OS,
+build, and corpus held constant. Endpoints: Mac ↔ mars, then WSL2 and possibly
+native Windows on the same silicon.
+
+Project is tabled until the hardware arrives; these stories are the plan for
+when it does. They supersede 4.50's 2.5 GbE plan.
+
+### 4.68 — Bring the link up, and prove it before believing it
+
+- [ ] Nothing is measured until the link itself is characterized. Four traps
+  are already known and each one silently produces plausible wrong numbers:
+
+1. **The X540 has no NBASE-T rungs.** It negotiates 100M / 1G / 10G only. A
+   marginal cable, port, or driver does not degrade gracefully — it drops to
+   1 GbE and every "10 GbE" measurement quietly re-measures the old ceiling.
+2. **The Mac adapter needs a driver.** macOS ships no Realtek 10GbE driver;
+   RTL8159 support likely means a vendor kext, which on Apple Silicon means
+   reduced-security mode. Confirm before the card is even installed in mars.
+3. **The adapter, not the wire, may be the ceiling.** USB 3.2 Gen 2 is 10 Gbit/s
+   raw; real USB NICs typically deliver 3–6 Gbit/s after protocol overhead.
+   Whatever `dd | ssh cat` and raw TCP say the path can do *is* the ceiling —
+   xsync is measured against that, never against the nominal 10 Gbit/s.
+4. **The X540 is PCIe 2.1 x8.** In an electrically x4 slot it caps below
+   10 Gbit/s. Check `lspci` link width the way orion's Gen2 default was caught.
+
+**AC**
+- Direct link on its **own subnet** (e.g. 10.10.0.0/24) — never more addresses
+  on 192.168.1.0/24, or the mDNS/dual-home ambiguity that already bit with
+  mars's WiFi returns with higher stakes. The bench harness guard is extended to
+  abort unless `$SSH_CONNECTION` shows the 10 GbE subnet.
+- Negotiated speed verified **on both ends, every session**, scripted into the
+  harness preamble, not checked once and assumed.
+- MTU decision recorded either way (9000 requires both ends *and* the RTL8159
+  driver to agree; a mismatch blackholes).
+- Link characterized before any xsync run: raw TCP, `dd | ssh cat`, and
+  single-stream vs multi-stream iperf3 if available, three reps each. These
+  numbers are the denominators for everything in 4.70.
+- `docs/network-topology.md` updated with the new link (the doc is also still
+  holding the router1-vs-router3 orion correction).
+
+### 4.69 — Re-baseline both links in one session
+
+- [ ] The whole point of keeping the 1 GbE NICs connected: measure the same
+  cell over both links back-to-back, same build, same session, rsync as the
+  anchor arm in every cell. This is the cleanest experiment the estate has ever
+  supported — the link is the *only* variable.
+
+Cells, in priority order (all Mac ↔ mars, both directions where marked):
+
+| corpus | why | prediction to test |
+|---|---|---|
+| large1gb, push + pull | link-bound at 1 GbE | should scale toward the 4.68 ceiling; whatever it stalls at is 4.70's subject |
+| manga (3.75 GiB) | longer run, drowns session setup | same, with tighter error bars |
+| congress-100k | **not** link-bound (20 MB/s at 1 GbE) | should barely move; if it does move, that is a finding about latency, not bandwidth |
+| a single ~4 GiB file | isolates one-file chunk pipeline from file dispatch | exposes the chunk window directly |
+
+**AC**
+- Time-to-durable and receiver dirty bytes recorded per run (4.64's lesson —
+  rsync defers gigabytes of writeback on Linux receivers; at 10 GbE the
+  deferred fraction grows).
+- Warmup discarded, three reps, alternating arms, exit + landed-count verified
+  — the standing discipline, no exceptions because the link is exciting.
+- mars's NVMe sequential write measured the same day (the orion Gen2/Gen3
+  lesson: the receiver's disk quietly bounds everything; mars must sustain
+  >1.2 GB/s or the "10 GbE" campaign is actually a disk campaign).
+
+### 4.70 — Find the first new ceiling, and name it
+
+- [ ] At 1 GbE the wire bound first and hid everything behind it. At 3–6+
+  Gbit/s something else binds first, and the campaign's real product is a
+  table naming it. Candidates, with what already exists on each:
+
+| candidate | prior state |
+|---|---|
+| **single-stream OpenSSH** | never measured — every prior "SSH ceiling" was link-limited at ~113 MB/s. Odds-on favourite. |
+| the USB adapter | measured in 4.68; if it binds, the table says so and the software is exonerated |
+| receiver write path | mars hid it at 1 GbE because NVMe ≫ wire; at 6 Gbit/s the margin shrinks to ~2x |
+| sender read+hash | BLAKE3 and the streaming read (4.63) — measure single-core hash throughput on the M1 Max before blaming it |
+| per-chunk protocol cost | 4.60/4.62 removed the fixed stalls; whatever residue remains scales up in share as wire time shrinks |
+
+**AC**
+- Per-endpoint CPU sampled during every arm (the 4.66 lesson: idle-vs-busy
+  distinguished serialization from work in one measurement).
+- A bottleneck table by corpus and direction, each row naming the binding
+  resource with its evidence.
+- **Only after** that table: re-open the questions gated on it — SSH cipher
+  selection (4.17 declined it *because the link bound first*; that verdict
+  expires the moment SSH binds), multiplexed streams, hash parallelism (4.28),
+  and Phase 12's QUIC/TLS question. None of these may be re-opened by
+  speculation; each needs its row in the table.
+
+### 4.71 — Re-derive every tuning knee on the new link
+
+- [ ] Every pacing constant was derived at ~1 GbE, several against a 5.3 ms
+  RTT that was probably an artifact of the old USB dongle (the switched path
+  measures ~1 ms). All are now env-overridable, so each sweep is a loop, not a
+  rebuild — this was the entire point of `tuning.rs`.
+
+| knob | derived at | re-derive because |
+|---|---|---|
+| `XSYNC_PIPELINE_FRAMES` (2048) | 5.3 ms RTT, 1 GbE | BDP changes ~6x; knee may move either way |
+| `XSYNC_LARGE_CHUNKS_IN_FLIGHT` (4 = 32 MB) | depth 4 ≡ 16 at 1 GbE | at 6 Gbit/s a chunk crosses in ~11 ms; window may need depth |
+| `XSYNC_CHECKPOINT_CHUNKS` (8) | diminishing returns past 8 | flush cost is fixed while wire time shrinks; its *share* grows |
+| `XSYNC_BATCH_BYTES` / `XSYNC_BATCH_FILES` | never mattered at 1 GbE | small-file path may finally see the wire |
+| 8 MB chunk size itself | compile-time | if per-chunk residue binds in 4.70, chunk size is the lever — currently needs a rebuild, and both ends must agree on nothing (it is sender-local) — confirm that before sweeping |
+
+**AC**: one sweep per knob on the 10 GbE path with rsync anchored, defaults
+changed only where the gain reproduces across two corpora, and the 1 GbE
+defaults preserved if the knees differ — which raises (and this story should
+answer) whether defaults need to become link-aware.
+
+### 4.72 — Windows and WSL2 on the fast link
+
+- [ ] mars dual-boots Windows on the same silicon, and the X540 is visible to
+  both OSes — the same-hardware OS comparison from BENCHMARKSv3, now with the
+  wire no longer flattening everything.
+
+Known constraints to design around:
+- **Scheduling**: Windows and Linux mars are mutually exclusive. Run the full
+  Linux campaign (4.69–4.71) first; a reboot destroys the Linux control.
+- **WSL2 networking**: default NAT through the Hyper-V virtual switch has its
+  own throughput ceiling that may bind below the adapter. Measure raw TCP
+  Mac→WSL2 first; consider `.wslconfig` mirrored networking mode if NAT binds.
+  The WSL keepalive requirement and silent-failure mode are already documented
+  — re-verify on the new link.
+- **Windows receiver**: Defender measured 1.22x at 1 GbE (~23% of the then-gap);
+  at 6 Gbit/s the per-byte scan cost stops hiding behind the wire. Measure
+  Defender-on as the primary condition, exclusion as the control — exclusions
+  are an operator action, not a harness action.
+- **`--streams` was harmful on Windows at 1 GbE** (1.44–1.53x slower). Re-test
+  before assuming that still holds when the wire is 6x wider.
+
+**AC**: the 3-way same-silicon table (native Linux / WSL2 / Windows) as
+receiver and as sender, each cell carrying the raw-TCP ceiling measured through
+the same OS path, so the OS penalty is separated from the OS's own network
+stack ceiling.
+
 ### 4.50 — A 2.5 GbE point-to-point link, and what it is for
+
+> **Superseded by Phase 13 (4.68–4.72).** The hardware decision changed: 10 GbE
+> (X540-T2 + USB RTL8159), not 2.5 GbE. Kept for the survey and the latency
+> analysis, which still hold; the plan itself is replaced.
 
 - [ ] Every cross-host number in this project was taken over a 1 GbE link
   reached through a **USB dongle on the Mac**, and nothing currently gets near
