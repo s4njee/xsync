@@ -1,0 +1,36 @@
+{"host": "mars", "corpus": "manga", "arm": "rsync -az", "rep": 1, "seconds": 37.5, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 102.4, "ok": true, "error": ""}
+{"host": "mars", "corpus": "manga", "arm": "xs --streams 4", "rep": 1, "seconds": 36.6, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 104.9, "ok": true, "error": ""}
+{"host": "mars", "corpus": "congress", "arm": "rsync -az", "rep": 1, "seconds": 189.43, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 55.3, "ok": true, "error": ""}
+{"host": "mars", "corpus": "congress", "arm": "xs --streams 4", "rep": 1, "seconds": 102.09, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 102.6, "ok": true, "error": ""}
+{"host": "mars", "corpus": "cb7", "arm": "rsync -az", "rep": 1, "seconds": 269.93, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 221.0, "ok": true, "error": ""}
+{"host": "mars", "corpus": "cb7", "arm": "xs --streams 4", "rep": 1, "seconds": 201.34, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 296.3, "ok": true, "error": ""}
+{"host": "freya", "corpus": "manga", "arm": "rsync -az", "rep": 1, "seconds": 57.8, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 66.4, "ok": true, "error": ""}
+{"host": "freya", "corpus": "manga", "arm": "xs --streams 4", "rep": 1, "seconds": 50.15, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 76.6, "ok": true, "error": ""}
+{"host": "freya", "corpus": "congress", "arm": "rsync -az", "rep": 1, "seconds": 204.9, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 51.1, "ok": true, "error": ""}
+{"host": "freya", "corpus": "congress", "arm": "xs --streams 4", "rep": 1, "seconds": 105.77, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 99.0, "ok": true, "error": ""}
+{"host": "freya", "corpus": "cb7", "arm": "rsync -az", "rep": 1, "seconds": 264.17, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 225.8, "ok": true, "error": ""}
+{"host": "freya", "corpus": "cb7", "arm": "xs --streams 4", "rep": 1, "seconds": 227.27, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 262.5, "ok": true, "error": ""}
+{"host": "orion", "corpus": "manga", "arm": "rsync -az", "rep": 1, "seconds": 98.66, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 38.9, "ok": true, "error": ""}
+{"host": "orion", "corpus": "manga", "arm": "xs --streams 4", "rep": 1, "seconds": 36.98, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 103.8, "ok": true, "error": ""}
+{"host": "orion", "corpus": "congress", "arm": "rsync -az", "rep": 1, "seconds": 326.06, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 32.1, "ok": true, "error": ""}
+{"host": "orion", "corpus": "congress", "arm": "xs --streams 4", "rep": 1, "seconds": 148.66, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 70.5, "ok": true, "error": ""}
+{"host": "orion", "corpus": "cb7", "arm": "rsync -az", "rep": 1, "seconds": 1681.26, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 35.5, "ok": true, "error": ""}
+{"host": "orion", "corpus": "cb7", "arm": "xs --streams 4", "rep": 1, "seconds": 214.48, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 278.1, "ok": true, "error": ""}
+{"host": "mars", "corpus": "manga", "arm": "rsync -az", "rep": 2, "seconds": 36.19, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 106.1, "ok": true, "error": ""}
+{"host": "mars", "corpus": "manga", "arm": "xs --streams 4", "rep": 2, "seconds": 36.37, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 105.6, "ok": true, "error": ""}
+{"host": "mars", "corpus": "congress", "arm": "rsync -az", "rep": 2, "seconds": 188.08, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 55.7, "ok": true, "error": ""}
+{"host": "mars", "corpus": "congress", "arm": "xs --streams 4", "rep": 2, "seconds": 94.28, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 111.1, "ok": true, "error": ""}
+{"host": "mars", "corpus": "cb7", "arm": "rsync -az", "rep": 2, "seconds": 246.89, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 241.6, "ok": true, "error": ""}
+{"host": "mars", "corpus": "cb7", "arm": "xs --streams 4", "rep": 2, "seconds": 198.89, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 299.9, "ok": true, "error": ""}
+{"host": "freya", "corpus": "manga", "arm": "rsync -az", "rep": 2, "seconds": 51.03, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 75.2, "ok": true, "error": ""}
+{"host": "freya", "corpus": "manga", "arm": "xs --streams 4", "rep": 2, "seconds": 47.43, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 81.0, "ok": true, "error": ""}
+{"host": "freya", "corpus": "congress", "arm": "rsync -az", "rep": 2, "seconds": 192.99, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 54.3, "ok": true, "error": ""}
+{"host": "freya", "corpus": "congress", "arm": "xs --streams 4", "rep": 2, "seconds": 104.49, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 100.3, "ok": true, "error": ""}
+{"host": "freya", "corpus": "cb7", "arm": "rsync -az", "rep": 2, "seconds": 255.45, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 233.5, "ok": true, "error": ""}
+{"host": "freya", "corpus": "cb7", "arm": "xs --streams 4", "rep": 2, "seconds": 220.53, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 270.5, "ok": true, "error": ""}
+{"host": "orion", "corpus": "manga", "arm": "rsync -az", "rep": 2, "seconds": 92.84, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 41.4, "ok": true, "error": ""}
+{"host": "orion", "corpus": "manga", "arm": "xs --streams 4", "rep": 2, "seconds": 36.62, "rc": 0, "files": 56, "expect": 56, "gib": 3.75, "mib_s": 104.9, "ok": true, "error": ""}
+{"host": "orion", "corpus": "congress", "arm": "rsync -az", "rep": 2, "seconds": 323.44, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 32.4, "ok": true, "error": ""}
+{"host": "orion", "corpus": "congress", "arm": "xs --streams 4", "rep": 2, "seconds": 147.39, "rc": 0, "files": 1318771, "expect": 1318771, "gib": 10.23, "mib_s": 71.1, "ok": true, "error": ""}
+{"host": "orion", "corpus": "cb7", "arm": "rsync -az", "rep": 2, "seconds": 1676.18, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 35.6, "ok": true, "error": ""}
+{"host": "orion", "corpus": "cb7", "arm": "xs --streams 4", "rep": 2, "seconds": 220.6, "rc": 0, "files": 204577, "expect": 204577, "gib": 58.25, "mib_s": 270.4, "ok": true, "error": ""}
