@@ -356,26 +356,24 @@ fn publish_file(stage: &Path, destination: &Path) -> Result<(), CloneError> {
     }
 }
 
-/// Whether the destination filesystem can reflink, probed once per run.
+/// Probe whether a file can be cloned **from `source_probe` into
+/// `destination_root`**.
 ///
-/// A clone attempt is expensive: it stages a file, shells out, and on failure
-/// unwinds. On a filesystem without reflink support every attempt is doomed, and
-/// measured on ext4 that machinery cost **65.8% of total wall time** — 0.572 s
-/// against 0.196 s with clones disabled, for a corpus rsync copies in 0.323 s.
-/// One probe removes the whole class.
+/// The probe clones a real source file because that is the operation the
+/// caller is about to perform. It only ever reads `source_probe`.
 ///
-/// The probe uses the same mechanism as the real clone, so it cannot disagree
-/// with it. A failure to create the probe files is reported as "unsupported",
-/// which only costs the fast path, never correctness.
+/// An earlier version created a file inside the destination and cloned it to a
+/// second file in the destination. That answers a different question: it
+/// reports success on any reflink-capable filesystem even when the source sits
+/// on another device, where every real clone then fails with `EXDEV`. A
+/// cross-device copy onto XFS therefore ran `cp -a --reflink=always` over the
+/// whole tree, failed once per file, tore the staged tree back down, and only
+/// then started the ordinary copy -- pure overhead proportional to file count.
 #[must_use]
-pub fn supports_reflink(destination_root: &Path) -> bool {
-    let source = destination_root.join(".xsync.tmp.reflink-probe");
+pub fn supports_reflink(source_probe: &Path, destination_root: &Path) -> bool {
     let target = destination_root.join(".xsync.tmp.reflink-probe-clone");
-    let _ = fs::remove_file(&source);
     let _ = fs::remove_file(&target);
-    let supported =
-        fs::write(&source, b"x").is_ok() && platform_clone_file(&source, &target).is_ok();
-    let _ = fs::remove_file(&source);
+    let supported = platform_clone_file(source_probe, &target).is_ok();
     let _ = fs::remove_file(&target);
     supported
 }
@@ -684,5 +682,37 @@ mod tests {
                 .is_none()
         );
         assert!(target.is_dir());
+    }
+
+    #[test]
+    fn reflink_probe_reads_the_source_and_leaves_the_destination_clean() {
+        let source_root = tempdir().unwrap();
+        let destination_root = tempdir().unwrap();
+        let source = source_root.path().join("probe.bin");
+        fs::write(&source, b"probe contents").unwrap();
+
+        // Whether the clone succeeds depends on the filesystem under the temp
+        // dirs, and both answers are legitimate. What must hold either way is
+        // that probing never mutates the source and never leaves a stray file
+        // in the destination for the scan to trip over.
+        let _ = supports_reflink(&source, destination_root.path());
+
+        assert_eq!(fs::read(&source).unwrap(), b"probe contents");
+        let residue: Vec<_> = fs::read_dir(destination_root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(residue.is_empty(), "probe left {residue:?} behind");
+    }
+
+    #[test]
+    fn reflink_probe_reports_unsupported_for_a_missing_source() {
+        let destination_root = tempdir().unwrap();
+        let missing = destination_root.path().join("absent.bin");
+
+        // The old probe synthesised its own source inside the destination, so
+        // it could never reach this case; it answered "supported" wherever the
+        // destination filesystem could reflink, regardless of the source.
+        assert!(!supports_reflink(&missing, destination_root.path()));
     }
 }

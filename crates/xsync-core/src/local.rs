@@ -655,9 +655,13 @@ where
             name: "transfer",
             started: true,
         });
-        // Probe the destination once. Without reflink support every clone
-        // attempt is doomed, and the attempts themselves dominate the run.
-        let reflink = options.directory_clones && clone::supports_reflink(destination_sink.root());
+        // Probe once, with a real source file. Without reflink support every
+        // clone attempt is doomed, and the attempts themselves dominate the
+        // run -- which is also true when the source is simply on a different
+        // device from the destination, so the probe has to involve the source.
+        let reflink = options.directory_clones
+            && reflink_probe_source(&source_reader_root, &source_by_destination, &plan)
+                .is_some_and(|probe| clone::supports_reflink(&probe, destination_sink.root()));
         if reflink && options.cloud_files == CloudFilesPolicy::Download {
             apply_directory_clones(
                 &source_reader_root,
@@ -771,6 +775,25 @@ where
 /// destination. A directory clone is attempted only for entries classified as
 /// new, so a partially-present or changed subtree stays on the normal planned
 /// path and retains per-entry correctness checks.
+/// Pick one real source file to probe cloning with.
+///
+/// The probe must use a file the caller would actually clone: a file
+/// synthesised inside the destination cannot reveal that the source is on
+/// another device, where every clone fails with `EXDEV`. Returning `None`
+/// disables the clone path, which is the correct answer when there is no file
+/// to clone.
+fn reflink_probe_source(source_root: &Path, paths: &SourcePathMap, plan: &Plan) -> Option<PathBuf> {
+    plan.files
+        .new
+        .iter()
+        .chain(&plan.files.changed)
+        .find_map(|entry| {
+            let relative = paths.source_for_destination.get(&entry.path)?;
+            let path = relative.to_native_path(source_root);
+            path.is_file().then_some(path)
+        })
+}
+
 fn apply_directory_clones(
     source_root: &Path,
     sink: &Sink,
