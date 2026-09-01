@@ -2060,6 +2060,71 @@ a false drift conclusion on top of it. Only interleaved same-session A/Bs with
 per-run verification have survived contact with reality this cycle. 4.21 must
 make both the default.
 
+### 4.67 — R1 does not work, and the reason is not in the software
+
+- [ ] **A writer thread was implemented three ways and none of them moved the
+  number.** The disk write is provably on the critical path, yet taking it off
+  the critical path changes nothing. That contradiction is the finding.
+
+**What was tried** (orion receiver, `large1gb`, measured to durability against
+rsync's 8.4 s):
+
+| attempt | result |
+|---|---:|
+| baseline, write inline | 9.62-9.79 s |
+| writer thread, queue = sender window | 9.82-10.37 s |
+| writer thread, queue depth 2 / 8 / 16 / 32 | 9.83-10.08 s, flat |
+| writer thread, **no per-chunk `fsync` at all** | 9.83-10.29 s |
+| destination on tmpfs (control) | **8.54 s** |
+
+Every threaded variant is marginally *worse* than writing inline. Queue depth
+does nothing across a 16x range. Removing `fsync` from the writer entirely does
+nothing. Yet putting the destination in RAM recovers almost all of it.
+
+**Two design corrections were made along the way and both are worth keeping.**
+Acknowledgement must not wait on the disk -- tying the two deadlocked twice,
+because the receive loop blocks reading while the sender blocks on a full
+window. An ack now means "received and verified", with durability carried by
+the journal, which is what a resume actually consults. And the writer must be
+drained *before* `large_files.remove()` in the `LargeFileFinish` handler:
+retiring a chunk needs that entry to attribute its range, and removing it first
+made every in-flight range vanish silently, surfacing as "incomplete byte
+coverage".
+
+**What has now been eliminated as the mechanism**, each by measurement:
+
+| candidate | evidence |
+|---|---|
+| fsync cadence | 1 / 8 / 0 chunks all identical; ext4 `data=ordered` flushes every 5 s regardless |
+| the write being on the receive loop | three writer-thread designs, no change |
+| write pattern | sparse-and-reopen matched sequential append |
+| receiver CPU | **14% busy across 4 cores** |
+| receiver memory | 12.2 MB median against rsync's 10.7; **247 MB against 262 MB at 1.3M files** |
+| sender platform | mars→orion 0.864, Mac→orion 0.868 |
+| per-file cost | file count x329,693 moves the gap not at all |
+| `sync_file_range` | 0.7%, inside noise |
+
+**What is established:** the gap is `bytes ÷ disk write speed`, to within 2-11%
+across a 15x range in corpus size and on two devices differing 2.25x in speed.
+
+**The hypothesis that survives is hardware, not software.** On a Pi 5 both the
+NVMe and the ethernet reach the SoC through the same RP1/PCIe fabric. If disk
+writes and network receive contend for that shared path, then the cost is
+proportional to bytes written, cannot be hidden by threading, disappears when
+the destination is RAM, and scales with device speed — which is every
+observation above, including the ones that defeated R1.
+
+**Next experiment, and it is cheap:** run the receiver with the destination on
+the *USB* NVMe while the network is saturated, and compare against the internal
+NVMe at matched write speed. If the contention is fabric-wide the two behave the
+same; if it is per-device they diverge. Also worth measuring `iostat`/PCIe
+counters on orion during a transfer, and repeating the whole comparison with a
+non-Pi Linux receiver — mars as receiver already shows no such gap, which is
+consistent with the hypothesis and is currently the strongest evidence for it.
+
+**Do not attempt another writer-pool variant before that question is answered.**
+Three have now failed for reasons no amount of queue tuning addressed.
+
 ### 4.66 — The receiver writes large-file chunks inline, and slow storage pays for it
 
 - [ ] On a Raspberry Pi 5 receiver, large-file push runs at **83.4 MB/s against
