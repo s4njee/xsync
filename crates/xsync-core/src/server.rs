@@ -2699,6 +2699,10 @@ impl Server {
         let mut large_files: HashMap<u64, FileEntry> = HashMap::new();
         // Verified large-file ranges per file_id, for durable checkpointing.
         let mut large_ranges: HashMap<u64, Vec<ByteRange>> = HashMap::new();
+        // Chunks written but not yet flushed, per file. The journal may lag the
+        // in-memory track; memory is lost in a crash, so that is correct while
+        // a flush always precedes the checkpoint recording those ranges.
+        let mut unsynced: HashMap<u64, usize> = HashMap::new();
 
         // Process incoming transfer operations.
         loop {
@@ -2934,30 +2938,55 @@ impl Server {
                     } else if let Some(file_entry) = large_files.get(&file_id) {
                         let hash = blake3::Hash::from_bytes(digest);
                         let length = data.len() as u64;
-                        sink.write_chunk_with_retry(
-                            file_entry,
-                            offset,
-                            length,
-                            &hash,
-                            |_attempt| Ok(data.clone()),
-                        )?;
+                        // Flush cadence is `receiver_flush_chunks()`: 1 keeps
+                        // today's per-chunk behaviour, N flushes every N, and 0
+                        // defers everything to `LargeFileFinish`. The ordering
+                        // invariant never changes -- a range is journalled only
+                        // after the bytes are flushed -- so a wider cadence
+                        // trades resume granularity, never correctness (4.66).
+                        let cadence = crate::tuning::receiver_flush_chunks();
+                        if cadence == 1 {
+                            sink.write_chunk_with_retry(
+                                file_entry,
+                                offset,
+                                length,
+                                &hash,
+                                |_attempt| Ok(data.clone()),
+                            )?;
+                        } else {
+                            sink.write_chunk_deferred(
+                                file_entry,
+                                offset,
+                                length,
+                                &hash,
+                                |_attempt| Ok(data.clone()),
+                            )?;
+                        }
 
-                        // Durably checkpoint this verified range before the ack
-                        // that makes it "durably acknowledged".
                         let range = ByteRange { offset, length };
                         let track = large_ranges
                             .get_mut(&file_id)
                             .expect("large file range tracker is initialized");
                         track.push(range);
-                        let journal = self
-                            .journal
-                            .as_ref()
-                            .expect("journal is initialized during handshake");
-                        let identity = crate::journal::ResumeIdentity {
-                            path: file_entry.path.clone().into_bytes(),
-                            fingerprint: file_entry.fingerprint,
-                        };
-                        journal.checkpoint(&identity, track)?;
+
+                        let pending = unsynced.entry(file_id).or_insert(0);
+                        *pending += 1;
+                        let due = cadence == 1 || (cadence > 1 && *pending >= cadence);
+                        if due {
+                            if cadence != 1 {
+                                sink.sync_staged_chunks(file_entry)?;
+                            }
+                            *pending = 0;
+                            let journal = self
+                                .journal
+                                .as_ref()
+                                .expect("journal is initialized during handshake");
+                            let identity = crate::journal::ResumeIdentity {
+                                path: file_entry.path.clone().into_bytes(),
+                                fingerprint: file_entry.fingerprint,
+                            };
+                            journal.checkpoint(&identity, track)?;
+                        }
 
                         let ack = Message::Ack {
                             acknowledged_id: frame.message_id,
@@ -3103,6 +3132,23 @@ impl Server {
                             "LargeFileFinish for unregistered file_id {file_id}"
                         )));
                     };
+                    // Flush anything the cadence left outstanding before the
+                    // coverage check reads the journal or the commit renames.
+                    // `commit_temp` does not sync, so an unflushed range would
+                    // publish a hole and under-report coverage at once.
+                    if unsynced.remove(&file_id).is_some_and(|p| p > 0) {
+                        sink.sync_staged_chunks(&entry)?;
+                        if let Some(track) = large_ranges.get(&file_id) {
+                            let identity = crate::journal::ResumeIdentity {
+                                path: entry.path.clone().into_bytes(),
+                                fingerprint: entry.fingerprint,
+                            };
+                            self.journal
+                                .as_ref()
+                                .expect("journal is initialized during handshake")
+                                .checkpoint(&identity, track)?;
+                        }
+                    }
                     {
                         // `prepare_large` preallocates the staging file, so a
                         // finish without complete coverage would otherwise

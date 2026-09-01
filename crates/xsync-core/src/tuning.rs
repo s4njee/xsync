@@ -105,6 +105,7 @@ static BATCH_FILES: OnceLock<usize> = OnceLock::new();
 static APPLY_WORKERS: OnceLock<usize> = OnceLock::new();
 static LARGE_CHUNKS: OnceLock<usize> = OnceLock::new();
 static CHECKPOINT_CHUNKS: OnceLock<usize> = OnceLock::new();
+static RECEIVER_FLUSH: OnceLock<usize> = OnceLock::new();
 
 /// Read an environment variable as `T`, clamped to `min..=max`.
 ///
@@ -252,6 +253,29 @@ pub fn checkpoint_chunks() -> usize {
     *CHECKPOINT_CHUNKS.get_or_init(|| bounded("XSYNC_CHECKPOINT_CHUNKS", 8, 1, 64))
 }
 
+/// Chunks a *receiving server* writes before flushing them and checkpointing.
+///
+/// Overridden by `XSYNC_RECEIVER_FLUSH_CHUNKS`. **`1` is the default and is
+/// today's behaviour**: flush every 8 MB chunk. **`0` defers every flush to
+/// `LargeFileFinish`**, which is the shape rsync effectively has — it lets the
+/// kernel write back while the socket keeps reading.
+///
+/// This exists because the receiver's deficit tracks its disk write time almost
+/// exactly (4.66): 1.29 s against 1.11 s of disk on a Gen3 `NVMe`, 2.31 s against
+/// 2.49 s on a USB one (both `NVMe`). The open question is whether flushing *as we go*
+/// contends with the receive path rather than merely costing its own time — the
+/// raw-device measurement says cadence is worth only 0.36 s, so a larger gain
+/// here would mean contention, not fsync cost.
+///
+/// **The trade is resume granularity.** At `0`, an interrupted transfer redoes
+/// the whole file, because nothing is journalled until the end. A low-powered
+/// receiver may still want it; that is the heuristic this knob is here to let
+/// someone derive.
+#[must_use]
+pub fn receiver_flush_chunks() -> usize {
+    *RECEIVER_FLUSH.get_or_init(|| bounded("XSYNC_RECEIVER_FLUSH_CHUNKS", 1, 0, 4096))
+}
+
 /// The values actually in effect, for recording beside a measurement.
 ///
 /// Reports what the process resolved, not what the environment said, so a
@@ -278,6 +302,7 @@ pub fn is_tuned() -> bool {
     max_pipelined_frames() != MAX_PIPELINED_FRAMES
         || batch_target_size() != BATCH_TARGET_SIZE
         || max_batch_files() != MAX_BATCH_FILES
+        || receiver_flush_chunks() != 1
         || checkpoint_chunks() != 8
         || large_chunks_in_flight()
             != usize::try_from(DEFAULT_UNACKNOWLEDGED_WINDOW as u64 / LARGE_FILE_CHUNK)
