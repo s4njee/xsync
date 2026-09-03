@@ -4,6 +4,7 @@ members = [
     "benches",
     "benches/engine",
     "crates/xsync",
+    "crates/xsync-client",
     "crates/xsync-core",
 ]
 # `benches/engine` holds Unix-only research spikes (`xsync-remote-spike` uses
@@ -14,6 +15,7 @@ members = [
 default-members = [
     "benches",
     "crates/xsync",
+    "crates/xsync-client",
     "crates/xsync-core",
 ]
 

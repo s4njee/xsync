@@ -36,8 +36,9 @@ compatibility-matrix row and the f2/Kestrel consumer decision.
 | 1 | E5-S1 — Full attributes (except owner names) | **Done** 2026-09-03 |
 | 1 | E5-S2 — Directory reading and cursors | **Done** 2026-09-03 |
 | 1 | E5-S3 — Capacity and filesystem facts | **Done** 2026-09-03 |
-| 1 | E9-S1 — `xsync-client` async crate | Next |
-| 1 | E4-S8, E5-S1b, E9-S4/S6, E10-S1/S4 | Not started |
+| 1 | E9-S1 — `xsync-client` async crate (Phase 1 surface) | **Done** 2026-09-03 |
+| 1 | E10-S1 / E10-S4 — Confinement tests and fuzzing | Next |
+| 1 | E4-S8, E5-S1b, E9-S4/S6 | Not started |
 | 2–6 | everything else | Not started |
 
 All of the above is on xsync branch `v3`, **uncommitted**. §0 below still describes the
@@ -1192,18 +1193,68 @@ As an editor I can save a file back only if nobody else changed it.
 
 *Today: synchronous `BrowseSession<R, W>`; no CLI browse commands.*
 
-#### X3-E9-S1 — `xsync-client` async crate
+#### X3-E9-S1 — `xsync-client` async crate — **Done (Phase 1 surface)**
+
+*Landed 2026-09-03 on xsync branch `v3`.*
+
 **AC**
-- New workspace crate, `tokio`-based, no Tauri/GUI dependency: `Client::connect_tls`,
+- [x] New workspace crate, `tokio`-based, no Tauri/GUI dependency:
   `Client::connect_ssh`, `Client::from_stream(AsyncRead + AsyncWrite)`; `Mount`
-  handle exposing every E4–E7 operation as async methods returning typed errors.
-- Object-safe trait `xsync_client::Fs` (list, stat, open/read/write/close, mkdir,
-  rename, unlink, rmdir, statfs, watch, …) so Excalibur's `ShareBackend` and
-  Kestrel's `RemoteFs` are thin adapters.
-- Internally: one demultiplexing task per connection, request-id → oneshot map,
-  credit tracking (E3-S3), automatic keepalive, transparent `Resume` on drop within
-  grace (surfaced as an event, never silent).
-- `#![forbid(unsafe_code)]` continues from the workspace lints.
+  exposing the operations that exist as async methods returning typed errors.
+- [ ] `Client::connect_tls`. **Deferred** with the TLS transport itself (E2-S1).
+- [ ] Object-safe trait `xsync_client::Fs`. **Deferred deliberately.** The trait
+  exists so Excalibur's `ShareBackend` and Kestrel's `RemoteFs` are thin adapters,
+  and neither adapter exists yet — `plan.md` already says to expect this method list
+  to be revised once M1 drives it. Freezing a trait shape first, and adding
+  `async-trait` to do it, is the wrong order. The concrete async API is what an
+  adapter wraps today.
+- [x] One demultiplexing task per connection, request-id → oneshot map, automatic
+  keepalive.
+- [ ] Credit tracking (E3-S3) and transparent `Resume` (E3-S2). **Deferred** with the
+  server halves; a client cannot resume against a server that has no session
+  identity.
+- [x] `#![forbid(unsafe_code)]`.
+
+**Results**
+
+- The crate is the seam between a synchronous server and async consumers. A writer
+  task drains an unbounded channel; a reader task decodes frames and routes each to
+  the caller waiting on its id through a `oneshot`. Several requests are genuinely
+  outstanding at once — a test issues 32 reads without awaiting any and asserts every
+  reply reached the caller that asked for it.
+- **The opening handshake is done inline, before the tasks exist.** Nothing may be
+  multiplexed until the grammar is settled, and a peer that selects v2 is rejected
+  with `NotFilesystemCapable { selected }` rather than being driven with frames it
+  would abort on.
+- **`read_verified` closes E4-S2's other half.** The server has always been able to
+  send a BLAKE3 digest; this is the first code that checks one. A reply that omits
+  the digest when it was asked for counts as a mismatch, not as permission to skip
+  the check.
+- Writes always send a digest. It costs one hash of bytes already in memory, and it
+  is what makes a corrupted payload a refusal instead of a corrupted file.
+- `Error::kind()` maps onto `std::io::ErrorKind` for callers with their own taxonomy.
+  This is the hand-written subset; E9-S4 generates the full table from the enum so it
+  cannot drift.
+- **A dropped connection fails every waiting request** rather than leaving it hung:
+  when the reader task ends it clears the pending map, so each `oneshot` resolves to
+  `Disconnected`. There is a test that a peer going away does not hang a caller.
+- Tests run the real synchronous server on a thread over a **loopback socket**, not
+  an in-process pipe: it exercises the same framing a deployment uses and is the only
+  way to have both halves run as themselves.
+- `tokio` is scoped to this crate with only the features it uses; `xsync-core` and the
+  `xs` binary stay synchronous. `docs/supply-chain.md` records it.
+
+**Next steps**
+
+- **Excalibur M1** is now unblocked: this is the surface its `ShareBackend` adapts.
+  Expect the method list to change once it does — that is the point of building the
+  adapter before the trait.
+- **E9-S4** generates the error table from the enum.
+- **E9-S6** is the conformance kit (an in-process server with fault injection) that
+  consumers use in their own suites; the loopback harness in `tests/session.rs` is
+  most of it and should be lifted into the crate proper.
+- Keepalive is opt-in via `keepalive_every`. Whether it should default on wants a
+  deployment that drops idle connections to answer it.
 
 #### X3-E9-S2 — Sync façade
 **AC**
@@ -1448,7 +1499,7 @@ method list to be revised against what the GUI actually needs once M1 is running
 
 | Phase | Stories | Unlocks |
 |---|---|---|
-| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, ~~E4-S2~~, ~~E4-S3~~, ~~E5-S1~~, ~~E5-S2~~, ~~E5-S3~~, **E9-S1 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
+| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, ~~E4-S2~~, ~~E4-S3~~, ~~E5-S1~~, ~~E5-S2~~, ~~E5-S3~~, ~~E9-S1~~, **E9-S4/S6 + E10-S1/S4 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
 | **2. Daemon, TLS, identity** | E1-S1–S3, E1-S5, E2-S1, E2-S3–S5, E10-S2, E10-S6, E12-S1–S3 | Connect without SSH; exports; principals; the "New Connection" dialog's xsync tab is complete. |
 | **3. Durability and coherence** | E3-S2, E3-S3, E3-S5, E4-S6, E4-S7, E6-S1, E6-S4, E6-S5, E5-S4, E5-S7 | Resumable uploads that survive drops; locks for edit-in-place; complete mutation set. |
 | **4. Live views and speed** | E7, E6-S2, E8-S1–S5, E5-S2 cursor fix, E5-S5, E4-S4, E4-S5 | Auto-refreshing listings, leases, compound open-read, sparse. |

@@ -1,0 +1,37 @@
+[package]
+name = "xsync-client"
+description = "Async client for the xsync v3 filesystem protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+blake3 = { version = "1", features = ["prefer_intrinsics"] }
+thiserror = "2"
+# The consumers of this crate are async applications (Excalibur's Tauri backend,
+# Kestrel's engine), so the client is too. Only the features it uses: no
+# `rt-multi-thread` and no `fs`.
+tokio = { version = "1", features = [
+  "io-util",
+  "macros",
+  "net",
+  "process",
+  "rt",
+  "sync",
+  "time",
+] }
+xsync-core = { path = "../xsync-core", version = "0.1.0" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread"] }

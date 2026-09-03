@@ -10,6 +10,12 @@ one end of a transfer actually has.
 ## [Unreleased]
 
 ### Added
+- New crate `xsync-client`: an async client for the v3 filesystem protocol.
+  Multiplexes requests over one connection, verifies read digests before handing
+  bytes over, and exposes mount, stat, statfs, open, read, write, flush, close
+  and paged directory listing. Connects over a caller-supplied stream or by
+  starting `xs --server` over SSH. Adds `tokio`, scoped to this crate; see
+  `docs/supply-chain.md`.
 - Protocol v3 `StatFs`: capacity and filesystem facts for the mounted export.
   Adds a dependency on `fs4` for free/available/total space, because this
   workspace denies `unsafe_code` and `statvfs` is otherwise unreachable; inode
