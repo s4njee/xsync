@@ -1433,6 +1433,18 @@ fn native_path_bytes(path: &std::ffi::OsStr) -> Vec<u8> {
     path.to_string_lossy().as_bytes().to_vec()
 }
 
+/// The inverse of [`native_path_bytes`], for turning a name captured from a
+/// directory listing back into something that can be joined onto a path.
+fn native_path_os_string(bytes: &[u8]) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(bytes.to_vec())
+    }
+    #[cfg(not(unix))]
+    std::ffi::OsString::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
 fn mutation_failure(error: &ServerError) -> (MutationStatus, String) {
     (MutationStatus::Error, error.to_string())
 }
@@ -1627,6 +1639,12 @@ struct OpenHandle {
     /// handle opened write-only, and `Write` needs to know an `APPEND` handle
     /// ignores its offset (E4-S3).
     flags: u32,
+    /// Names captured when a directory listing started, so paging is a slice
+    /// rather than a re-read. `None` until the first page asks for one.
+    ///
+    /// `Arc` so a page clones the list out and releases the lock before it
+    /// starts stat-ing entries.
+    listing: Mutex<Option<Arc<Vec<Vec<u8>>>>>,
 }
 
 impl FsSessionState {
@@ -1686,6 +1704,17 @@ impl FsHandler for ServerFsHandler {
                 data,
             } => write_handle(state, related_id, handle, offset, digest, &data),
             V3Message::Flush { handle } => flush_handle(state, related_id, handle),
+            V3Message::Stat {
+                target,
+                follow,
+                attr_mask,
+            } => stat_target(state, related_id, &target, follow, attr_mask),
+            V3Message::ReadDir {
+                handle,
+                cursor,
+                max_entries,
+                attr_mask,
+            } => read_dir_handle(state, related_id, handle, cursor, max_entries, attr_mask),
             other => V3Message::Error {
                 related_id,
                 code: FsErrorCode::NotSupported,
@@ -2074,6 +2103,7 @@ fn open_handle(
             path: native,
             file: None,
             flags,
+            listing: Mutex::new(None),
         }
     } else {
         // A directory opened without DIRECTORY would produce a handle no read
@@ -2102,6 +2132,7 @@ fn open_handle(
                 path: native,
                 file: Some(file),
                 flags,
+                listing: Mutex::new(None),
             },
             Err(error) => return fs_io_error(related_id, &error, "open"),
         }
@@ -2340,6 +2371,135 @@ fn flush_handle(state: &FsSessionState, related_id: u64, handle: u64) -> V3Messa
     match file.sync_all() {
         Ok(()) => V3Message::Done { related_id },
         Err(error) => fs_io_error(related_id, &error, "flush"),
+    }
+}
+
+/// Attributes of a path or an open handle.
+fn stat_target(
+    state: &FsSessionState,
+    related_id: u64,
+    target: &StatTarget,
+    follow: bool,
+    attr_mask: u32,
+) -> V3Message {
+    let (path, metadata) = match target {
+        StatTarget::Path(path) => {
+            let native = match browse_stat_path(&state.root, path) {
+                Ok(native) => native,
+                Err(error) => return fs_path_error(related_id, &error),
+            };
+            // `follow` is the whole difference between stat and lstat, and a
+            // client listing a tree wants lstat so a link reads as a link.
+            let metadata = if follow {
+                fs::metadata(&native)
+            } else {
+                fs::symlink_metadata(&native)
+            };
+            match metadata {
+                Ok(metadata) => (native, metadata),
+                Err(error) => return fs_io_error(related_id, &error, "stat"),
+            }
+        }
+        StatTarget::Handle(handle) => {
+            let Some(open) = state.handle(*handle) else {
+                return fs_error(related_id, FsErrorCode::BadHandle, "no such handle");
+            };
+            // A file handle answers from the descriptor, so it describes the
+            // file this session opened even if the name has since been reused.
+            // A directory handle has no descriptor to ask, so it restats the
+            // path.
+            let metadata = match open.file.as_ref() {
+                Some(file) => file.metadata(),
+                None => fs::metadata(&open.path),
+            };
+            match metadata {
+                Ok(metadata) => (open.path.clone(), metadata),
+                Err(error) => return fs_io_error(related_id, &error, "stat handle"),
+            }
+        }
+    };
+    V3Message::AttrsResponse {
+        related_id,
+        attrs: attrs_from_metadata(&metadata, &path, attr_mask),
+    }
+}
+
+/// One page of a directory handle's listing.
+fn read_dir_handle(
+    state: &FsSessionState,
+    related_id: u64,
+    handle: u64,
+    cursor: u64,
+    max_entries: u32,
+    attr_mask: u32,
+) -> V3Message {
+    let Some(open) = state.handle(handle) else {
+        return fs_error(related_id, FsErrorCode::BadHandle, "no such handle");
+    };
+    if open.file.is_some() {
+        return fs_error(
+            related_id,
+            FsErrorCode::NotDirectory,
+            "handle is a file; open it with DIRECTORY to list it",
+        );
+    }
+
+    // The names are captured once, at cursor zero, and every later page is a
+    // slice of that. Re-reading the directory per page and skipping forward is
+    // what makes paging quadratic in the number of entries.
+    let names = {
+        let Ok(mut listing) = open.listing.lock() else {
+            return fs_error(related_id, FsErrorCode::Io, "listing state is poisoned");
+        };
+        if cursor == 0 || listing.is_none() {
+            let directory = match fs::read_dir(&open.path) {
+                Ok(directory) => directory,
+                Err(error) => return fs_io_error(related_id, &error, "read directory"),
+            };
+            let mut names = Vec::new();
+            for entry in directory {
+                match entry {
+                    // `read_dir` never yields "." or "..".
+                    Ok(entry) => names.push(native_path_bytes(&entry.file_name())),
+                    Err(error) => return fs_io_error(related_id, &error, "read directory"),
+                }
+            }
+            *listing = Some(Arc::new(names));
+        }
+        Arc::clone(listing.as_ref().expect("just populated"))
+    };
+
+    let Ok(start) = usize::try_from(cursor) else {
+        return fs_error(related_id, FsErrorCode::Invalid, "cursor is out of range");
+    };
+    if start > names.len() {
+        return fs_error(
+            related_id,
+            FsErrorCode::Invalid,
+            "cursor is past the end of this listing",
+        );
+    }
+    let end = start.saturating_add(max_entries as usize).min(names.len());
+
+    let mut entries = Vec::with_capacity(end - start);
+    for name in &names[start..end] {
+        let path = open.path.join(native_path_os_string(name));
+        // A name from the snapshot that has since been removed is simply left
+        // out: the contract allows an entry that changed mid-listing to appear
+        // or not, and refusing the whole page would be worse.
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            entries.push(protocol_v3::DirEntry {
+                name: name.clone(),
+                attrs: attrs_from_metadata(&metadata, &path, attr_mask),
+            });
+        }
+    }
+
+    V3Message::DirPage {
+        related_id,
+        cursor: end as u64,
+        final_page: end >= names.len(),
+        entries,
     }
 }
 
@@ -11496,6 +11656,313 @@ mod tests {
         // the flush reported success and the bytes are readable from the file
         // rather than only through the handle.
         assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn fs_stat_answers_for_a_path_a_link_and_a_handle() {
+        use protocol_v3::{attr_presence as presence, open_flags};
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"12345").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("file", root.path().join("link")).unwrap();
+
+        let mask = presence::IDENTITY | presence::NLINK | presence::SYMLINK_TARGET;
+        let mut requests = vec![
+            (
+                3,
+                V3Message::Stat {
+                    target: StatTarget::Path(b"file".to_vec()),
+                    follow: true,
+                    attr_mask: mask,
+                },
+            ),
+            (4, fs_open(b"file", open_flags::READ, 0)),
+            (
+                5,
+                V3Message::Stat {
+                    target: StatTarget::Handle(1),
+                    follow: false,
+                    attr_mask: presence::IDENTITY,
+                },
+            ),
+            (
+                6,
+                V3Message::Stat {
+                    target: StatTarget::Path(b"missing".to_vec()),
+                    follow: true,
+                    attr_mask: 0,
+                },
+            ),
+        ];
+        #[cfg(unix)]
+        {
+            // lstat: the link itself.
+            requests.push((
+                7,
+                V3Message::Stat {
+                    target: StatTarget::Path(b"link".to_vec()),
+                    follow: false,
+                    attr_mask: mask,
+                },
+            ));
+            // stat: what it points at.
+            requests.push((
+                8,
+                V3Message::Stat {
+                    target: StatTarget::Path(b"link".to_vec()),
+                    follow: true,
+                    attr_mask: mask,
+                },
+            ));
+        }
+
+        let replies = fs_run_serial(root.path(), &requests);
+        let attrs = |id: u64| match fs_reply(&replies, id) {
+            V3Message::AttrsResponse { attrs, .. } => attrs.clone(),
+            other => panic!("request {id}: expected Attrs, got {other:?}"),
+        };
+
+        let file = attrs(3);
+        assert_eq!(file.kind, 1);
+        assert_eq!(file.size, 5);
+        assert!(file.identity.is_some() && file.nlink.is_some());
+        // Not a symlink, so no target even though the mask asked.
+        assert_eq!(file.symlink_target, None);
+
+        // fstat through the handle agrees with the path.
+        assert_eq!(attrs(5).identity, file.identity);
+
+        match fs_reply(&replies, 6) {
+            V3Message::Error { code, .. } => assert_eq!(*code, FsErrorCode::NoEntry),
+            other => panic!("expected ENOENT, got {other:?}"),
+        }
+
+        #[cfg(unix)]
+        {
+            let link = attrs(7);
+            assert_eq!(link.kind, 3, "follow=false must describe the link");
+            assert_eq!(link.symlink_target.as_deref(), Some(&b"file"[..]));
+            let followed = attrs(8);
+            assert_eq!(followed.kind, 1, "follow=true must describe the target");
+            assert_eq!(followed.size, 5);
+        }
+    }
+
+    #[test]
+    fn fs_read_dir_pages_a_snapshot_without_repeating_or_losing_entries() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        let listing = root.path().join("listing");
+        fs::create_dir(&listing).unwrap();
+        for index in 0..250 {
+            fs::write(listing.join(format!("entry-{index:04}")), b"x").unwrap();
+        }
+        fs::create_dir(listing.join("subdir")).unwrap();
+
+        let mut session = FsLiveSession::start(Server::new(root.path()));
+        let handle = session.open(b"listing", open_flags::READ | open_flags::DIRECTORY);
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = 0_u64;
+        let mut pages = 0;
+        loop {
+            let reply = session.request(&V3Message::ReadDir {
+                handle,
+                cursor,
+                max_entries: 32,
+                attr_mask: 0,
+            });
+            let V3Message::DirPage {
+                cursor: next,
+                final_page,
+                entries,
+                ..
+            } = reply
+            else {
+                panic!("expected DirPage, got {reply:?}")
+            };
+            pages += 1;
+            for entry in entries {
+                // Never the directory's own links.
+                assert_ne!(entry.name, b".");
+                assert_ne!(entry.name, b"..");
+                seen.push(entry.name);
+            }
+            if final_page {
+                break;
+            }
+            assert_ne!(next, cursor, "a non-final page must advance the cursor");
+            cursor = next;
+        }
+        session.finish();
+
+        assert!(pages > 1, "the page size should have forced several pages");
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "an entry was listed twice");
+        assert_eq!(seen.len(), 251, "an entry was lost across pages");
+        assert!(seen.iter().any(|name| name == b"subdir"));
+    }
+
+    #[test]
+    fn fs_read_dir_fills_the_attributes_the_mask_asked_for() {
+        use protocol_v3::{attr_presence as presence, open_flags};
+
+        let root = tempdir().unwrap();
+        let listing = root.path().join("listing");
+        fs::create_dir(&listing).unwrap();
+        fs::write(listing.join("file"), b"abc").unwrap();
+        fs::create_dir(listing.join("dir")).unwrap();
+
+        let mut session = FsLiveSession::start(Server::new(root.path()));
+        let handle = session.open(b"listing", open_flags::READ | open_flags::DIRECTORY);
+
+        let page = |session: &mut FsLiveSession, mask: u32| {
+            let reply = session.request(&V3Message::ReadDir {
+                handle,
+                cursor: 0,
+                max_entries: 64,
+                attr_mask: mask,
+            });
+            match reply {
+                V3Message::DirPage { entries, .. } => entries,
+                other => panic!("expected DirPage, got {other:?}"),
+            }
+        };
+
+        // The fixed part always rides along -- that is what makes one round
+        // trip a readdirplus rather than a listing plus a stat per entry.
+        for entry in page(&mut session, 0) {
+            assert!(entry.attrs.kind == 1 || entry.attrs.kind == 2);
+            assert_ne!(entry.attrs.change_cookie, [0; 16]);
+            assert_eq!(entry.attrs.identity, None);
+        }
+        for entry in page(&mut session, presence::IDENTITY | presence::OWNER) {
+            assert!(entry.attrs.identity.is_some());
+            if entry.name == b"file" {
+                assert_eq!(entry.attrs.size, 3);
+            }
+            if cfg!(unix) {
+                assert!(entry.attrs.owner.is_some());
+            }
+        }
+        session.finish();
+    }
+
+    #[test]
+    fn fs_read_dir_refuses_a_file_handle_and_a_cursor_past_the_end() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"x").unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (3, fs_open(b"file", open_flags::READ, 0)),
+                (
+                    4,
+                    fs_open(b"dir", open_flags::READ | open_flags::DIRECTORY, 0),
+                ),
+                (
+                    5,
+                    V3Message::ReadDir {
+                        handle: 1,
+                        cursor: 0,
+                        max_entries: 8,
+                        attr_mask: 0,
+                    },
+                ),
+                (
+                    6,
+                    V3Message::ReadDir {
+                        handle: 2,
+                        cursor: 9_999,
+                        max_entries: 8,
+                        attr_mask: 0,
+                    },
+                ),
+                (
+                    7,
+                    V3Message::ReadDir {
+                        handle: 999,
+                        cursor: 0,
+                        max_entries: 8,
+                        attr_mask: 0,
+                    },
+                ),
+            ],
+        );
+        let code = |id: u64| match fs_reply(&replies, id) {
+            V3Message::Error { code, .. } => *code,
+            other => panic!("request {id}: expected Error, got {other:?}"),
+        };
+        assert_eq!(code(5), FsErrorCode::NotDirectory);
+        assert_eq!(code(6), FsErrorCode::Invalid);
+        assert_eq!(code(7), FsErrorCode::BadHandle);
+    }
+
+    #[test]
+    fn fs_read_dir_paging_does_not_grow_with_the_number_of_pages() {
+        use protocol_v3::open_flags;
+
+        // The bug this guards against re-read the directory on every page and
+        // skipped forward, which Kestrel measured as 167 ms at page 256 against
+        // 46 ms for one large page. Paging is a slice of one snapshot, so both
+        // shapes do the same work; the bound is deliberately loose because the
+        // failure it catches is ~40x, not 40%.
+        let root = tempdir().unwrap();
+        let listing = root.path().join("listing");
+        fs::create_dir(&listing).unwrap();
+        for index in 0..10_000 {
+            fs::write(listing.join(format!("e{index:05}")), b"").unwrap();
+        }
+
+        let count_all = |page_size: u32| -> (usize, std::time::Duration) {
+            let mut session = FsLiveSession::start(Server::new(root.path()));
+            let handle = session.open(b"listing", open_flags::READ | open_flags::DIRECTORY);
+            let start = std::time::Instant::now();
+            let mut total = 0;
+            let mut cursor = 0;
+            loop {
+                let reply = session.request(&V3Message::ReadDir {
+                    handle,
+                    cursor,
+                    max_entries: page_size,
+                    attr_mask: 0,
+                });
+                let V3Message::DirPage {
+                    cursor: next,
+                    final_page,
+                    entries,
+                    ..
+                } = reply
+                else {
+                    panic!("expected DirPage, got {reply:?}")
+                };
+                total += entries.len();
+                cursor = next;
+                if final_page {
+                    break;
+                }
+            }
+            let elapsed = start.elapsed();
+            session.finish();
+            (total, elapsed)
+        };
+
+        let (single_total, single) = count_all(16_384);
+        let (paged_total, paged) = count_all(256);
+        assert_eq!(single_total, 10_000);
+        assert_eq!(paged_total, 10_000);
+        assert!(
+            paged < single * 5 + std::time::Duration::from_millis(250),
+            "paging looks quadratic: {paged:?} in pages of 256 against {single:?} in one page"
+        );
     }
 
     #[test]

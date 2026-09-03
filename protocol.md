@@ -505,17 +505,31 @@ asked for it.
   nothing outstanding — but on a directory handle it is `EISDIR`, because a
   directory handle buffers nothing. `Close` answers `Done` and releases the
   handle.
-- `Stat.target` is `0` path or `1` handle. For a path target the handle field
+- `Stat` on a file handle answers from the descriptor, so it describes the file
+  this session opened even if the name has since been reused; on a directory
+  handle, which holds no descriptor, it restats the path. `Stat.target` is `0`
+  path or `1` handle. For a path target the handle field
   must be `0`; for a handle target the path must be empty; otherwise the
   payload is a protocol error. `follow` selects `stat` over `lstat` and is
   ignored for a handle target. The `attr mask` follows the rules above; asking
   for `names` requires the `OWNER_NAMES` feature and is otherwise answered
   without that block.
-- `ReadDir` requires a handle opened with `DIRECTORY`; its `attr mask` applies
-  to every entry in the page, which is what makes one round trip a readdirplus.
-  `max entries` is `1..=65,536`; `count` is capped at 65,536 before reserving memory. Cursor `0`
-  starts a fresh snapshot; a non-final page returns the cursor for the next
-  page. `.` and `..` are never returned.
+- `ReadDir` requires a handle opened with `DIRECTORY`; a file handle is
+  `ENOTDIR`. Its `attr mask` applies to every entry in the page, which is what
+  makes one round trip a readdirplus: the server still stats each entry, since
+  the fixed part of `Attrs` cannot be answered from the directory alone, but
+  the client pays one round trip rather than one per entry. `max entries` is
+  `1..=65,536`; `count` is capped at 65,536 before reserving memory. `.` and
+  `..` are never returned.
+- Cursor `0` starts a fresh snapshot of the directory's names; a non-final page
+  returns the cursor for the next page, and a cursor past the end of that
+  snapshot is `EINVAL`. Paging is a position within the snapshot, so a page
+  costs the size of the page and not the size of the offset — re-reading the
+  directory per page and skipping forward makes a listing quadratic in its own
+  length. An entry created or removed while a listing is in progress may or may
+  not appear, but no entry appears twice and an entry present throughout is
+  never missed; a name that has disappeared by the time its page is built is
+  left out rather than failing the page.
 - `FsInfo.read_only` describes the filesystem, distinct from the export's
   access. `fs type` is UTF-8 of at most 256 bytes. Inode counts of `0` mean
   unknown.

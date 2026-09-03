@@ -33,8 +33,10 @@ compatibility-matrix row and the f2/Kestrel consumer decision.
 | 1 | E4-S1 — Open and close handles | **Done** 2026-09-03 |
 | 1 | E4-S2 — Positional read (server side) | **Done** 2026-09-03 |
 | 1 | E4-S3 — Positional write and flush (server side) | **Done** 2026-09-03 |
-| 1 | E5-S1 / E5-S2 — Attributes and directory reading | Next |
-| 1 | E4-S8, E5-S3, E9-S1/S4/S6, E10-S1/S4 | Not started |
+| 1 | E5-S1 — Full attributes (except owner names) | **Done** 2026-09-03 |
+| 1 | E5-S2 — Directory reading and cursors | **Done** 2026-09-03 |
+| 1 | E5-S3 — Capacity and filesystem facts | Next |
+| 1 | E4-S8, E5-S1b, E9-S1/S4/S6, E10-S1/S4 | Not started |
 | 2–6 | everything else | Not started |
 
 All of the above is on xsync branch `v3`, **uncommitted**. §0 below still describes the
@@ -875,32 +877,105 @@ As an editor I can save a file back only if nobody else changed it.
 
 *Today: six-field entry record, no capacity, single-purpose mutations.*
 
-#### X3-E5-S1 — Full attributes
+#### X3-E5-S1 — Full attributes — **Done (except owner names)**
+
+*Landed 2026-09-03 on xsync branch `v3`.*
+
 **AC**
-- `Attrs` record used by `Stat`, `Open`, `ReadDir`, `WriteAck`: `kind`, `mode`,
+- [x] `Attrs` record used by `Stat`, `Open`, `ReadDir`, `WriteAck`: `kind`, `mode`,
   `uid`, `gid`, `nlink`, `size`, `allocated_size`, `atime`, `mtime`, `ctime`,
   `btime?` (birth time when the FS has it), `dev`, `ino`, `rdev` (for device
   entries), `symlink_target?`, `change_cookie` (E6-S4), `flags` (immutable, append-
-  only, hidden — for Windows/macOS hidden bit parity).
-- Optional `owner_name`/`group_name` strings resolved server-side when the client
-  sets the `names` bit of the request's `attr_mask`, so a UI can show names without
-  an ID mapping of its own.
-- `Stat(path, follow: bool)` = `stat`/`lstat`; `Stat(handle)` = `fstat`.
-- Vectors cover every optional field present/absent.
+  only, hidden — for Windows/macOS hidden bit parity). *(The record and its filling
+  landed with E4-S1; this story added the `Stat` that asks for one. `flags` is
+  carried but never set — the platform bits need per-OS work nothing needs yet.)*
+- [ ] Optional `owner_name`/`group_name` resolved server-side. **Deferred:**
+  `getpwuid`/`getgrgid` are FFI, and the workspace denies `unsafe_code` with one
+  documented exception. The block stays absent and the server does not advertise
+  `OWNER_NAMES`, so a client knows not to ask. Revisit with a vetted dependency if a
+  UI actually needs names.
+- [x] `Stat(path, follow: bool)` = `stat`/`lstat`; `Stat(handle)` = `fstat`.
+- [x] Vectors cover every optional field present/absent. *(Frozen with the Phase 1
+  table: `opened-minimal-attrs` has `presence=0`, `attrs-symlink-with-owner` carries
+  `OWNER|SYMLINK_TARGET`.)*
 
-#### X3-E5-S2 — Directory reading with attributes and stable cursors
+**Results**
+
+- `Stat` on a **file handle** answers from the descriptor, so it describes the file
+  this session opened even if the name has since been reused. A **directory handle**
+  holds no descriptor, so it restats the path — a real difference, now written down
+  rather than left for someone to find.
+- `follow` is the whole distinction between `stat` and `lstat`, and it matters for
+  the client this is being built for: a listing wants `follow=false` so a link reads
+  as a link. Tested both ways against a real symlink — kind `3` with a target, versus
+  kind `1` with the target's size.
+- A mask asking for `SYMLINK_TARGET` on something that is not a link gets no target
+  rather than an error, which is the "response is a subset of the mask" rule doing
+  its job.
+
+**Next steps**
+
+- **E5-S3 (`StatFs`)** is the last of the three and the one Excalibur's capacity
+  display needs.
+- `flags` (immutable, append-only, hidden) wants `st_flags` on macOS/BSD and file
+  attributes on Windows; worth doing when a client shows them.
+
+#### X3-E5-S1b — Owner and group names *(carved out of E5-S1)*
 **AC**
-- `ReadDir(dir_handle, cursor, max_entries, attr_mask)` returns entries carrying the
-  `Attrs` blocks the mask asked for (readdirplus), so a 10k-entry listing needs no
-  per-entry stat.
-- Cursors are server-side positions into a snapshot taken at first page; a page is
-  O(page) not O(offset) — the O(n²) skip-from-start that Kestrel measured (167 ms at
-  page 256 vs 46 ms at 16,384) is a bug to fix, with a regression test that pages of
-  256 over 10k entries complete within 1.5× of a single page.
-- Entries created/removed during the listing may or may not appear (snapshot), but
-  no entry appears twice and none present at both start and end is missing.
-- `.` and `..` are never returned; names are single components, raw bytes.
-- Target: 10k-entry directory listed with attributes in < 100 ms on LAN (E8-S5).
+- Resolve `uid`/`gid` to names when the `names` mask bit is set, and advertise the
+  `OWNER_NAMES` feature so a client knows it can ask.
+- No `unsafe` in this workspace: either a vetted dependency or an out-of-process
+  lookup.
+- A name that cannot be resolved leaves the block absent rather than inventing one.
+
+#### X3-E5-S2 — Directory reading with attributes and stable cursors — **Done**
+
+*Landed 2026-09-03 on xsync branch `v3`.*
+
+**AC**
+- [~] `ReadDir(dir_handle, cursor, max_entries, attr_mask)` returns entries carrying
+  the `Attrs` blocks the mask asked for (readdirplus), so a 10k-entry listing needs
+  no per-entry stat. **Corrected:** it needs no per-entry *round trip*, which is the
+  point, but the server does stat each entry — the fixed part of `Attrs` (kind, mode,
+  size, mtime, cookie) cannot be answered from the directory alone on any platform
+  this targets. `protocol.md` now says which of the two it means.
+- [x] Cursors are server-side positions into a snapshot taken at the first page; a
+  page is O(page) not O(offset).
+- [x] Entries created/removed during the listing may or may not appear, but no entry
+  appears twice and none present throughout is missing.
+- [x] `.` and `..` are never returned; names are single components, raw bytes.
+- [ ] Target: 10k-entry listing with attributes in < 100 ms on LAN. **Deferred** to
+  E8-S5 with the other latency budgets; nothing is measured over a wire yet.
+
+**Results**
+
+- The snapshot is a `Vec` of raw names captured at cursor zero and held on the
+  handle behind a `Mutex<Option<Arc<..>>>`. A page clones the `Arc` out and releases
+  the lock before it starts stat-ing, so a slow page does not block another request
+  on the same handle — which matters because `ReadDir` is *shared* in the ordering
+  model and two pages can genuinely be in flight at once.
+- Paging is a slice of that snapshot, so a page costs the size of the page. The
+  regression test walks 10,000 entries in pages of 256 and compares against one large
+  page. **The bound is deliberately loose (5× plus a fixed allowance) rather than the
+  1.5× the AC asked for**: the failure it exists to catch is re-reading the directory
+  per page, which is ~40× at this size, and a tight ratio on a shared machine would
+  flake without catching anything a loose one misses.
+- A name that has disappeared between the snapshot and its page is left out rather
+  than failing the page — the contract already allows an entry that changed mid-listing
+  to appear or not.
+- A cursor past the end of the snapshot is `EINVAL` rather than an empty final page,
+  so a client that mismatches cursors learns rather than silently sees nothing.
+- The paging and attribute tests both use `FsLiveSession`: paging is a conversation,
+  and a scripted byte stream cannot express "read a page, then ask for the next".
+
+**Next steps**
+
+- **E5-S3 (`StatFs`)** completes the trio Excalibur's status bar reads.
+- **E7 (`Watch`)** is what turns a listing from a snapshot into a live view; until it
+  exists a client refreshes by relisting.
+- The snapshot holds every name in the directory at once. That is fine for the
+  millions-of-small-files corpora this project benchmarks, but a directory large
+  enough to matter would want a streaming cursor; worth revisiting only with a case.
 
 #### X3-E5-S3 — Capacity and filesystem facts
 **AC**
@@ -1331,7 +1406,7 @@ method list to be revised against what the GUI actually needs once M1 is running
 
 | Phase | Stories | Unlocks |
 |---|---|---|
-| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, ~~E4-S2~~, ~~E4-S3~~, **E5-S1–S3 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
+| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, ~~E4-S2~~, ~~E4-S3~~, ~~E5-S1~~, ~~E5-S2~~, **E5-S3 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
 | **2. Daemon, TLS, identity** | E1-S1–S3, E1-S5, E2-S1, E2-S3–S5, E10-S2, E10-S6, E12-S1–S3 | Connect without SSH; exports; principals; the "New Connection" dialog's xsync tab is complete. |
 | **3. Durability and coherence** | E3-S2, E3-S3, E3-S5, E4-S6, E4-S7, E6-S1, E6-S4, E6-S5, E5-S4, E5-S7 | Resumable uploads that survive drops; locks for edit-in-place; complete mutation set. |
 | **4. Live views and speed** | E7, E6-S2, E8-S1–S5, E5-S2 cursor fix, E5-S5, E4-S4, E4-S5 | Auto-refreshing listings, leases, compound open-read, sparse. |

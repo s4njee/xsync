@@ -10,6 +10,10 @@ one end of a transfer actually has.
 ## [Unreleased]
 
 ### Added
+- Protocol v3 `Stat` and `ReadDir`: attributes for a path (`stat` or `lstat`) or
+  an open handle, and paged directory listings carrying each entry's attributes
+  in the same round trip. Paging is a position in a snapshot taken at the first
+  page, so a page costs the size of the page rather than the size of the offset.
 - Protocol v3 `Write`/`Flush`: positional writes with an optional BLAKE3 digest
   verified before anything reaches the file, `APPEND` handles that ignore the
   offset, and `Flush` as the durability barrier. `WriteAck.stable` is always
