@@ -25,7 +25,8 @@ use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1561,6 +1562,66 @@ struct FsSessionState {
     /// The operator asked for a read-only export (`xs --server --read-only`).
     read_only: bool,
     cancelled: Mutex<HashSet<u64>>,
+    /// Open handles, shared by every worker.
+    ///
+    /// Handles are `Arc`ed so a worker clones one out and releases the lock
+    /// before doing any I/O: a slow read must not block an unrelated `Open`.
+    handles: RwLock<HashMap<u64, Arc<OpenHandle>>>,
+    /// Never reused within a session, and never `0`.
+    next_handle: AtomicU64,
+    /// Reserved handle slots: incremented *before* an open starts and released
+    /// if it fails. Reading the table's length instead would let every worker
+    /// see room at once and overshoot the cap by the width of the pool.
+    reserved_handles: AtomicU64,
+    max_handles: u64,
+}
+
+/// A reserved handle slot, released on drop unless the open committed.
+struct HandleSlot<'a> {
+    state: &'a FsSessionState,
+    committed: bool,
+}
+
+impl Drop for HandleSlot<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.state.reserved_handles.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl FsSessionState {
+    /// Reserve one slot, or `None` when the session is at its limit.
+    fn reserve_handle(&self) -> Option<HandleSlot<'_>> {
+        if self.reserved_handles.fetch_add(1, Ordering::AcqRel) >= self.max_handles {
+            self.reserved_handles.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(HandleSlot {
+            state: self,
+            committed: false,
+        })
+    }
+
+    fn release_handle(&self) {
+        self.reserved_handles.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One open file or directory.
+#[derive(Debug)]
+struct OpenHandle {
+    /// Resolved native path, already confined under the export root.
+    path: PathBuf,
+    /// `None` for a directory handle. Positional reads and writes use
+    /// `FileExt`, which takes `&self`, so several workers can use one open
+    /// file at once without a lock and without a shared seek offset.
+    file: Option<fs::File>,
+    /// The flags it was opened with. Only recoverable here: `Read` must refuse
+    /// a handle opened write-only, and `Write` must know an `APPEND` handle
+    /// ignores its offset (E4-S2, E4-S3).
+    #[allow(dead_code, reason = "read by the E4-S2/E4-S3 handlers")]
+    flags: u32,
 }
 
 impl FsSessionState {
@@ -1599,16 +1660,25 @@ trait FsHandler: Send + Sync {
 struct ServerFsHandler;
 
 impl FsHandler for ServerFsHandler {
-    fn handle(&self, _state: &FsSessionState, related_id: u64, request: V3Message) -> V3Message {
-        V3Message::Error {
-            related_id,
-            code: FsErrorCode::NotSupported,
-            platform_errno: 0,
-            message: format!(
-                "v3 message type {} is negotiated but not implemented by this build",
-                protocol_v3::message_type(&request)
-            )
-            .into_bytes(),
+    fn handle(&self, state: &FsSessionState, related_id: u64, request: V3Message) -> V3Message {
+        match request {
+            V3Message::Open {
+                path,
+                flags,
+                mode,
+                attr_mask,
+            } => open_handle(state, related_id, &path, flags, mode, attr_mask),
+            V3Message::Close { handle } => close_handle(state, related_id, handle),
+            other => V3Message::Error {
+                related_id,
+                code: FsErrorCode::NotSupported,
+                platform_errno: 0,
+                message: format!(
+                    "v3 message type {} is negotiated but not implemented by this build",
+                    protocol_v3::message_type(&other)
+                )
+                .into_bytes(),
+            },
         }
     }
 }
@@ -1759,6 +1829,308 @@ fn mount_info(
     }
 }
 
+/// Translate a filesystem failure into the frozen v3 code.
+///
+/// The errno is preserved alongside it, so a client can distinguish two
+/// failures that share a code without this table having to grow.
+#[cfg(unix)]
+fn fs_code_for(error: &io::Error) -> FsErrorCode {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => FsErrorCode::NoEntry,
+        Some(libc::EACCES | libc::EPERM) => FsErrorCode::Access,
+        Some(libc::EEXIST) => FsErrorCode::Exists,
+        Some(libc::EISDIR) => FsErrorCode::IsDirectory,
+        Some(libc::ENOTDIR) => FsErrorCode::NotDirectory,
+        Some(libc::ELOOP) => FsErrorCode::Loop,
+        Some(libc::EROFS) => FsErrorCode::ReadOnly,
+        Some(libc::ENOSPC) => FsErrorCode::NoSpace,
+        Some(libc::EDQUOT) => FsErrorCode::Quota,
+        Some(libc::ENAMETOOLONG) => FsErrorCode::NameTooLong,
+        Some(libc::ENOTEMPTY) => FsErrorCode::NotEmpty,
+        // Out of descriptors is this server's limit, not the caller's mistake.
+        Some(libc::EMFILE | libc::ENFILE) => FsErrorCode::Limit,
+        _ => FsErrorCode::Io,
+    }
+}
+
+#[cfg(not(unix))]
+fn fs_code_for(error: &io::Error) -> FsErrorCode {
+    match error.kind() {
+        io::ErrorKind::NotFound => FsErrorCode::NoEntry,
+        io::ErrorKind::PermissionDenied => FsErrorCode::Access,
+        io::ErrorKind::AlreadyExists => FsErrorCode::Exists,
+        _ => FsErrorCode::Io,
+    }
+}
+
+fn fs_io_error(related_id: u64, error: &io::Error, context: &str) -> V3Message {
+    V3Message::Error {
+        related_id,
+        code: fs_code_for(error),
+        platform_errno: error.raw_os_error().unwrap_or(0),
+        message: format!("{context}: {error}").into_bytes(),
+    }
+}
+
+/// A path that left the export, or was never representable, never reaches the
+/// filesystem.
+fn fs_path_error(related_id: u64, error: &ServerError) -> V3Message {
+    let code = match error {
+        ServerError::SymlinkEscape(_) => FsErrorCode::Access,
+        _ => FsErrorCode::Invalid,
+    };
+    fs_error(related_id, code, &error.to_string())
+}
+
+/// An opaque 16-byte value that changes whenever the file does.
+///
+/// Derived from identity, length and both timestamps, so an edit that
+/// preserves length still changes it. It is a digest rather than a packed
+/// tuple because the contract says opaque, and a client that starts parsing
+/// one would be relying on something this may change.
+fn change_cookie(metadata: &fs::Metadata) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&metadata.len().to_le_bytes());
+    hasher.update(
+        &metadata
+            .modified()
+            .map(system_time_to_nanos)
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(&metadata.dev().to_le_bytes());
+        hasher.update(&metadata.ino().to_le_bytes());
+        hasher.update(&metadata.ctime().to_le_bytes());
+        hasher.update(&metadata.ctime_nsec().to_le_bytes());
+    }
+    let mut cookie = [0_u8; 16];
+    cookie.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    cookie
+}
+
+/// Build an `Attrs` record, filling the optional blocks the mask asked for.
+///
+/// A block the mask did not ask for, or that this platform cannot answer, is
+/// simply absent: the contract lets the response be a strict subset of the
+/// mask, and a client must render with any of them missing.
+fn attrs_from_metadata(metadata: &fs::Metadata, path: &Path, attr_mask: u32) -> protocol_v3::Attrs {
+    use protocol_v3::attr_presence as presence;
+
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_file() {
+        1
+    } else if file_type.is_dir() {
+        2
+    } else if file_type.is_symlink() {
+        3
+    } else {
+        4
+    };
+    let mut attrs = protocol_v3::Attrs::minimal(
+        kind,
+        permission_mode(metadata),
+        metadata.len(),
+        metadata
+            .modified()
+            .map(system_time_to_nanos)
+            .unwrap_or_default(),
+        change_cookie(metadata),
+    );
+    let wants = |bit: u32| attr_mask & bit != 0;
+    if wants(presence::ATIME) {
+        attrs.atime_ns = metadata.accessed().ok().map(system_time_to_nanos);
+    }
+    if wants(presence::BTIME) {
+        attrs.btime_ns = metadata.created().ok().map(system_time_to_nanos);
+    }
+    if wants(presence::SYMLINK_TARGET) && kind == 3 {
+        attrs.symlink_target = fs::read_link(path)
+            .ok()
+            .map(|target| native_path_bytes(target.as_os_str()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if wants(presence::OWNER) {
+            attrs.owner = Some((metadata.uid(), metadata.gid()));
+        }
+        if wants(presence::NLINK) {
+            attrs.nlink = u32::try_from(metadata.nlink()).ok();
+        }
+        if wants(presence::CTIME) {
+            attrs.ctime_ns = Some(
+                metadata
+                    .ctime()
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(metadata.ctime_nsec()),
+            );
+        }
+        if wants(presence::IDENTITY) {
+            attrs.identity = Some((metadata.dev(), metadata.ino()));
+        }
+        if wants(presence::RDEV) && kind == 4 {
+            attrs.rdev = Some(metadata.rdev());
+        }
+        if wants(presence::ALLOCATED_SIZE) {
+            attrs.allocated_size = Some(metadata.blocks().saturating_mul(512));
+        }
+    }
+    // NAMES is never filled: resolving a uid to a name needs `getpwuid`, and
+    // the server does not advertise the OWNER_NAMES feature that would let a
+    // client ask for it.
+    attrs
+}
+
+#[cfg(unix)]
+fn apply_unix_open_flags(options: &mut fs::OpenOptions, flags: u32, mode: u32) {
+    use protocol_v3::open_flags;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if flags & open_flags::CREATE != 0 {
+        options.mode(mode & protocol_v3::MAX_MODE);
+    }
+    if flags & open_flags::NOFOLLOW != 0 {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+}
+
+#[cfg(not(unix))]
+fn apply_unix_open_flags(_options: &mut fs::OpenOptions, _flags: u32, _mode: u32) {}
+
+/// Open a file or directory and put it in the session's handle table.
+fn open_handle(
+    state: &FsSessionState,
+    related_id: u64,
+    path: &[u8],
+    flags: u32,
+    mode: u32,
+    attr_mask: u32,
+) -> V3Message {
+    use protocol_v3::open_flags;
+
+    let native = match browse_stat_path(&state.root, path) {
+        Ok(native) => native,
+        Err(error) => return fs_path_error(related_id, &error),
+    };
+
+    // Reserved before the open, so a session cannot exhaust the process's
+    // descriptors. The slot is released on every failure path below by the
+    // guard's `Drop`.
+    let Some(mut slot) = state.reserve_handle() else {
+        return fs_error(
+            related_id,
+            FsErrorCode::Limit,
+            "too many open handles on this session",
+        );
+    };
+
+    let directory = flags & open_flags::DIRECTORY != 0;
+    // `symlink_metadata` rather than `metadata`: with NOFOLLOW the answer must
+    // describe the link itself, and without it the open below follows anyway.
+    let existing = fs::symlink_metadata(&native);
+    if let Ok(metadata) = &existing {
+        if metadata.file_type().is_symlink() && flags & open_flags::NOFOLLOW != 0 {
+            return fs_error(
+                related_id,
+                FsErrorCode::Loop,
+                "path is a symbolic link and NOFOLLOW was requested",
+            );
+        }
+    }
+
+    let handle = if directory {
+        let metadata = match fs::metadata(&native) {
+            Ok(metadata) => metadata,
+            Err(error) => return fs_io_error(related_id, &error, "open directory"),
+        };
+        if !metadata.is_dir() {
+            return fs_error(
+                related_id,
+                FsErrorCode::NotDirectory,
+                "DIRECTORY was requested but the path is not a directory",
+            );
+        }
+        OpenHandle {
+            path: native,
+            file: None,
+            flags,
+        }
+    } else {
+        // A directory opened without DIRECTORY would produce a handle no read
+        // or write could use, so refuse it here rather than at first use.
+        if existing.is_ok_and(|metadata| metadata.is_dir()) {
+            return fs_error(
+                related_id,
+                FsErrorCode::IsDirectory,
+                "path is a directory; open it with the DIRECTORY flag",
+            );
+        }
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(flags & open_flags::READ != 0)
+            .write(flags & open_flags::WRITE != 0 && flags & open_flags::APPEND == 0)
+            .append(flags & open_flags::APPEND != 0)
+            .truncate(flags & open_flags::TRUNC != 0);
+        if flags & open_flags::EXCL != 0 {
+            options.create_new(true);
+        } else if flags & open_flags::CREATE != 0 {
+            options.create(true);
+        }
+        apply_unix_open_flags(&mut options, flags, mode);
+        match options.open(&native) {
+            Ok(file) => OpenHandle {
+                path: native,
+                file: Some(file),
+                flags,
+            },
+            Err(error) => return fs_io_error(related_id, &error, "open"),
+        }
+    };
+
+    let metadata = match handle.file.as_ref() {
+        Some(file) => file.metadata(),
+        None => fs::metadata(&handle.path),
+    };
+    let metadata = match metadata {
+        Ok(metadata) => metadata,
+        Err(error) => return fs_io_error(related_id, &error, "stat after open"),
+    };
+    let attrs = attrs_from_metadata(&metadata, &handle.path, attr_mask);
+
+    let id = state.next_handle.fetch_add(1, Ordering::Relaxed);
+    match state.handles.write() {
+        Ok(mut handles) => {
+            handles.insert(id, Arc::new(handle));
+            slot.committed = true;
+        }
+        Err(_) => return fs_error(related_id, FsErrorCode::Io, "handle table is poisoned"),
+    }
+    V3Message::Opened {
+        related_id,
+        handle: id,
+        attrs,
+    }
+}
+
+/// Drop a handle. Closing one that is not open is this request's error, never
+/// the session's.
+fn close_handle(state: &FsSessionState, related_id: u64, handle: u64) -> V3Message {
+    match state.handles.write() {
+        Ok(mut handles) => {
+            if handles.remove(&handle).is_some() {
+                state.release_handle();
+                V3Message::Done { related_id }
+            } else {
+                fs_error(related_id, FsErrorCode::BadHandle, "no such handle")
+            }
+        }
+        Err(_) => fs_error(related_id, FsErrorCode::Io, "handle table is poisoned"),
+    }
+}
+
 /// Whether a request would modify the export, and so must be refused on a
 /// mount that is not writable before it reaches the filesystem.
 fn fs_is_write_class(request: &V3Message) -> bool {
@@ -1845,6 +2217,7 @@ pub struct Server {
     fs_max_in_flight: usize,
     fs_workers: usize,
     fs_read_only: bool,
+    fs_max_handles: usize,
     fs_handler: Arc<dyn FsHandler>,
 }
 
@@ -1873,6 +2246,7 @@ impl Server {
             fs_max_in_flight: DEFAULT_FS_MAX_IN_FLIGHT,
             fs_workers: DEFAULT_FS_WORKERS,
             fs_read_only: false,
+            fs_max_handles: DEFAULT_FS_MAX_HANDLES,
             fs_handler: Arc::new(ServerFsHandler),
         }
     }
@@ -1904,6 +2278,18 @@ impl Server {
         );
         self.fs_max_in_flight = max_in_flight;
         self.fs_workers = workers;
+        self
+    }
+
+    /// Bound the open handles one v3 session may hold.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bound is zero, which would make every `Open` fail.
+    #[must_use]
+    pub fn with_fs_max_handles(mut self, max_handles: usize) -> Self {
+        assert!(max_handles > 0, "a session must be allowed one handle");
+        self.fs_max_handles = max_handles;
         self
     }
 
@@ -2133,6 +2519,10 @@ impl Server {
             root: self.root.clone(),
             read_only: self.fs_read_only,
             cancelled: Mutex::new(HashSet::new()),
+            handles: RwLock::new(HashMap::new()),
+            next_handle: AtomicU64::new(1),
+            reserved_handles: AtomicU64::new(0),
+            max_handles: self.fs_max_handles as u64,
         });
         let (work, jobs) = crossbeam_channel::unbounded::<FsJob>();
         for _ in 0..self.fs_workers {
@@ -4558,6 +4948,12 @@ pub const DEFAULT_FS_MAX_IN_FLIGHT: usize = 64;
 /// `MountInfo`. The envelope caps this at `MAX_DATA_SEGMENT` (8 MiB); 1 MiB is
 /// the point where a read is one frame and still fits comfortably in flight.
 pub const DEFAULT_FS_MAX_TRANSFER: u32 = 1024 * 1024;
+
+/// Open handles allowed on one session (`xsyncv3.md` E1-S5).
+///
+/// Bounded so one session cannot exhaust the process's descriptors; a server
+/// serving many sessions is bounded by this times its session limit.
+pub const DEFAULT_FS_MAX_HANDLES: usize = 1024;
 
 /// Worker threads executing v3 requests for one session.
 ///
@@ -9597,7 +9993,9 @@ mod tests {
     /// the server wrote them, with the `FeaturesAck` and `MountInfo` that open
     /// every session dropped.
     fn fs_run_server(mut server: Server, requests: &[(u64, V3Message)]) -> Vec<V3Frame> {
-        let mut frames = vec![(2, V3Message::Features { features: 0 }), (1000, fs_mount())];
+        // Id 1 for the mount: ids need only be unique, and tests own every id
+        // from 3 up, including the thousands the leak test uses.
+        let mut frames = vec![(2, V3Message::Features { features: 0 }), (1, fs_mount())];
         frames.extend(requests.iter().cloned());
         let mut output = Vec::new();
         server
@@ -9892,6 +10290,289 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn fs_open(path: &[u8], flags: u32, attr_mask: u32) -> V3Message {
+        V3Message::Open {
+            path: path.to_vec(),
+            flags,
+            mode: 0,
+            attr_mask,
+        }
+    }
+
+    /// Run against a populated root, returning the replies after the mount.
+    fn fs_run_in(root: &Path, requests: &[(u64, V3Message)]) -> Vec<V3Frame> {
+        fs_run_server(Server::new(root), requests)
+    }
+
+    /// As [`fs_run_in`] with one worker, so pooled requests execute in send
+    /// order. Only for tests whose *subject* is a sequence — the dispatcher
+    /// gives no ordering between requests that do not name one handle.
+    fn fs_run_serial(root: &Path, requests: &[(u64, V3Message)]) -> Vec<V3Frame> {
+        fs_run_server(
+            Server::new(root).with_fs_limits(requests.len().max(1) + 1, 1),
+            requests,
+        )
+    }
+
+    #[test]
+    fn fs_open_returns_a_handle_and_the_attributes_of_the_file() {
+        use protocol_v3::{attr_presence as presence, open_flags};
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file.txt"), b"hello").unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (
+                    3,
+                    fs_open(
+                        b"file.txt",
+                        open_flags::READ,
+                        presence::OWNER | presence::IDENTITY | presence::NLINK,
+                    ),
+                ),
+                // The first handle of a session is 1; a test that needed to
+                // discover it would need a live transport, not a fixed script.
+                (4, V3Message::Close { handle: 1 }),
+            ],
+        );
+
+        let V3Message::Opened {
+            related_id,
+            handle,
+            attrs,
+        } = &replies[0].message
+        else {
+            panic!("expected Opened, got {:?}", replies[0].message)
+        };
+        assert_eq!(*related_id, 3);
+        // Zero is never a handle, so a client cannot mistake a default for one.
+        assert_ne!(*handle, 0);
+        assert_eq!(attrs.kind, 1);
+        assert_eq!(attrs.size, 5);
+        assert_ne!(attrs.change_cookie, [0; 16]);
+        // Exactly the blocks the mask asked for, and no others.
+        assert!(attrs.identity.is_some() && attrs.nlink.is_some());
+        assert_eq!(attrs.atime_ns, None);
+        assert_eq!(attrs.allocated_size, None);
+        assert_eq!(attrs.names, None);
+        if cfg!(unix) {
+            assert!(attrs.owner.is_some());
+        }
+        assert_eq!(replies[1].message, V3Message::Done { related_id: 4 });
+    }
+
+    #[test]
+    fn fs_open_reports_a_changed_file_with_a_different_cookie() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        fs::write(&path, b"one").unwrap();
+        let first = fs_run_in(
+            root.path(),
+            &[(3, fs_open(b"file.txt", open_flags::READ, 0))],
+        );
+        // Same length, different content: a cookie derived from size alone
+        // would miss this.
+        fs::write(&path, b"two").unwrap();
+        let second = fs_run_in(
+            root.path(),
+            &[(3, fs_open(b"file.txt", open_flags::READ, 0))],
+        );
+
+        let cookie = |frame: &V3Frame| match &frame.message {
+            V3Message::Opened { attrs, .. } => attrs.change_cookie,
+            other => panic!("expected Opened, got {other:?}"),
+        };
+        assert_ne!(cookie(&first[0]), cookie(&second[0]));
+    }
+
+    #[test]
+    fn fs_close_of_an_unknown_handle_is_this_requests_error() {
+        let root = tempdir().unwrap();
+        let replies = fs_run_in(
+            root.path(),
+            &[
+                (3, V3Message::Close { handle: 4242 }),
+                // The session is still healthy afterwards.
+                (4, V3Message::Keepalive { nonce: 1 }),
+            ],
+        );
+        // Searched rather than indexed: the keepalive is answered on the
+        // session thread and legitimately overtakes the pooled close.
+        assert!(
+            replies.iter().any(|frame| matches!(
+                frame.message,
+                V3Message::Error {
+                    related_id: 3,
+                    code: FsErrorCode::BadHandle,
+                    ..
+                }
+            )),
+            "{replies:?}"
+        );
+        assert!(replies
+            .iter()
+            .any(|frame| frame.message == V3Message::KeepaliveAck { nonce: 1 }));
+    }
+
+    #[test]
+    fn fs_open_maps_filesystem_failures_onto_the_frozen_codes() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("taken"), b"x").unwrap();
+
+        let replies = fs_run_in(
+            root.path(),
+            &[
+                (3, fs_open(b"missing", open_flags::READ, 0)),
+                (
+                    4,
+                    fs_open(
+                        b"taken",
+                        open_flags::WRITE | open_flags::CREATE | open_flags::EXCL,
+                        0,
+                    ),
+                ),
+                // A directory without DIRECTORY yields a handle nothing could
+                // use, so it is refused at open rather than at first read.
+                (5, fs_open(b"dir", open_flags::READ, 0)),
+                (
+                    6,
+                    fs_open(b"taken", open_flags::READ | open_flags::DIRECTORY, 0),
+                ),
+                (
+                    7,
+                    fs_open(b"dir", open_flags::READ | open_flags::DIRECTORY, 0),
+                ),
+            ],
+        );
+
+        let code = |frame: &V3Frame| match &frame.message {
+            V3Message::Error { code, .. } => *code,
+            other => panic!("expected Error, got {other:?}"),
+        };
+        assert_eq!(code(&replies[0]), FsErrorCode::NoEntry);
+        assert_eq!(code(&replies[1]), FsErrorCode::Exists);
+        assert_eq!(code(&replies[2]), FsErrorCode::IsDirectory);
+        assert_eq!(code(&replies[3]), FsErrorCode::NotDirectory);
+        assert!(matches!(replies[4].message, V3Message::Opened { .. }));
+    }
+
+    #[test]
+    fn fs_open_confines_every_path_to_the_export() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret"), b"private").unwrap();
+        fs::create_dir(root.path().join("inside")).unwrap();
+
+        let mut requests = vec![
+            // Rejected by the wire path type before any syscall.
+            (3, fs_open(b"../secret", open_flags::READ, 0)),
+            (4, fs_open(b"/etc/passwd", open_flags::READ, 0)),
+            (5, fs_open(b"inside/../../secret", open_flags::READ, 0)),
+        ];
+        #[cfg(unix)]
+        {
+            // A symlink in a parent component may not redirect the open out of
+            // the export, even though every component is individually legal.
+            std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+            requests.push((6, fs_open(b"link/secret", open_flags::READ, 0)));
+        }
+
+        let replies = fs_run_in(root.path(), &requests);
+        for frame in &replies {
+            match &frame.message {
+                V3Message::Error { code, .. } => assert!(
+                    matches!(code, FsErrorCode::Invalid | FsErrorCode::Access),
+                    "{frame:?}"
+                ),
+                other => panic!("path escaped the export: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fs_open_is_bounded_by_the_session_handle_limit() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        for index in 0..4 {
+            fs::write(root.path().join(format!("f{index}")), b"x").unwrap();
+        }
+        let requests: Vec<_> = (0..4)
+            .map(|index| {
+                (
+                    index + 3,
+                    fs_open(format!("f{index}").as_bytes(), open_flags::READ, 0),
+                )
+            })
+            .collect();
+
+        let replies = fs_run_server(Server::new(root.path()).with_fs_max_handles(2), &requests);
+        let opened = replies
+            .iter()
+            .filter(|frame| matches!(frame.message, V3Message::Opened { .. }))
+            .count();
+        let limited = replies
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame.message,
+                    V3Message::Error {
+                        code: FsErrorCode::Limit,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(opened, 2);
+        assert_eq!(limited, 2);
+    }
+
+    #[test]
+    fn fs_open_and_close_cycles_do_not_leak_descriptors() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"x").unwrap();
+
+        // Far more cycles than the process has descriptors: a handle that
+        // outlived its Close would exhaust them and start failing EMFILE long
+        // before the end. One session, so the table is the only thing keeping
+        // the files open.
+        let cycles = 10_000_u64;
+        let mut requests = Vec::with_capacity(cycles as usize * 2);
+        for index in 0..cycles {
+            requests.push((index * 2 + 3, fs_open(b"file", open_flags::READ, 0)));
+            requests.push((index * 2 + 4, V3Message::Close { handle: index + 1 }));
+        }
+
+        let replies = fs_run_server(
+            // One worker, so each cycle's open and close run before the next
+            // and the handle ids stay predictable. The whole script is fed at
+            // once, so the in-flight bound has to admit all of it.
+            Server::new(root.path()).with_fs_limits(requests.len() + 1, 1),
+            &requests,
+        );
+        assert_eq!(replies.len() as u64, cycles * 2);
+        for frame in &replies {
+            assert!(
+                matches!(
+                    frame.message,
+                    V3Message::Opened { .. } | V3Message::Done { .. }
+                ),
+                "cycle failed, likely a leaked descriptor: {frame:?}"
+            );
+        }
     }
 
     #[test]

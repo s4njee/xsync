@@ -10,6 +10,11 @@ one end of a transfer actually has.
 ## [Unreleased]
 
 ### Added
+- Protocol v3 `Open`/`Close`: a session holds a bounded table of open file and
+  directory handles. `Open` answers with the handle plus the attributes the
+  request's `attr_mask` asked for, including an opaque change cookie, so an open
+  needs no follow-up stat. Paths are confined to the export before any
+  filesystem call.
 - Protocol v3 `Mount`: a session attaches to the `xs --server` root and receives
   its writability, the reason a write is refused, case/normalization semantics,
   name and path limits, and a `supports` bitmap. `xs --server --read-only` serves

@@ -437,10 +437,25 @@ asked for it.
   flag. `mode` is at most `0o7777` and must be `0` unless `CREATE` is set. A
   write-class open against a mount whose `effective_writable` is false is
   refused with `Error` code `3 EROFS` before any filesystem call.
-- Handles are `u64`, session-scoped, never reused within a server lifetime.
-  Requests on one handle are applied in send order; requests on different
-  handles or paths have no ordering guarantee and the server may answer them
-  out of order (responses correlate by related request ID).
+- Handles are `u64`, session-scoped, and never reused within a session. `0` is
+  never a handle. They are not unique across sessions and need not be: a handle
+  means nothing to a session that did not open it, and a session that resumes
+  (E3-S2) keeps its own table. Requests on one handle are applied in send
+  order; requests on different handles or paths have no ordering guarantee and
+  the server may answer them out of order (responses correlate by related
+  request ID).
+- `Open` answers `Opened` with the handle and the target's attributes, so an
+  open needs no follow-up `Stat`. A directory must be opened with `DIRECTORY`,
+  and a directory opened without it is `EISDIR` rather than a handle no read or
+  write could use; `DIRECTORY` on a non-directory is `ENOTDIR`. With
+  `NOFOLLOW`, a final symlink is `ELOOP`. A path that leaves the export is
+  refused before any filesystem call: `EINVAL` for one the wire format rejects
+  (absolute, empty component, `.`, `..`, NUL) and `EACCES` for a symlink in a
+  parent component.
+- A server bounds the handles one session may hold; past the bound `Open` is
+  `ELIMIT`. `Close` releases the handle and any lock or lease held through it;
+  closing a handle that is not open is `EBADF` for that request and never a
+  session error. Every handle is released when the session ends.
 - A server bounds the accepted-but-unanswered requests on one session. Past that
   bound a request is answered with `Error` code `24 ELIMIT` and is not executed;
   the session itself is unaffected and the client may retry once a response has

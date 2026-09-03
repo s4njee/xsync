@@ -30,8 +30,9 @@ compatibility-matrix row and the f2/Kestrel consumer decision.
 | 1 | E3-S7 — Error model (Phase 1 scope) | **Done** 2026-09-03 |
 | 1 | E3-S1 — Concurrent requests | **Done** 2026-09-03 |
 | 1 | E1-S4 — Mount and advertised writability (Phase 1 scope) | **Done** 2026-09-03 |
-| 1 | E4-S1 — Open and close handles | Next |
-| 1 | E4-S2–S3, E4-S8, E5-S1–S3, E9-S1/S4/S6, E10-S1/S4 | Not started |
+| 1 | E4-S1 — Open and close handles | **Done** 2026-09-03 |
+| 1 | E4-S2 / E4-S3 — Positional read and write | Next |
+| 1 | E4-S8, E5-S1–S3, E9-S1/S4/S6, E10-S1/S4 | Not started |
 | 2–6 | everything else | Not started |
 
 All of the above is on xsync branch `v3`, **uncommitted**. §0 below still describes the
@@ -608,24 +609,83 @@ As a client I can abandon a request I no longer need.
 (XS-C1) and the one Excalibur's Quick Look, Edit-in-place, video preview and resumable
 transfers all sit on.*
 
-#### X3-E4-S1 — Open and close handles
+#### X3-E4-S1 — Open and close handles — **Done**
+
+*Landed 2026-09-03 on xsync branch `v3`.*
+
 As a client I can open a file and hold a handle across many operations.
 
 **AC**
-- `Open(path, flags, mode, attr_mask)` → `handle u64`, plus the file's attributes
+- [x] `Open(path, flags, mode, attr_mask)` → `handle u64`, plus the file's attributes
   (E5-S1) and change cookie (E6-S4) so an open needs no extra stat.
-- Flags: `READ`, `WRITE`, `CREATE`, `EXCL` (create-new), `TRUNC`, `APPEND`,
+- [x] Flags: `READ`, `WRITE`, `CREATE`, `EXCL` (create-new), `TRUNC`, `APPEND`,
   `NOFOLLOW`, `DIRECTORY` (for directory handles used by E5-S2 and E7). Unknown flag
-  bits are a protocol error.
-- Mode applies only with `CREATE`; the server applies `mode & 0o7777` then the
-  identity's umask policy (configurable per export).
-- `Close(handle)` releases locks and leases held through it; closing an unknown
-  handle is `EBADF`-class, not a session error.
-- Handles are session-scoped and survive reconnect (E3-S2). All handles are closed
-  when the session is finally torn down; the server never leaks descriptors
-  (test with `lsof`-style count before/after 10,000 open/close cycles).
-- A write-class `Open` against an `ro` mount is refused with `EROFS` before any
-  filesystem call.
+  bits are a protocol error. *(Rejected by the codec since the Phase 1 freeze.)*
+- [x] Mode applies only with `CREATE`; the server applies `mode & 0o7777` then the
+  identity's umask policy. *(The process umask applies, as it does to any create.
+  A per-export umask needs the exports file, E1-S2.)*
+- [x] `Close(handle)` releases locks and leases held through it; closing an unknown
+  handle is `EBADF`-class, not a session error. *(No locks or leases exist yet;
+  `Close` drops the open file, which is everything a handle holds today.)*
+- [x] All handles are closed when the session is finally torn down; the server never
+  leaks descriptors (test with 10,000 open/close cycles).
+- [ ] Handles survive reconnect. **Deferred** with session resume itself (E3-S2).
+- [x] A write-class `Open` against an `ro` mount is refused with `EROFS` before any
+  filesystem call. *(Delivered by E1-S4's session-thread gate.)*
+
+**Results**
+
+- `FsSessionState` gains the handle table: `RwLock<HashMap<u64, Arc<OpenHandle>>>`.
+  Handles are `Arc`ed so a worker clones one out and releases the lock before doing
+  any I/O — a slow read must not block an unrelated `Open`.
+- **No lock around the open file itself.** Positional I/O uses `FileExt::read_at` /
+  `write_at`, which take `&self`, so several workers can use one open file
+  concurrently and there is no shared seek offset to race over. That is what makes
+  E4-S2 and E4-S3 straightforward, and it is why the handle stores a bare
+  `Option<fs::File>`.
+- **The handle cap needed an atomic reservation, not a length check.** The first
+  implementation compared `handles.len()` against the limit before opening; with
+  eight workers every one of them saw room at once and the cap overshot by the width
+  of the pool. A test caught it. Slots are now reserved with `fetch_add` *before* the
+  open and released by a `Drop` guard on every failure path, so the bound holds
+  regardless of pool width.
+- Confinement reuses `browse_stat_path`, which rejects a symlink in any parent
+  component, over `WirePath::from_wire`, which rejects absolute paths, empty
+  components, `.`, `..` and NUL. A path that leaves the export never reaches a
+  syscall: `EINVAL` for one the wire format rejects, `EACCES` for a symlink escape.
+  Tested against `../secret`, `/etc/passwd`, `inside/../../secret`, and a real
+  symlink pointing outside the root.
+- A directory opened without `DIRECTORY` is `EISDIR` rather than a handle no read or
+  write could use; `DIRECTORY` on a non-directory is `ENOTDIR`; `NOFOLLOW` on a
+  symlink is `ELOOP`. Refusing at open beats failing at first use.
+- `fs_code_for` maps errno onto the frozen table and keeps the raw errno alongside
+  it, so two failures sharing a code stay distinguishable without the table growing.
+- `attrs_from_metadata` fills exactly the optional blocks the `attr_mask` asked for
+  and silently omits any this platform cannot answer, which is what the contract
+  allows. `NAMES` is never filled: resolving a uid needs `getpwuid`, and the server
+  does not advertise `OWNER_NAMES`.
+- `change_cookie` is BLAKE3 over identity, length and both timestamps, truncated to
+  16 bytes — a digest rather than a packed tuple because the contract says opaque,
+  and a client that started parsing one would depend on something free to change. A
+  test rewrites a file with the same length and asserts the cookie moves.
+- **A doc correction:** the freeze said handles are "never reused within a server
+  lifetime". They are per-session, and that is the meaningful contract — a handle
+  means nothing to a session that did not open it, and a resumed session keeps its
+  own table — so `protocol.md` now says never reused *within a session*. Prose, not
+  wire layout.
+- Seven new tests, including the 10,000-cycle leak check: far more cycles than the
+  process has descriptors, so a handle outliving its `Close` exhausts them and starts
+  failing `EMFILE` long before the end.
+
+**Next steps**
+
+- **E4-S2 (`Read`)** and **E4-S3 (`Write`)** are the natural pair and both sit
+  directly on `read_at`/`write_at`. `Read` must refuse a handle opened write-only and
+  a directory handle; `Write` must honour `APPEND` ignoring its offset — both are why
+  `OpenHandle` stores the flags it was opened with.
+- **E5-S2 (`ReadDir`)** consumes the directory handles this story creates.
+- The `Arc<OpenHandle>` clone-and-release pattern is the one to keep: it is what lets
+  the pool stay concurrent once handlers actually block on I/O.
 
 #### X3-E4-S2 — Positional read
 As a client I can read any byte range of an open file, with pipelining.
@@ -1172,7 +1232,7 @@ method list to be revised against what the GUI actually needs once M1 is running
 
 | Phase | Stories | Unlocks |
 |---|---|---|
-| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, **E4-S1 next**, E4-S2–S3, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
+| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, **E4-S2–S3 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
 | **2. Daemon, TLS, identity** | E1-S1–S3, E1-S5, E2-S1, E2-S3–S5, E10-S2, E10-S6, E12-S1–S3 | Connect without SSH; exports; principals; the "New Connection" dialog's xsync tab is complete. |
 | **3. Durability and coherence** | E3-S2, E3-S3, E3-S5, E4-S6, E4-S7, E6-S1, E6-S4, E6-S5, E5-S4, E5-S7 | Resumable uploads that survive drops; locks for edit-in-place; complete mutation set. |
 | **4. Live views and speed** | E7, E6-S2, E8-S1–S5, E5-S2 cursor fix, E5-S5, E4-S4, E4-S5 | Auto-refreshing listings, leases, compound open-read, sparse. |
