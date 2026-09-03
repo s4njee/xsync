@@ -10224,26 +10224,20 @@ mod tests {
         );
 
         assert_eq!(replies.len(), 3);
-        for (index, expected) in [(0, 3_u64), (1, 4)] {
-            match &replies[index].message {
-                V3Message::Error {
-                    related_id,
-                    code,
-                    message,
-                    ..
-                } => {
-                    assert_eq!(*related_id, expected);
-                    assert_eq!(*code, FsErrorCode::ReadOnly);
+        for id in [3_u64, 4] {
+            match fs_reply(&replies, id) {
+                V3Message::Error { code, message, .. } => {
+                    assert_eq!(*code, FsErrorCode::ReadOnly, "request {id}");
                     // The refusal carries the mount's own reason, so a client
                     // shows one explanation everywhere.
                     assert_eq!(message, b"export is read-only");
                 }
-                other => panic!("expected EROFS, got {other:?}"),
+                other => panic!("request {id}: expected EROFS, got {other:?}"),
             }
         }
         // The read-class open was not gated and did reach the pool; the two
         // write-class requests never did.
-        assert_eq!(replies[2].message, V3Message::Done { related_id: 5 });
+        assert_eq!(*fs_reply(&replies, 5), V3Message::Done { related_id: 5 });
         assert_eq!(
             *recorder.seen.lock().unwrap(),
             vec![protocol_v3::types::OPEN]
@@ -10316,6 +10310,36 @@ mod tests {
         )
     }
 
+    const fn fs_related_id(message: &V3Message) -> Option<u64> {
+        match message {
+            V3Message::Error { related_id, .. }
+            | V3Message::Done { related_id }
+            | V3Message::Opened { related_id, .. }
+            | V3Message::MountInfo { related_id, .. }
+            | V3Message::AttrsResponse { related_id, .. }
+            | V3Message::ReadData { related_id, .. }
+            | V3Message::WriteAck { related_id, .. }
+            | V3Message::DirPage { related_id, .. }
+            | V3Message::FsInfo { related_id, .. }
+            | V3Message::FeaturesAck { related_id, .. } => Some(*related_id),
+            _ => None,
+        }
+    }
+
+    /// The reply to one request.
+    ///
+    /// Responses carry the id they answer precisely because they are not
+    /// ordered. A test that indexes them positionally asserts something the
+    /// dispatcher does not promise and fails whenever the pool happens to
+    /// finish them in a different order.
+    fn fs_reply(replies: &[V3Frame], related_id: u64) -> &V3Message {
+        replies
+            .iter()
+            .map(|frame| &frame.message)
+            .find(|message| fs_related_id(message) == Some(related_id))
+            .unwrap_or_else(|| panic!("no reply to request {related_id} in {replies:?}"))
+    }
+
     #[test]
     fn fs_open_returns_a_handle_and_the_attributes_of_the_file() {
         use protocol_v3::{attr_presence as presence, open_flags};
@@ -10344,9 +10368,9 @@ mod tests {
             related_id,
             handle,
             attrs,
-        } = &replies[0].message
+        } = fs_reply(&replies, 3)
         else {
-            panic!("expected Opened, got {:?}", replies[0].message)
+            panic!("expected Opened, got {:?}", fs_reply(&replies, 3))
         };
         assert_eq!(*related_id, 3);
         // Zero is never a handle, so a client cannot mistake a default for one.
@@ -10362,7 +10386,7 @@ mod tests {
         if cfg!(unix) {
             assert!(attrs.owner.is_some());
         }
-        assert_eq!(replies[1].message, V3Message::Done { related_id: 4 });
+        assert_eq!(*fs_reply(&replies, 4), V3Message::Done { related_id: 4 });
     }
 
     #[test]
@@ -10454,15 +10478,18 @@ mod tests {
             ],
         );
 
-        let code = |frame: &V3Frame| match &frame.message {
-            V3Message::Error { code, .. } => *code,
-            other => panic!("expected Error, got {other:?}"),
-        };
-        assert_eq!(code(&replies[0]), FsErrorCode::NoEntry);
-        assert_eq!(code(&replies[1]), FsErrorCode::Exists);
-        assert_eq!(code(&replies[2]), FsErrorCode::IsDirectory);
-        assert_eq!(code(&replies[3]), FsErrorCode::NotDirectory);
-        assert!(matches!(replies[4].message, V3Message::Opened { .. }));
+        for (id, expected) in [
+            (3, FsErrorCode::NoEntry),
+            (4, FsErrorCode::Exists),
+            (5, FsErrorCode::IsDirectory),
+            (6, FsErrorCode::NotDirectory),
+        ] {
+            match fs_reply(&replies, id) {
+                V3Message::Error { code, .. } => assert_eq!(*code, expected, "request {id}"),
+                other => panic!("request {id}: expected Error, got {other:?}"),
+            }
+        }
+        assert!(matches!(fs_reply(&replies, 7), V3Message::Opened { .. }));
     }
 
     #[test]

@@ -620,8 +620,14 @@ pub fn sync_push<F: FnMut(LocalEvent)>(
         options.dry_run,
     );
     let wire_bytes = writer.bytes;
-    drop(reader);
+    // Same ordering rule as the pull path above: the remote receiver also
+    // writes a closing exchange, and closing its stdout first would give it
+    // EPIPE for the same reason. No test has caught this one, but it is the
+    // same race with the same fix.
     drop(writer);
+    let mut trailing = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut reader, &mut trailing);
+    drop(reader);
     if let Ok(report) = &mut result {
         report.wire_bytes = wire_bytes;
     }
@@ -689,9 +695,20 @@ pub fn sync_pull<F: FnMut(LocalEvent)>(
         options,
         &mut emit,
     );
+    // Close the remote's stdin *before* its stdout. The other order leaves
+    // GNU's sender writing into a pipe with no reader: it takes EPIPE, reports
+    // `write error: Broken pipe` and exits 10. Whether it had already flushed
+    // its closing bytes into the pipe buffer decided whether a run passed,
+    // which is what made these transfers fail intermittently under load.
+    drop(writer);
+    // Then take whatever it writes on the way out, so it always has a reader
+    // until it is finished and the wire count includes those bytes. A failure
+    // here is not itself interesting: the child's exit status below is what
+    // says whether the transfer was sound.
+    let mut trailing = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut reader, &mut trailing);
     let wire_bytes = reader.get_ref().bytes;
     drop(reader);
-    drop(writer);
     let status = finish_child(&mut child, stderr_thread);
 
     match (result, status) {
