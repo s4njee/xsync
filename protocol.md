@@ -279,3 +279,212 @@ Malformed compression, a compressed output larger than the declared bounded
 length, or a declared decompressed length over 16 MiB is rejected before any
 filesystem publication. Protocol decoding does not write destination files;
 the sink may consume only fully decoded and separately verified operations.
+
+## v3 message table
+
+Protocol v3 is the random-access filesystem surface specified in `xsyncv3.md`.
+It uses the same 32-byte envelope shape and `xsn1` magic; the envelope version
+is `3` after the handshake selects v3. The v1 opening handshake and its
+acknowledgement remain v1 envelope frames as specified by `v2handshake.md`.
+Selection requires both peers to advertise `CAP_VERSION_NEGOTIATION` and
+`CAP_FS_V3` (`1 << 7`); otherwise the v2 rule applies unchanged. A v3 client
+against a v2 server therefore gets browse v2 with reduced capability, and a v2
+client never receives a v3 frame.
+
+The v3 reader is fail-closed in exactly the way the v2 reader is: it accepts
+only the types below, checks every bound before allocation, rejects unknown
+flag and presence bits, rejects field pairs that disagree, and rejects
+trailing payload bytes. A v3 selection is never inferred from a v2 decode
+failure and a v3 decode failure never restarts negotiation.
+
+This table is the **Phase 1 freeze** (`xsyncv3.md` §5): the types a client
+needs to mount, open, read, write, stat, list and measure capacity. Later
+phases add types in the reserved ranges below; they never change a type
+listed here. The consuming implementations are xsync and Excalibur; f2 does
+not implement v3.
+
+### Shared control types
+
+Types `18 CancelRequest`, `19 Keepalive` and `20 KeepaliveAck` are accepted in a
+v3 session with their v2 payload layouts unchanged. Cancellation applies to
+every v3 request type, including an in-flight `Read` or `ReadDir`; the server
+stops sending and answers with `Error` code `17 ECANCELED` or the request's
+normal terminal response.
+
+### Types
+
+| Type | Message | Payload fields in order |
+|---:|---|---|
+| 42 | Features | features `u64` |
+| 43 | FeaturesAck | related request ID `u64`, features `u64` |
+| 50 | Mount | export path, requested access `u8` |
+| 51 | MountInfo | related request ID `u64`, export path, access `u8`, effective-writable boolean, reason UTF-8, options UTF-8, case-sensitive boolean, normalization `u8`, max name length `u32`, max path length `u32`, supports `u64`, max read `u32`, max write `u32`, attribute cache ms `u32`, directory cache ms `u32` |
+| 56 | Open | path, flags `u32`, mode `u32`, attr mask `u32` |
+| 57 | Opened | related request ID `u64`, handle `u64`, attrs record |
+| 58 | Close | handle `u64` |
+| 59 | Read | handle `u64`, offset `u64`, length `u32`, want-digest boolean |
+| 60 | ReadData | related request ID `u64`, offset `u64`, eof boolean, digest-present boolean, optional digest `[32]`, data bytes |
+| 61 | Write | handle `u64`, offset `u64`, digest-present boolean, optional digest `[32]`, data bytes |
+| 62 | WriteAck | related request ID `u64`, bytes written `u32`, new size `u64`, stable boolean, change cookie `[16]` |
+| 63 | Flush | handle `u64` |
+| 80 | Stat | target `u8`, path, handle `u64`, follow boolean, attr mask `u32` |
+| 81 | Attrs | related request ID `u64`, attrs record |
+| 82 | ReadDir | handle `u64`, cursor `u64`, max entries `u32`, attr mask `u32` |
+| 83 | DirPage | related request ID `u64`, cursor `u64`, final-page boolean, count, entries |
+| 84 | StatFs | *(no fields)* |
+| 85 | FsInfo | related request ID `u64`, block size `u32`, total bytes `u64`, free bytes `u64`, available bytes `u64`, total inodes `u64`, free inodes `u64`, fs type UTF-8, max name length `u32`, case-sensitive boolean, normalization `u8`, read-only boolean |
+| 121 | Error | related request ID `u64`, code `u16`, platform errno `i32`, UTF-8 message |
+| 122 | Done | related request ID `u64` |
+
+Reserved for later phases and never reused: 44–49 (authentication and export
+discovery), 52–55 (session resume, unmount, `MountChanged`), 64–69 (`SetSize`,
+`Allocate`, `Seek`, `Advise`, `HandleState`), 70–79 (staged uploads), 86–99
+(namespace mutations, `Access`, xattrs), 100–109 (locks and leases), 110–115
+(watches), 116–119 (compound), 120 (`Shutdown`).
+
+### The attrs record
+
+Every `Attrs`, `Opened` and `DirPage` entry carries this record. It begins with
+a presence bitmap so optional blocks cost nothing when absent.
+
+```text
+presence u32
+kind u8            1 file, 2 directory, 3 symlink, 4 other (frozen v1 values)
+mode u32           permission bits, at most 0o7777
+size u64
+mtime ns i64
+change cookie [16] opaque; equal cookies mean "unchanged"
+```
+
+followed, in bit order, by each block whose presence bit is set:
+
+| Bit | Block | Fields |
+|---:|---|---|
+| 0 | owner | uid `u32`, gid `u32` |
+| 1 | nlink | nlink `u32` |
+| 2 | atime | atime ns `i64` |
+| 3 | ctime | ctime ns `i64` |
+| 4 | btime | btime ns `i64` |
+| 5 | identity | dev `u64`, ino `u64` |
+| 6 | rdev | rdev `u64` |
+| 7 | symlink target | target blob; valid only for kind `3` |
+| 8 | allocated size | allocated size `u64` |
+| 9 | names | owner name UTF-8, group name UTF-8 (each at most 256 bytes) |
+| 10 | flags | flags `u32`: bit 0 immutable, bit 1 append-only, bit 2 hidden |
+
+A presence bit above 10 is a protocol error. A symlink target on an entry whose
+kind is not `3` is a protocol error. A `DirPage` entry is a name blob (one
+relative component, raw bytes, at most 1 MiB) followed by an attrs record.
+
+### The attr mask
+
+`Open`, `Stat` and `ReadDir` each carry an `attr mask u32` naming the optional
+blocks the client wants in the reply, using the same bit numbering as the
+presence bitmap. A mask of `0` requests the fixed part only.
+
+The mask and the bitmap have deliberately opposite rules for unknown bits:
+
+- **Unknown mask bits are ignored**, like capability bits. A newer client may
+  ask an older server for a block it has never heard of; the server answers
+  without that block instead of failing the request.
+- **Unknown presence bits are rejected**, because a decoder cannot skip a block
+  whose length it does not know.
+
+A response's presence bitmap is a subset of the request's mask and may be a
+strict subset: a block the filesystem does not keep (`btime`), or one whose
+lookup the server declines (`names`), is simply absent. A client must render
+correctly with every optional block missing. The symlink target is bit 7 like
+any other block, so an entry of kind `3` carries its target only when the mask
+asked for it.
+
+### v3 field encoding and bounds
+
+- Paths, export names and entry names are raw byte strings of at most 1 MiB.
+  `Mount` with an empty export names the server's `--server` root. Paths are
+  relative to the export root; intermediate symlink components are rejected as
+  a traversal escape, as in v2.
+- `Features` carries the sender's optional-feature bitmap; the negotiated set
+  is the intersection and **unknown bits are ignored**, so peers of different
+  ages agree. Defined bits: `1 LOCKS`, `2 LEASES`, `4 SHARE_MODES`, `8 NOTIFY`,
+  `16 NOTIFY_POLLING`, `32 XATTR`, `64 SPARSE`, `128 COMPOUND`,
+  `256 STAGE_RESUME`, `512 ACCESS`, `1024 OWNER_NAMES`. Phase 1 defines the
+  bits and the exchange; the message groups they gate are later phases. A
+  client never sends a type whose feature bit the server did not advertise.
+- Access is `0` read-write or `1` read-only. Normalization is `0` none, `1`
+  NFC, `2` NFD.
+- `MountInfo.effective_writable` is the single source of truth for whether the
+  session may write. `reason` is required (non-empty) when it is false and must
+  be empty when it is true; `access=1` with `effective_writable=true` is a
+  protocol error. `supports` bits (`1 XATTRS`, `2 SYMLINKS`, `4 HARDLINKS`,
+  `8 LOCKS`, `16 LEASES`, `32 NOTIFY`, `64 NOTIFY_POLLING`, `128 SPARSE`)
+  describe the filesystem and unknown bits are preserved. `max read` and
+  `max write` are in `1..=8 MiB` and bound `Read.length` and `Write.data`.
+  Cache hints of `0` mean "no hint".
+- `Open.flags` bits: `1 READ`, `2 WRITE`, `4 CREATE`, `8 EXCL`, `16 TRUNC`,
+  `32 APPEND`, `64 NOFOLLOW`, `128 DIRECTORY`. Any other bit is a protocol
+  error, as is: no `READ`, `WRITE` or `DIRECTORY`; `CREATE`, `EXCL`, `TRUNC` or
+  `APPEND` without `WRITE`; `EXCL` without `CREATE`; `DIRECTORY` with any write
+  flag. `mode` is at most `0o7777` and must be `0` unless `CREATE` is set. A
+  write-class open against a mount whose `effective_writable` is false is
+  refused with `Error` code `3 EROFS` before any filesystem call.
+- Handles are `u64`, session-scoped, never reused within a server lifetime.
+  Requests on one handle are applied in send order; requests on different
+  handles or paths have no ordering guarantee and the server may answer them
+  out of order (responses correlate by related request ID).
+- A server bounds the accepted-but-unanswered requests on one session. Past that
+  bound a request is answered with `Error` code `24 ELIMIT` and is not executed;
+  the session itself is unaffected and the client may retry once a response has
+  freed a slot. A server must not stall its reader to apply the bound, because
+  `Keepalive` and `Cancel` have to stay answerable while the pool is busy — those
+  two and the `Features` exchange are answered without waiting for any
+  filesystem work. Negotiated credit-based flow control is a later revision.
+- `Cancel` on a request that has not started yet is that request's terminal
+  response (`ECANCELED`); on one already executing it is advisory, and the
+  request's own terminal response is the only answer the client receives, so a
+  request is never answered twice.
+- `Read.length` is `1..=max read`. `ReadData.data` is at most 8 MiB; a short
+  read is legal only with `eof=true`. `Write.data` is `1..=max write`. When a
+  digest is present it is BLAKE3 of `data`; a `Write` whose digest does not
+  match is refused with code `23 EINTEGRITY` and nothing is written.
+- `WriteAck.stable` is true only when the bytes are already durable (export
+  configured `sync`); otherwise `Flush` is the durability barrier and answers
+  `Done`. `Close` answers `Done` and releases the handle.
+- `Stat.target` is `0` path or `1` handle. For a path target the handle field
+  must be `0`; for a handle target the path must be empty; otherwise the
+  payload is a protocol error. `follow` selects `stat` over `lstat` and is
+  ignored for a handle target. The `attr mask` follows the rules above; asking
+  for `names` requires the `OWNER_NAMES` feature and is otherwise answered
+  without that block.
+- `ReadDir` requires a handle opened with `DIRECTORY`; its `attr mask` applies
+  to every entry in the page, which is what makes one round trip a readdirplus.
+  `max entries` is `1..=65,536`; `count` is capped at 65,536 before reserving memory. Cursor `0`
+  starts a fresh snapshot; a non-final page returns the cursor for the next
+  page. `.` and `..` are never returned.
+- `FsInfo.read_only` describes the filesystem, distinct from the export's
+  access. `fs type` is UTF-8 of at most 256 bytes. Inode counts of `0` mean
+  unknown.
+- `Error.code` is frozen: `1 ENOENT`, `2 EACCES`, `3 EROFS`, `4 EEXIST`,
+  `5 ENOTEMPTY`, `6 EISDIR`, `7 ENOTDIR`, `8 EXDEV`, `9 ESTALE`, `10 ENOSPC`,
+  `11 EDQUOT`, `12 ENAMETOOLONG`, `13 ELOOP`, `14 EBUSY`, `15 EWOULDBLOCK`,
+  `16 ETIMEDOUT`, `17 ECANCELED`, `18 EBADF`, `19 EINVAL`, `20 EIO`,
+  `21 EOPNOTSUPP`, `22 EILSEQ`, `23 EINTEGRITY`, `24 ELIMIT`, `25 ECHANGED`,
+  `26 ELEASEBROKEN`. Any other value is a protocol error. `platform errno` is
+  `0` when unavailable; the message is UTF-8 of at most 64 KiB.
+- UTF-8 text fields (`reason`, `options`, error messages) are capped at 64 KiB.
+  Booleans are exactly `0` or `1`.
+- The 16 MiB encoded and decoded payload caps, checked length arithmetic,
+  reserved-field rules and message-ID uniqueness apply unchanged. Phase 1
+  frames are uncompressed; the envelope compression flag is reserved for a
+  later phase and a compressed v3 frame is rejected today.
+
+### v3 session handling
+
+- After the selected-version boundary a v3 session accepts only the table
+  above plus types 18–20. A v1 or v2 frame after a v3 selection, or a v3 frame
+  after a v1 or v2 selection, is a protocol error.
+- The client sends `Features` immediately after selection and `Mount` after
+  `FeaturesAck`; every other request requires a completed `Mount`.
+- Errors are per-request and do not terminate the session unless the error is a
+  framing, bounds, duplicate-ID or other protocol error.
+- Byte-exact vectors live in `protocol-v3-vectors/`; the codec is
+  `xsync-core::protocol_v3`.

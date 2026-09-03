@@ -113,6 +113,11 @@ pub enum LocalEvent {
         common_capabilities: u32,
         /// Whether browse-only v2 requests are available.
         browse_available: bool,
+        /// Whether the v3 filesystem grammar was selected.
+        fs_v3_available: bool,
+        /// Optional v3 features common to both endpoints; `0` when v3 was not
+        /// selected or the peer offers none.
+        fs_v3_features: u64,
     },
     /// Metadata planning has completed.
     Planned {

@@ -42,6 +42,7 @@ ignored as specified by `protocol.md`.
 | 2 | `CAP_BROWSE_V2` | Endpoint can use the v2 browse message set |
 | 3 | `CAP_VERSION_NEGOTIATION` | Endpoint understands this handshake contract |
 | 6 | `CAP_BROWSE_META` | Endpoint understands browse types 36–41 (chmod, mtime, readlink) |
+| 7 | `CAP_FS_V3` | Endpoint can use the protocol v3 filesystem message set (`protocol.md` "v3 message table") |
 
 The v1 implementation advertises `CAP_VERSION_NEGOTIATION` after this change,
 but does not advertise `CAP_BROWSE_V2`. A v2 implementation advertises both
@@ -59,8 +60,24 @@ acknowledged, both endpoints calculate the same result:
 v2 = local has CAP_VERSION_NEGOTIATION and CAP_BROWSE_V2
   && remote has CAP_VERSION_NEGOTIATION and CAP_BROWSE_V2
 
-selected_version = 2 if v2 else 1
+v3 = local has CAP_VERSION_NEGOTIATION and CAP_FS_V3
+  && remote has CAP_VERSION_NEGOTIATION and CAP_FS_V3
+
+selected_version = 3 if v3 else (2 if v2 else 1)
 ```
+
+`CAP_FS_V3` is evaluated first because v3 is a superset of what a filesystem
+client needs; a peer that advertises v3 is expected to advertise
+`CAP_BROWSE_V2` as well so that a v2-only partner still gets browse. A
+`Role::Session` endpoint advertises `CAP_FS_V3`; a sync endpoint (`Source` or
+`Sink`) does not, so a push or pull selects exactly what it selected before v3
+existed.
+
+Immediately after a v3 selection the client sends `Features` and the server
+answers `FeaturesAck` with the intersection. That set gates every optional
+message group: a client must not send a message whose feature the server did
+not grant, because a fail-closed peer aborts the session on a type it does not
+know.
 
 The selected version is committed before the next request. There is no retry,
 probe, or mid-session fallback.

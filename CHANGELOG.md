@@ -10,6 +10,24 @@ one end of a transfer actually has.
 ## [Unreleased]
 
 ### Added
+- Protocol v3 concurrency: a v3 session dispatches requests to a bounded worker
+  pool and answers them out of order, while requests naming the same handle stay
+  in send order. `Features`, `Keepalive` and `Cancel` are answered without waiting
+  for the pool. Past the in-flight cap a request is refused with `ELIMIT` rather
+  than stalling the reader; `Server::with_fs_limits` tunes both bounds.
+- Protocol v3 negotiation: a `Role::Session` peer advertises `CAP_FS_V3`,
+  `negotiate_protocol_version` selects 3/2/1, and a selected v3 session opens
+  with a `Features` exchange whose intersection gates every optional message
+  group. New client entry points `probe_fs_session` and `FsSession`, and a new
+  `ProbeStatus::ReadyV3`. `probe_session` is unchanged and still never selects
+  v3, so an existing browse consumer keeps its behaviour against a v3 server.
+  Filesystem verbs answer `EOPNOTSUPP` until their handlers land.
+  `protocol-negotiated` gains `fs_v3_available` and `fs_v3_features`.
+- Protocol v3 Phase 1 freeze: the filesystem message table (types 42–122,
+  reserved ranges included), the `Attrs` record, the frozen error-code table,
+  `CAP_FS_V3`, the `xsync-core::protocol_v3` fail-closed codec, and
+  `protocol-v3-vectors/`. No implementation advertises the bit yet; selection
+  lands with `xsyncv3.md` E3-S6. See `protocol.md` "v3 message table".
 - `--bootstrap=once|persist` uploads a checksum-verified binary to a remote that
   has none (D5.2). See `docs/remote-bootstrap.md`.
 - `--log-json FILE` writes structured failure records from both the client and

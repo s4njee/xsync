@@ -1844,12 +1844,16 @@ fn json_event(event: &xsync_core::local::LocalEvent) -> serde_json::Value {
             remote_capabilities,
             common_capabilities,
             browse_available,
+            fs_v3_available,
+            fs_v3_features,
         } => serde_json::json!({
             "event": "protocol-negotiated",
             "selected_version": selected_version,
             "remote_capabilities": remote_capabilities,
             "common_capabilities": common_capabilities,
             "browse_available": browse_available,
+            "fs_v3_available": fs_v3_available,
+            "fs_v3_features": fs_v3_features,
         }),
         LocalEvent::Planned { files, bytes } => serde_json::json!({
             "event": "planned",
@@ -2424,10 +2428,25 @@ mod tests {
             remote_capabilities: 0,
             common_capabilities: 0,
             browse_available: false,
+            fs_v3_available: false,
+            fs_v3_features: 0,
         });
         assert_eq!(value["event"], "protocol-negotiated");
         assert_eq!(value["selected_version"], 1);
         assert_eq!(value["browse_available"], false);
+        assert_eq!(value["fs_v3_available"], false);
+
+        let value = json_event(&xsync_core::local::LocalEvent::ProtocolNegotiated {
+            selected_version: 3,
+            remote_capabilities: 0,
+            common_capabilities: 0,
+            browse_available: true,
+            fs_v3_available: true,
+            fs_v3_features: 5,
+        });
+        assert_eq!(value["selected_version"], 3);
+        assert_eq!(value["fs_v3_available"], true);
+        assert_eq!(value["fs_v3_features"], 5);
     }
 
     #[test]

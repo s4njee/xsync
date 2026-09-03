@@ -25,7 +25,7 @@ use std::fs;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,11 +40,14 @@ use crate::protocol::{
     common_capabilities, encode_frame, encode_frame_with_compression, negotiate_compression,
     negotiate_protocol_version, ByteRange, CompressionMode, EntryRecord, FrameDecoder, Message,
     MetadataOperation, ProtocolError, Role, CAP_BROWSE_META, CAP_BROWSE_V2, CAP_FILTER_RULES,
-    CAP_UNIX_MODES, CAP_VERSION_NEGOTIATION, CAP_ZSTD, DEFAULT_UNACKNOWLEDGED_WINDOW,
+    CAP_FS_V3, CAP_UNIX_MODES, CAP_VERSION_NEGOTIATION, CAP_ZSTD, DEFAULT_UNACKNOWLEDGED_WINDOW,
     MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
 };
 use crate::protocol_v2::{self, V2CodecError, V2Frame, V2Message};
 use crate::protocol_v2::{BrowseEntry, MutationStatus, StatStatus};
+use crate::protocol_v3::{
+    self, ErrorCode as FsErrorCode, StatTarget, V3CodecError, V3Frame, V3Message,
+};
 use crate::scanner::{
     fingerprint_from_metadata, permission_mode, scan, scan_with_filter, EntryKind as ScanEntryKind,
     FileEntry, FileIdentity, ScanError, SourceFingerprint,
@@ -99,7 +102,10 @@ impl ServerError {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
-            Self::Protocol(_) | Self::UnexpectedMessage(_) | Self::Browse(_) => "protocol",
+            Self::Protocol(_)
+            | Self::UnexpectedMessage(_)
+            | Self::Browse(_)
+            | Self::FsSession(_) => "protocol",
             Self::Io(_) | Self::Sink(_) | Self::SourceRead(_) | Self::Journal(_) => "io",
             Self::Scan(_) => "scan",
             Self::Planner(_) => "plan",
@@ -179,6 +185,9 @@ pub enum ServerError {
     /// A browse-session frame was malformed or used the wrong message shape.
     #[error("v2 session error: {0}")]
     Browse(#[from] V2CodecError),
+    /// A filesystem-session frame was malformed or used the wrong message shape.
+    #[error("v3 session error: {0}")]
+    FsSession(#[from] V3CodecError),
     /// The remote shell positively reported that xsync is unavailable.
     #[error("xs not found on remote host — install it or check PATH")]
     MissingRemoteXsync,
@@ -215,6 +224,12 @@ pub enum ServerError {
 pub enum ProbeStatus {
     /// The peer supports the current browse protocol.
     Ready,
+    /// The peer selected the v3 filesystem grammar.
+    ///
+    /// Only reachable from [`probe_fs_session`], which is the probe that
+    /// advertises `CAP_FS_V3`; [`probe_session`] never produces it, so an
+    /// existing browse consumer keeps its exact behaviour against a v3 server.
+    ReadyV3,
     /// The peer answered, but is older and cannot provide browse v2.
     OlderPeer { selected_version: u32 },
     /// The peer answered with an unusable role or protocol state.
@@ -227,6 +242,7 @@ impl ProbeStatus {
     pub const fn action(&self) -> &'static str {
         match self {
             Self::Ready => "open the browse session",
+            Self::ReadyV3 => "open the filesystem session",
             Self::OlderPeer { .. } => "upgrade the remote xsync binary before browsing",
             Self::Unusable { .. } => "check the remote xsync installation and protocol settings",
         }
@@ -283,6 +299,58 @@ impl<R: Read, W: Write> ProbedConnection<R, W> {
             common_capabilities: self.probe.common_capabilities,
         })
     }
+
+    /// Continue into a v3 filesystem session, performing the `Features`
+    /// exchange before returning.
+    ///
+    /// `requested_features` is this client's optional-feature bitmap; the
+    /// session keeps the intersection with the server's, which is the only set
+    /// whose messages may be sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::UnexpectedMessage`] when the probe did not settle
+    /// on [`ProbeStatus::ReadyV3`], or when the peer answers the exchange with
+    /// anything but `FeaturesAck`.
+    pub fn into_fs_session(
+        mut self,
+        requested_features: u64,
+    ) -> Result<FsSession<R, W>, ServerError> {
+        if !matches!(self.probe.status, ProbeStatus::ReadyV3) {
+            return Err(ServerError::UnexpectedMessage(format!(
+                "cannot open filesystem session after probe: {:?}",
+                self.probe.status
+            )));
+        }
+        self.writer.write_all(&protocol_v3::encode_frame(
+            2,
+            &V3Message::Features {
+                features: requested_features,
+            },
+        )?)?;
+        self.writer.flush()?;
+        let frame =
+            protocol_v3::read_frame(&mut self.reader)?.ok_or(ServerError::PeerDisconnected)?;
+        let V3Message::FeaturesAck { features, .. } = frame.message else {
+            return Err(ServerError::UnexpectedMessage(format!(
+                "expected FeaturesAck, got {:?}",
+                frame.message
+            )));
+        };
+        if features & !requested_features != 0 {
+            return Err(ServerError::UnexpectedMessage(format!(
+                "server granted v3 features 0x{features:x} the client did not request",
+            )));
+        }
+        Ok(FsSession {
+            reader: self.reader,
+            writer: self.writer,
+            next_message_id: 3,
+            remote_capabilities: self.probe.remote_capabilities,
+            common_capabilities: self.probe.common_capabilities,
+            negotiated_features: features,
+        })
+    }
 }
 
 /// Perform the v1-compatible opening handshake without starting a session operation.
@@ -293,11 +361,48 @@ impl<R: Read, W: Write> ProbedConnection<R, W> {
 /// handshake acknowledgement, and propagates transport and codec failures from
 /// the underlying stream.
 pub fn probe_session<R: Read, W: Write>(
+    reader: R,
+    writer: W,
+    job_id: [u8; 16],
+) -> Result<ProbedConnection<R, W>, ServerError> {
+    probe_with_capabilities(
+        reader,
+        writer,
+        job_id,
+        CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION | CAP_BROWSE_META,
+    )
+}
+
+/// Perform the opening handshake advertising `CAP_FS_V3` as well.
+///
+/// Selection prefers v3 and falls back to v2 browse against an older peer, so
+/// the returned status is [`ProbeStatus::ReadyV3`], [`ProbeStatus::Ready`], or
+/// an older/unusable peer. This is a separate entry point from
+/// [`probe_session`] on purpose: an existing browse consumer must not start
+/// selecting a different grammar because the server was upgraded.
+///
+/// # Errors
+///
+/// As [`probe_session`].
+pub fn probe_fs_session<R: Read, W: Write>(
+    reader: R,
+    writer: W,
+    job_id: [u8; 16],
+) -> Result<ProbedConnection<R, W>, ServerError> {
+    probe_with_capabilities(
+        reader,
+        writer,
+        job_id,
+        CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION | CAP_BROWSE_META | CAP_FS_V3,
+    )
+}
+
+fn probe_with_capabilities<R: Read, W: Write>(
     mut reader: R,
     mut writer: W,
     job_id: [u8; 16],
+    capabilities: u32,
 ) -> Result<ProbedConnection<R, W>, ServerError> {
-    let capabilities = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION | CAP_BROWSE_META;
     let handshake = Message::Handshake {
         role: Role::Session,
         capabilities,
@@ -353,10 +458,10 @@ pub fn probe_session<R: Read, W: Write>(
         });
     }
     let selected_version = negotiate_protocol_version(capabilities, remote_capabilities);
-    let status = if selected_version == 2 {
-        ProbeStatus::Ready
-    } else {
-        ProbeStatus::OlderPeer { selected_version }
+    let status = match selected_version {
+        3 => ProbeStatus::ReadyV3,
+        2 => ProbeStatus::Ready,
+        _ => ProbeStatus::OlderPeer { selected_version },
     };
     Ok(ProbedConnection {
         probe: AgentProbe {
@@ -914,6 +1019,151 @@ fn from_protocol_kind(kind: crate::protocol::EntryKind) -> ScanEntryKind {
     }
 }
 
+/// Client-side driver for a persistent v3 filesystem session.
+///
+/// The session is committed to v3 before this type exists and never retries a
+/// frame as v2 or v1. Requests are issued one at a time; concurrent dispatch
+/// with out-of-order responses is `xsyncv3.md` E3-S1.
+pub struct FsSession<R, W> {
+    reader: R,
+    writer: W,
+    next_message_id: u64,
+    remote_capabilities: u32,
+    common_capabilities: u32,
+    negotiated_features: u64,
+}
+
+impl<R: Read, W: Write> FsSession<R, W> {
+    /// Open a filesystem session over an already-connected stream pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] when the peer does not negotiate v3 or the
+    /// opening handshake or feature exchange is malformed.
+    pub fn connect(
+        reader: R,
+        writer: W,
+        job_id: [u8; 16],
+        requested_features: u64,
+    ) -> Result<Self, ServerError> {
+        probe_fs_session(reader, writer, job_id)?.into_fs_session(requested_features)
+    }
+
+    /// Capabilities advertised by the remote peer.
+    #[must_use]
+    pub const fn remote_capabilities(&self) -> u32 {
+        self.remote_capabilities
+    }
+
+    /// Known capabilities shared by both endpoints.
+    #[must_use]
+    pub const fn common_capabilities(&self) -> u32 {
+        self.common_capabilities
+    }
+
+    /// Optional v3 features both endpoints offer.
+    #[must_use]
+    pub const fn negotiated_features(&self) -> u64 {
+        self.negotiated_features
+    }
+
+    /// Whether every bit in `features` was negotiated.
+    #[must_use]
+    pub const fn supports(&self, features: u64) -> bool {
+        self.negotiated_features & features == features
+    }
+
+    /// Refuse to send a message whose feature the server did not advertise.
+    ///
+    /// A fail-closed peer aborts the session on a message type it does not
+    /// know, so sending an ungated request would cost the connection. This
+    /// turns that into a local error naming the missing feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::UnexpectedMessage`] when a bit is missing.
+    pub fn require(&self, features: u64, name: &str) -> Result<(), ServerError> {
+        if self.supports(features) {
+            return Ok(());
+        }
+        Err(ServerError::UnexpectedMessage(format!(
+            "remote peer did not negotiate the v3 {name} feature (0x{features:x}); \
+             negotiated set is 0x{:x}",
+            self.negotiated_features
+        )))
+    }
+
+    /// Recover the underlying streams.
+    pub fn into_parts(self) -> (R, W) {
+        (self.reader, self.writer)
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_message_id;
+        self.next_message_id = self.next_message_id.saturating_add(1);
+        id
+    }
+
+    /// Send one request and return its message ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] on encode or transport failure.
+    pub fn send(&mut self, message: &V3Message) -> Result<u64, ServerError> {
+        let id = self.next_id();
+        self.writer
+            .write_all(&protocol_v3::encode_frame(id, message)?)?;
+        self.writer.flush()?;
+        Ok(id)
+    }
+
+    /// Read the next frame from the peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::PeerDisconnected`] at clean EOF, and propagates
+    /// codec and transport failures.
+    pub fn receive(&mut self) -> Result<V3Frame, ServerError> {
+        protocol_v3::read_frame(&mut self.reader)?.ok_or(ServerError::PeerDisconnected)
+    }
+
+    /// Send one request and read its reply.
+    ///
+    /// # Errors
+    ///
+    /// As [`FsSession::send`] and [`FsSession::receive`].
+    pub fn request(&mut self, message: &V3Message) -> Result<V3Frame, ServerError> {
+        self.send(message)?;
+        self.receive()
+    }
+
+    /// Send a keepalive and check that the peer echoes the nonce.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::UnexpectedMessage`] when the reply is not the
+    /// matching acknowledgement.
+    pub fn keepalive(&mut self, nonce: u64) -> Result<(), ServerError> {
+        let frame = self.request(&V3Message::Keepalive { nonce })?;
+        match frame.message {
+            V3Message::KeepaliveAck { nonce: echoed } if echoed == nonce => Ok(()),
+            other => Err(ServerError::UnexpectedMessage(format!(
+                "expected KeepaliveAck({nonce}), got {other:?}"
+            ))),
+        }
+    }
+
+    /// Abandon one in-flight request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError`] on encode or transport failure.
+    pub fn cancel(&mut self, related_id: u64) -> Result<(), ServerError> {
+        self.send(&V3Message::Cancel { related_id })?;
+        Ok(())
+    }
+}
+
 /// Convert a [`SystemTime`] timestamp into nanoseconds since Unix epoch.
 #[must_use]
 pub fn system_time_to_nanos(time: SystemTime) -> i64 {
@@ -1300,6 +1550,118 @@ fn publish_error_response(related_id: u64, error: &str) -> V2Message {
 /// A server instance executing Source, Sink, or long-lived Session roles over
 /// framed streams.
 #[derive(Debug)]
+/// Shared state for one v3 filesystem session.
+///
+/// Every worker thread holds an `Arc` of this, so anything mutable lives behind
+/// its own lock. The handle table lands with E4-S1; today it carries only the
+/// export root and the set of cancelled requests.
+struct FsSessionState {
+    /// Export root every path in the session resolves below.
+    #[allow(dead_code, reason = "read by the E1-S4/E4/E5 handlers once they exist")]
+    root: PathBuf,
+    cancelled: Mutex<HashSet<u64>>,
+}
+
+impl FsSessionState {
+    fn cancel(&self, related_id: u64) {
+        if let Ok(mut cancelled) = self.cancelled.lock() {
+            cancelled.insert(related_id);
+        }
+    }
+
+    /// Whether this request was cancelled. A handler doing long work should
+    /// poll this and stop early; a short one may ignore it.
+    #[allow(dead_code, reason = "polled by the E4/E5 handlers once they exist")]
+    fn is_cancelled(&self, related_id: u64) -> bool {
+        self.cancelled
+            .lock()
+            .is_ok_and(|cancelled| cancelled.contains(&related_id))
+    }
+}
+
+/// Executes one v3 filesystem request.
+///
+/// Called from several worker threads at once, so an implementation must be
+/// internally synchronised. The real handlers arrive with E1-S4 (`Mount`),
+/// E4 (`Open`/`Read`/`Write`/`Flush`/`Close`) and E5 (`Stat`/`ReadDir`/`StatFs`);
+/// this seam exists so they are written against a dispatcher that is already
+/// concurrent rather than retrofitted onto a serial one.
+trait FsHandler: Send + Sync {
+    fn handle(&self, state: &FsSessionState, related_id: u64, request: V3Message) -> V3Message;
+}
+
+/// The default handler: every verb is negotiated but not yet implemented.
+struct UnimplementedFsHandler;
+
+impl FsHandler for UnimplementedFsHandler {
+    fn handle(&self, _state: &FsSessionState, related_id: u64, request: V3Message) -> V3Message {
+        V3Message::Error {
+            related_id,
+            code: FsErrorCode::NotSupported,
+            platform_errno: 0,
+            message: format!(
+                "v3 message type {} is negotiated but not implemented by this build",
+                protocol_v3::message_type(&request)
+            )
+            .into_bytes(),
+        }
+    }
+}
+
+/// One unit of work for the session's pool.
+struct FsJob {
+    related_id: u64,
+    /// The handle whose ordering domain this request belongs to, if any.
+    key: Option<u64>,
+    request: V3Message,
+}
+
+/// What the session thread waits on: either a frame from the peer or a
+/// completed job from a worker.
+enum FsEvent {
+    Incoming(Result<Option<V3Frame>, V3CodecError>),
+    Completed {
+        related_id: u64,
+        key: Option<u64>,
+        response: V3Message,
+    },
+}
+
+/// The ordering domain of a request.
+///
+/// Requests naming the same handle are applied in send order, so a `Write`
+/// followed by a `Read` on one handle observes the write. Everything else may
+/// execute concurrently and be answered out of order.
+fn fs_ordering_key(request: &V3Message) -> Option<u64> {
+    match request {
+        V3Message::Read { handle, .. }
+        | V3Message::Write { handle, .. }
+        | V3Message::Flush { handle }
+        | V3Message::Close { handle }
+        | V3Message::ReadDir { handle, .. }
+        | V3Message::Stat {
+            target: StatTarget::Handle(handle),
+            ..
+        } => Some(*handle),
+        _ => None,
+    }
+}
+
+fn fs_error(related_id: u64, code: FsErrorCode, message: &str) -> V3Message {
+    V3Message::Error {
+        related_id,
+        code,
+        platform_errno: 0,
+        message: message.as_bytes().to_vec(),
+    }
+}
+
+fn write_v3<W: Write>(writer: &mut W, id: u64, message: &V3Message) -> Result<(), ServerError> {
+    writer.write_all(&protocol_v3::encode_frame(id, message)?)?;
+    writer.flush()?;
+    Ok(())
+}
+
 pub struct Server {
     root: PathBuf,
     next_message_id: u64,
@@ -1309,6 +1671,10 @@ pub struct Server {
     compression: CompressionMode,
     compression_level: i32,
     capabilities: u32,
+    fs_features: u64,
+    fs_max_in_flight: usize,
+    fs_workers: usize,
+    fs_handler: Arc<dyn FsHandler>,
 }
 
 impl Server {
@@ -1327,8 +1693,46 @@ impl Server {
                 | CAP_VERSION_NEGOTIATION
                 | CAP_FILTER_RULES
                 | CAP_BROWSE_META
+                | CAP_FS_V3
                 | if cfg!(unix) { CAP_UNIX_MODES } else { 0 },
+            // Every optional v3 feature gates a later phase, so an honest
+            // server offers none of them yet. A client that asks for one gets
+            // it back cleared and must not send the messages it gates.
+            fs_features: 0,
+            fs_max_in_flight: DEFAULT_FS_MAX_IN_FLIGHT,
+            fs_workers: DEFAULT_FS_WORKERS,
+            fs_handler: Arc::new(UnimplementedFsHandler),
         }
+    }
+
+    /// Bound one v3 session's concurrency.
+    ///
+    /// `max_in_flight` is the number of accepted-but-unanswered requests; past
+    /// it a request is refused with `ELIMIT` rather than stalling the session.
+    /// `workers` is the pool that executes them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either bound is zero, which would deadlock the session.
+    #[must_use]
+    pub fn with_fs_limits(mut self, max_in_flight: usize, workers: usize) -> Self {
+        assert!(
+            max_in_flight > 0 && workers > 0,
+            "v3 session limits must be non-zero"
+        );
+        self.fs_max_in_flight = max_in_flight;
+        self.fs_workers = workers;
+        self
+    }
+
+    /// Advertise a v3 optional-feature bitmap (see `protocol_v3::features`).
+    ///
+    /// The negotiated set is the intersection with the client's, so this can
+    /// only ever narrow what a peer may send.
+    #[must_use]
+    pub const fn with_fs_features(mut self, features: u64) -> Self {
+        self.fs_features = features;
+        self
     }
 
     /// Create a server with an explicit capability set.
@@ -1390,9 +1794,9 @@ impl Server {
 
         let selected_version =
             negotiate_protocol_version(advertised_capabilities, client_capabilities);
-        if client_role == Role::Session && selected_version != 2 {
+        if client_role == Role::Session && selected_version < 2 {
             return Err(ServerError::UnexpectedMessage(
-                "session role requires negotiated protocol v2".to_owned(),
+                "session role requires negotiated protocol v2 or v3".to_owned(),
             ));
         }
 
@@ -1438,7 +1842,13 @@ impl Server {
         writer.flush()?;
 
         if client_role == Role::Session {
-            return self.run_browse_session(reader, &mut writer);
+            // The grammar was committed above and is never revisited: a v3
+            // session never falls back to browse v2 on a decode failure.
+            return if selected_version >= 3 {
+                self.run_fs_session(reader, &mut writer)
+            } else {
+                self.run_browse_session(reader, &mut writer)
+            };
         }
 
         // 2. Receive SessionConfig from client.
@@ -1507,6 +1917,237 @@ impl Server {
             }
             Role::Source => self.run_source(&mut reader, &mut writer, checksum),
             Role::Session => unreachable!("browse sessions return before sync dispatch"),
+        }
+    }
+
+    /// Serve one v3 filesystem session.
+    ///
+    /// The session opens with the `Features` exchange, then dispatches requests
+    /// to a bounded worker pool and writes each response as it completes, in
+    /// whatever order that happens (`xsyncv3.md` E3-S1). Three things stay on
+    /// this thread because they must never queue behind filesystem work: the
+    /// feature exchange, `Keepalive`, and `Cancel`.
+    ///
+    /// Ordering: requests naming the same handle are executed one at a time in
+    /// send order, so a `Write` then `Read` on one handle observes the write.
+    /// Everything else runs concurrently. The writer is only ever touched from
+    /// this thread, so responses cannot interleave on the wire.
+    fn run_fs_session<R: Read + Send + 'static, W: Write>(
+        &mut self,
+        mut reader: R,
+        writer: &mut W,
+    ) -> Result<(), ServerError> {
+        let (events, incoming) = crossbeam_channel::unbounded();
+        let reader_events = events.clone();
+        thread::spawn(move || loop {
+            let frame = protocol_v3::read_frame(&mut reader);
+            let done = matches!(frame, Ok(None) | Err(_));
+            if reader_events.send(FsEvent::Incoming(frame)).is_err() || done {
+                break;
+            }
+        });
+
+        let state = Arc::new(FsSessionState {
+            root: self.root.clone(),
+            cancelled: Mutex::new(HashSet::new()),
+        });
+        let (work, jobs) = crossbeam_channel::unbounded::<FsJob>();
+        for _ in 0..self.fs_workers {
+            let jobs = jobs.clone();
+            let events = events.clone();
+            let state = Arc::clone(&state);
+            let handler = Arc::clone(&self.fs_handler);
+            thread::spawn(move || {
+                while let Ok(job) = jobs.recv() {
+                    let response = handler.handle(&state, job.related_id, job.request);
+                    if events
+                        .send(FsEvent::Completed {
+                            related_id: job.related_id,
+                            key: job.key,
+                            response,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        // The workers hold the only remaining receivers, so dropping this one
+        // lets them exit when `work` goes out of scope at the end of the
+        // session.
+        drop(jobs);
+
+        let mut seen_ids = HashSet::new();
+        let mut negotiated_features: Option<u64> = None;
+        let mut in_flight: usize = 0;
+        let mut running: HashSet<u64> = HashSet::new();
+        let mut busy_handles: HashSet<u64> = HashSet::new();
+        let mut handle_queues: HashMap<u64, VecDeque<FsJob>> = HashMap::new();
+        let mut eof = false;
+
+        loop {
+            // Everything the peer sent has been answered and no more is
+            // coming: the session is over. Checked before blocking, because
+            // this thread holds a sender and so `recv` would never return.
+            if eof && in_flight == 0 {
+                return Ok(());
+            }
+            let Ok(event) = incoming.recv() else {
+                return Ok(());
+            };
+            let frame = match event {
+                FsEvent::Incoming(Err(error)) => return Err(ServerError::FsSession(error)),
+                FsEvent::Incoming(Ok(None)) => {
+                    eof = true;
+                    continue;
+                }
+                FsEvent::Incoming(Ok(Some(frame))) => frame,
+                FsEvent::Completed {
+                    related_id,
+                    key,
+                    response,
+                } => {
+                    running.remove(&related_id);
+                    in_flight -= 1;
+                    write_v3(writer, self.next_id(), &response)?;
+                    // Release this handle's ordering domain to the next
+                    // request queued behind it, if any.
+                    if let Some(handle) = key {
+                        if let Some(next) =
+                            handle_queues.get_mut(&handle).and_then(VecDeque::pop_front)
+                        {
+                            running.insert(next.related_id);
+                            if work.send(next).is_err() {
+                                return Err(ServerError::UnexpectedMessage(
+                                    "v3 worker pool stopped".to_owned(),
+                                ));
+                            }
+                        } else {
+                            busy_handles.remove(&handle);
+                            handle_queues.remove(&handle);
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            if !seen_ids.insert(frame.message_id) {
+                return Err(ServerError::UnexpectedMessage(format!(
+                    "duplicate v3 session message ID {}",
+                    frame.message_id
+                )));
+            }
+            let related_id = frame.message_id;
+            match (negotiated_features, frame.message) {
+                // The exchange is the first frame of the session, so a client
+                // cannot send a feature-gated request before the server has
+                // said whether it has the feature.
+                (None, V3Message::Features { features }) => {
+                    let common = features & self.fs_features;
+                    negotiated_features = Some(common);
+                    server_log(format_args!(
+                        "v3 features: client=0x{features:x}, server=0x{:x}, common=0x{common:x}",
+                        self.fs_features
+                    ));
+                    write_v3(
+                        writer,
+                        self.next_id(),
+                        &V3Message::FeaturesAck {
+                            related_id,
+                            features: common,
+                        },
+                    )?;
+                }
+                (None, other) => {
+                    return Err(ServerError::UnexpectedMessage(format!(
+                        "v3 session expects Features first, got {other:?}"
+                    )))
+                }
+                (Some(_), V3Message::Features { .. }) => {
+                    return Err(ServerError::UnexpectedMessage(
+                        "v3 features exchanged twice".to_owned(),
+                    ))
+                }
+                // Answered on this thread: a keepalive that queued behind a
+                // large read would report the session dead while it is merely
+                // busy.
+                (Some(_), V3Message::Keepalive { nonce }) => {
+                    write_v3(writer, self.next_id(), &V3Message::KeepaliveAck { nonce })?;
+                }
+                // Likewise a cancel, which exists to overtake queued work.
+                (Some(_), V3Message::Cancel { related_id: target }) => {
+                    let queued = handle_queues.values_mut().find_map(|queue| {
+                        let position = queue.iter().position(|job| job.related_id == target)?;
+                        queue.remove(position)
+                    });
+                    if queued.is_some() {
+                        // Never started: this is the target's terminal response.
+                        in_flight -= 1;
+                        write_v3(
+                            writer,
+                            self.next_id(),
+                            &fs_error(target, FsErrorCode::Cancelled, "cancelled before execution"),
+                        )?;
+                    } else if running.contains(&target) {
+                        // Already executing: flag it and let the handler's own
+                        // response be the terminal one, so the client never
+                        // sees two answers to one request.
+                        state.cancel(target);
+                    } else {
+                        write_v3(
+                            writer,
+                            self.next_id(),
+                            &fs_error(target, FsErrorCode::Cancelled, "request already complete"),
+                        )?;
+                    }
+                }
+                (Some(_), request) => {
+                    if in_flight >= self.fs_max_in_flight {
+                        write_v3(
+                            writer,
+                            self.next_id(),
+                            &fs_error(
+                                related_id,
+                                FsErrorCode::Limit,
+                                "too many requests in flight on this session",
+                            ),
+                        )?;
+                        continue;
+                    }
+                    in_flight += 1;
+                    let key = fs_ordering_key(&request);
+                    let job = FsJob {
+                        related_id,
+                        key,
+                        request,
+                    };
+                    match key {
+                        // This handle is already executing a request; hold this
+                        // one until that one answers, preserving send order.
+                        Some(handle) if busy_handles.contains(&handle) => {
+                            handle_queues.entry(handle).or_default().push_back(job);
+                        }
+                        Some(handle) => {
+                            busy_handles.insert(handle);
+                            running.insert(related_id);
+                            if work.send(job).is_err() {
+                                return Err(ServerError::UnexpectedMessage(
+                                    "v3 worker pool stopped".to_owned(),
+                                ));
+                            }
+                        }
+                        None => {
+                            running.insert(related_id);
+                            if work.send(job).is_err() {
+                                return Err(ServerError::UnexpectedMessage(
+                                    "v3 worker pool stopped".to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3653,6 +4294,17 @@ pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
 /// without a rebuild, rather than referring to this constant directly.
 pub const MAX_PIPELINED_FRAMES: usize = 2048;
 
+/// Accepted-but-unanswered v3 requests allowed on one session (`xsyncv3.md`
+/// E1-S5). Past it a request is refused with `ELIMIT`; it never stalls the
+/// session, because a stalled reader cannot service a keepalive or a cancel.
+pub const DEFAULT_FS_MAX_IN_FLIGHT: usize = 64;
+
+/// Worker threads executing v3 requests for one session.
+///
+/// Requests are I/O-bound, so this is not sized from core count: it is the
+/// number of filesystem operations worth having outstanding at once.
+pub const DEFAULT_FS_WORKERS: usize = 8;
+
 /// Bytes per chunk when a file is larger than one data segment.
 ///
 /// Named because the pipelining depth in [`crate::tuning::large_chunks_in_flight`]
@@ -4030,6 +4682,10 @@ pub fn run_client_push<R: Read, W: Write, F: FnMut(LocalEvent)>(
         remote_capabilities,
         common_capabilities: common_capabilities(local_capabilities, remote_capabilities),
         browse_available: selected_version >= 2,
+        // A push or pull never advertises CAP_FS_V3, so this route cannot
+        // select v3 and has no feature bitmap to report.
+        fs_v3_available: false,
+        fs_v3_features: 0,
     });
 
     // 2. Send SessionConfig.
@@ -4989,6 +5645,10 @@ pub fn run_client_pull<R: Read, W: Write, F: FnMut(LocalEvent)>(
         remote_capabilities,
         common_capabilities: common_capabilities(local_capabilities, remote_capabilities),
         browse_available: selected_version >= 2,
+        // A push or pull never advertises CAP_FS_V3, so this route cannot
+        // select v3 and has no feature bitmap to report.
+        fs_v3_available: false,
+        fs_v3_features: 0,
     });
 
     // 2. Send SessionConfig.
@@ -8341,6 +9001,661 @@ mod tests {
             "upgrade the remote xsync binary before browsing"
         );
         assert!(older.into_browse_session().is_err());
+    }
+
+    fn fs_session_handshake(capabilities: u32) -> Message {
+        Message::Handshake {
+            role: Role::Session,
+            capabilities,
+            max_payload: MAX_COMPLETE_PAYLOAD as u32,
+            max_segment: MAX_DATA_SEGMENT as u32,
+            window: DEFAULT_UNACKNOWLEDGED_WINDOW as u32,
+            job_id: [3; 16],
+            compression: CompressionMode::None,
+            compression_level: 3,
+        }
+    }
+
+    /// Client bytes: the v1 opening handshake, then v3 frames.
+    fn fs_client_input(client_capabilities: u32, frames: &[(u64, V3Message)]) -> Vec<u8> {
+        let mut input = encode_frame(1, &fs_session_handshake(client_capabilities)).unwrap();
+        for (id, message) in frames {
+            input.extend_from_slice(&protocol_v3::encode_frame(*id, message).unwrap());
+        }
+        input
+    }
+
+    /// Split the server's output into its v1 handshake pair and the v3 frames.
+    fn fs_server_replies(output: Vec<u8>) -> (u32, Vec<V3Frame>) {
+        let mut decoder = FrameDecoder::new();
+        let mut cursor = Cursor::new(output);
+        let advertised = match decoder.read(&mut cursor).unwrap().message {
+            Message::Handshake { capabilities, .. } => capabilities,
+            other => panic!("expected server handshake, got {other:?}"),
+        };
+        assert!(matches!(
+            decoder.read(&mut cursor).unwrap().message,
+            Message::Ack { .. }
+        ));
+        let position = cursor.position();
+        let mut cursor = Cursor::new(cursor.into_inner());
+        cursor.set_position(position);
+        let mut frames = Vec::new();
+        while let Some(frame) = protocol_v3::read_frame(&mut cursor).unwrap() {
+            frames.push(frame);
+        }
+        (advertised, frames)
+    }
+
+    /// Peer bytes for a client-side probe, optionally answering the feature
+    /// exchange with `granted`.
+    fn fs_peer_bytes(peer_capabilities: u32, granted: Option<u64>) -> Vec<u8> {
+        let mut bytes = encode_frame(100, &fs_session_handshake(peer_capabilities)).unwrap();
+        bytes.extend_from_slice(
+            &encode_frame(
+                101,
+                &Message::Ack {
+                    acknowledged_id: 1,
+                    acknowledged_type: 1,
+                },
+            )
+            .unwrap(),
+        );
+        if let Some(features) = granted {
+            bytes.extend_from_slice(
+                &protocol_v3::encode_frame(
+                    102,
+                    &V3Message::FeaturesAck {
+                        related_id: 2,
+                        features,
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        bytes
+    }
+
+    const FS_V3_CLIENT: u32 = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION | CAP_FS_V3;
+    const FS_LOCKS: u64 = crate::protocol_v3::features::LOCKS;
+    const FS_NOTIFY: u64 = crate::protocol_v3::features::NOTIFY;
+
+    #[test]
+    fn fs_session_negotiates_features_then_serves_control_verbs() {
+        let input = fs_client_input(
+            FS_V3_CLIENT,
+            &[
+                (
+                    2,
+                    V3Message::Features {
+                        features: FS_LOCKS | FS_NOTIFY,
+                    },
+                ),
+                (3, V3Message::Keepalive { nonce: 7 }),
+                (
+                    4,
+                    V3Message::Mount {
+                        export: Vec::new(),
+                        requested_access: crate::protocol_v3::Access::ReadWrite,
+                    },
+                ),
+            ],
+        );
+
+        let mut output = Vec::new();
+        Server::new(tempdir().unwrap().path())
+            .with_fs_features(FS_LOCKS)
+            .run(Cursor::new(input), &mut output)
+            .unwrap();
+
+        let (advertised, replies) = fs_server_replies(output);
+        assert!(advertised & CAP_FS_V3 != 0);
+        assert_eq!(replies.len(), 3);
+        // The granted set is the intersection: the client asked for notify too.
+        assert_eq!(
+            replies[0].message,
+            V3Message::FeaturesAck {
+                related_id: 2,
+                features: FS_LOCKS,
+            }
+        );
+        assert_eq!(replies[1].message, V3Message::KeepaliveAck { nonce: 7 });
+        // Mount is negotiated but unimplemented until E1-S4; it must be a
+        // per-request error, not a dead session.
+        match &replies[2].message {
+            V3Message::Error {
+                related_id, code, ..
+            } => {
+                assert_eq!(*related_id, 4);
+                assert_eq!(*code, FsErrorCode::NotSupported);
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn version_selection_covers_every_client_server_pair() {
+        let root = tempdir().unwrap();
+
+        // v3 client, v2 server: the server never advertises CAP_FS_V3, both
+        // select v2, and browse still works.
+        let mut output = Vec::new();
+        let mut input = encode_frame(1, &fs_session_handshake(FS_V3_CLIENT)).unwrap();
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(2, &V2Message::Keepalive { nonce: 1 }).unwrap(),
+        );
+        Server::new_with_capabilities(root.path(), CAP_VERSION_NEGOTIATION | CAP_BROWSE_META)
+            .run(Cursor::new(input), &mut output)
+            .unwrap();
+        let mut decoder = FrameDecoder::new();
+        let mut cursor = Cursor::new(output);
+        match decoder.read(&mut cursor).unwrap().message {
+            Message::Handshake { capabilities, .. } => {
+                assert_eq!(capabilities & CAP_FS_V3, 0);
+                assert!(capabilities & CAP_BROWSE_V2 != 0);
+            }
+            other => panic!("expected handshake, got {other:?}"),
+        }
+
+        // v2 client, v3 server: the server advertises v3 but the client does
+        // not, so v2 is selected and no v3 frame is ever emitted.
+        let mut output = Vec::new();
+        let mut input = encode_frame(
+            1,
+            &fs_session_handshake(CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION),
+        )
+        .unwrap();
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(2, &V2Message::Keepalive { nonce: 5 }).unwrap(),
+        );
+        Server::new(root.path())
+            .run(Cursor::new(input), &mut output)
+            .unwrap();
+        let mut decoder = FrameDecoder::new();
+        let mut cursor = Cursor::new(output);
+        assert!(matches!(
+            decoder.read(&mut cursor).unwrap().message,
+            Message::Handshake { .. }
+        ));
+        assert!(matches!(
+            decoder.read(&mut cursor).unwrap().message,
+            Message::Ack { .. }
+        ));
+        let position = cursor.position();
+        let mut cursor = Cursor::new(cursor.into_inner());
+        cursor.set_position(position);
+        assert_eq!(
+            protocol_v2::read_frame(&mut cursor)
+                .unwrap()
+                .unwrap()
+                .message,
+            V2Message::KeepaliveAck { nonce: 5 }
+        );
+
+        // A session peer with neither browse nor fs bits cannot be served.
+        let input = encode_frame(1, &fs_session_handshake(CAP_VERSION_NEGOTIATION)).unwrap();
+        let error = Server::new(root.path())
+            .run(Cursor::new(input), &mut Vec::new())
+            .unwrap_err();
+        assert!(error.to_string().contains("v2 or v3"), "{error}");
+    }
+
+    #[test]
+    fn fs_probe_selects_v3_and_leaves_the_browse_probe_alone() {
+        let v3_peer = FS_V3_CLIENT;
+        let v2_peer = CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION;
+
+        let ready = probe_fs_session(
+            Cursor::new(fs_peer_bytes(v3_peer, None)),
+            Vec::new(),
+            [1; 16],
+        )
+        .unwrap();
+        assert_eq!(ready.probe.status, ProbeStatus::ReadyV3);
+        assert_eq!(ready.probe.selected_version, 3);
+        assert_eq!(ready.probe.status.action(), "open the filesystem session");
+        // Ready for v3 is not ready for browse: the grammars are exclusive.
+        assert!(ready.into_browse_session().is_err());
+
+        let degraded = probe_fs_session(
+            Cursor::new(fs_peer_bytes(v2_peer, None)),
+            Vec::new(),
+            [2; 16],
+        )
+        .unwrap();
+        assert_eq!(degraded.probe.status, ProbeStatus::Ready);
+        assert_eq!(degraded.probe.selected_version, 2);
+        assert!(degraded.into_fs_session(0).is_err());
+
+        // The regression guard for existing browse consumers: the v2 probe
+        // must not start selecting v3 just because the server was upgraded.
+        let unchanged = probe_session(
+            Cursor::new(fs_peer_bytes(v3_peer, None)),
+            Vec::new(),
+            [3; 16],
+        )
+        .unwrap();
+        assert_eq!(unchanged.probe.status, ProbeStatus::Ready);
+        assert_eq!(unchanged.probe.selected_version, 2);
+        assert!(unchanged.into_browse_session().is_ok());
+    }
+
+    #[test]
+    fn fs_client_keeps_only_the_negotiated_feature_set() {
+        let mut session = FsSession::connect(
+            Cursor::new(fs_peer_bytes(FS_V3_CLIENT, Some(FS_LOCKS))),
+            Vec::new(),
+            [4; 16],
+            FS_LOCKS | FS_NOTIFY,
+        )
+        .unwrap();
+        assert_eq!(session.negotiated_features(), FS_LOCKS);
+        assert!(session.supports(FS_LOCKS));
+        assert!(!session.supports(FS_NOTIFY));
+        assert!(!session.supports(FS_LOCKS | FS_NOTIFY));
+        session.require(FS_LOCKS, "locks").unwrap();
+        let error = session.require(FS_NOTIFY, "notify").unwrap_err();
+        assert!(error.to_string().contains("notify"), "{error}");
+        assert!(session.keepalive(1).is_err(), "peer sent no keepalive ack");
+
+        // A server may only narrow the request; granting something unasked-for
+        // means one side is not speaking this contract.
+        let Err(error) = FsSession::connect(
+            Cursor::new(fs_peer_bytes(FS_V3_CLIENT, Some(FS_NOTIFY))),
+            Vec::new(),
+            [5; 16],
+            FS_LOCKS,
+        ) else {
+            panic!("accepted a feature the client did not request")
+        };
+        assert!(error.to_string().contains("did not request"), "{error}");
+    }
+
+    /// A handler that parks every request until `target` of them are running
+    /// at once. A serial dispatcher can never release it, so the timeout is a
+    /// clean failure rather than a hang.
+    struct ConcurrencyProbe {
+        target: usize,
+        inside: Mutex<usize>,
+        signal: std::sync::Condvar,
+    }
+
+    impl ConcurrencyProbe {
+        fn new(target: usize) -> Arc<Self> {
+            Arc::new(Self {
+                target,
+                inside: Mutex::new(0),
+                signal: std::sync::Condvar::new(),
+            })
+        }
+    }
+
+    impl FsHandler for ConcurrencyProbe {
+        fn handle(
+            &self,
+            _state: &FsSessionState,
+            related_id: u64,
+            _request: V3Message,
+        ) -> V3Message {
+            let mut inside = self.inside.lock().unwrap();
+            *inside += 1;
+            if *inside >= self.target {
+                self.signal.notify_all();
+                return V3Message::Done { related_id };
+            }
+            let (_guard, wait) = self
+                .signal
+                .wait_timeout_while(inside, std::time::Duration::from_secs(10), |inside| {
+                    *inside < self.target
+                })
+                .unwrap();
+            if wait.timed_out() {
+                fs_error(
+                    related_id,
+                    FsErrorCode::TimedOut,
+                    "requests never ran concurrently",
+                )
+            } else {
+                V3Message::Done { related_id }
+            }
+        }
+    }
+
+    fn fs_stat(path: &[u8]) -> V3Message {
+        V3Message::Stat {
+            target: StatTarget::Path(path.to_vec()),
+            follow: true,
+            attr_mask: 0,
+        }
+    }
+
+    /// Feed `requests` to a session whose handler is `handler`, returning the
+    /// v3 responses in the order the server wrote them.
+    fn fs_run_with_handler(
+        handler: Arc<dyn FsHandler>,
+        limits: (usize, usize),
+        requests: &[(u64, V3Message)],
+    ) -> Vec<V3Frame> {
+        let mut frames = vec![(2, V3Message::Features { features: 0 })];
+        frames.extend(requests.iter().cloned());
+        let mut server = Server::new(tempdir().unwrap().path()).with_fs_limits(limits.0, limits.1);
+        server.fs_handler = handler;
+        let mut output = Vec::new();
+        server
+            .run(
+                Cursor::new(fs_client_input(FS_V3_CLIENT, &frames)),
+                &mut output,
+            )
+            .unwrap();
+        let (_, replies) = fs_server_replies(output);
+        // Drop the FeaturesAck; every caller here cares about what follows.
+        replies[1..].to_vec()
+    }
+
+    #[test]
+    fn fs_session_executes_independent_requests_concurrently() {
+        // 64 requests issued without awaiting, against a pool of 8. The probe
+        // only releases once 8 are inside it at the same time, so this passes
+        // only if the dispatcher is genuinely concurrent.
+        let requests: Vec<_> = (0..64)
+            .map(|index| (index + 3, fs_stat(format!("f{index}").as_bytes())))
+            .collect();
+        let replies = fs_run_with_handler(ConcurrencyProbe::new(8), (64, 8), &requests);
+
+        assert_eq!(replies.len(), 64);
+        let mut answered: Vec<u64> = replies
+            .iter()
+            .map(|frame| match &frame.message {
+                V3Message::Done { related_id } => *related_id,
+                other => panic!("expected Done, got {other:?}"),
+            })
+            .collect();
+        answered.sort_unstable();
+        assert_eq!(answered, (3..67).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fs_session_answers_out_of_order() {
+        /// `slow` finishes only after `fast` has, so the reply order must
+        /// invert the request order.
+        struct OrderProbe {
+            fast_done: Mutex<bool>,
+            signal: std::sync::Condvar,
+        }
+
+        impl FsHandler for OrderProbe {
+            fn handle(
+                &self,
+                _state: &FsSessionState,
+                related_id: u64,
+                request: V3Message,
+            ) -> V3Message {
+                let V3Message::Stat {
+                    target: StatTarget::Path(path),
+                    ..
+                } = request
+                else {
+                    panic!("unexpected request")
+                };
+                if path == b"fast" {
+                    *self.fast_done.lock().unwrap() = true;
+                    self.signal.notify_all();
+                    return V3Message::Done { related_id };
+                }
+                let (_guard, wait) = self
+                    .signal
+                    .wait_timeout_while(
+                        self.fast_done.lock().unwrap(),
+                        std::time::Duration::from_secs(10),
+                        |done| !*done,
+                    )
+                    .unwrap();
+                if wait.timed_out() {
+                    fs_error(related_id, FsErrorCode::TimedOut, "fast request never ran")
+                } else {
+                    V3Message::Done { related_id }
+                }
+            }
+        }
+
+        let replies = fs_run_with_handler(
+            Arc::new(OrderProbe {
+                fast_done: Mutex::new(false),
+                signal: std::sync::Condvar::new(),
+            }),
+            (8, 4),
+            &[(3, fs_stat(b"slow")), (4, fs_stat(b"fast"))],
+        );
+
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0].message, V3Message::Done { related_id: 4 });
+        assert_eq!(replies[1].message, V3Message::Done { related_id: 3 });
+    }
+
+    #[test]
+    fn fs_session_serialises_requests_on_one_handle() {
+        /// Records arrival order and fails loudly if a second request on the
+        /// same handle is dispatched while the first is still running.
+        struct HandleOrderProbe {
+            arrivals: Mutex<Vec<u64>>,
+        }
+
+        impl FsHandler for HandleOrderProbe {
+            fn handle(
+                &self,
+                _state: &FsSessionState,
+                related_id: u64,
+                _request: V3Message,
+            ) -> V3Message {
+                let first = {
+                    let mut arrivals = self.arrivals.lock().unwrap();
+                    arrivals.push(related_id);
+                    arrivals.len() == 1
+                };
+                if first {
+                    // Hold the handle's ordering domain. An unordered
+                    // dispatcher would start the other two during this window.
+                    thread::sleep(std::time::Duration::from_millis(250));
+                    if self.arrivals.lock().unwrap().len() > 1 {
+                        return fs_error(
+                            related_id,
+                            FsErrorCode::Busy,
+                            "a later request on the same handle overtook this one",
+                        );
+                    }
+                }
+                V3Message::Done { related_id }
+            }
+        }
+
+        let probe = Arc::new(HandleOrderProbe {
+            arrivals: Mutex::new(Vec::new()),
+        });
+        let read = |offset: u64| V3Message::Read {
+            handle: 1,
+            offset,
+            length: 4096,
+            want_digest: false,
+        };
+        let replies = fs_run_with_handler(
+            Arc::clone(&probe) as Arc<dyn FsHandler>,
+            (8, 8),
+            &[(3, read(0)), (4, read(1)), (5, read(2))],
+        );
+
+        // Same handle, so send order is preserved end to end even though the
+        // pool has eight free workers.
+        assert_eq!(*probe.arrivals.lock().unwrap(), vec![3, 4, 5]);
+        let ids: Vec<u64> = replies
+            .iter()
+            .map(|frame| match &frame.message {
+                V3Message::Done { related_id } => *related_id,
+                other => panic!("expected Done, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn fs_session_refuses_requests_past_the_in_flight_cap() {
+        // Two workers park until both are busy, so requests three and four
+        // arrive with the cap full.
+        let replies = fs_run_with_handler(
+            ConcurrencyProbe::new(2),
+            (2, 4),
+            &[
+                (3, fs_stat(b"a")),
+                (4, fs_stat(b"b")),
+                (5, fs_stat(b"c")),
+                (6, fs_stat(b"d")),
+            ],
+        );
+
+        assert_eq!(replies.len(), 4);
+        let mut limited = Vec::new();
+        let mut done = Vec::new();
+        for frame in &replies {
+            match &frame.message {
+                V3Message::Done { related_id } => done.push(*related_id),
+                V3Message::Error {
+                    related_id, code, ..
+                } if *code == FsErrorCode::Limit => limited.push(*related_id),
+                other => panic!("unexpected reply {other:?}"),
+            }
+        }
+        done.sort_unstable();
+        limited.sort_unstable();
+        assert_eq!(done, vec![3, 4]);
+        assert_eq!(limited, vec![5, 6]);
+    }
+
+    #[test]
+    fn fs_session_answers_keepalive_without_waiting_for_the_pool() {
+        // Both stats park until the second is dispatched, which happens after
+        // the keepalive is read -- so a keepalive queued behind pool work
+        // could not be answered first.
+        let replies = fs_run_with_handler(
+            ConcurrencyProbe::new(2),
+            (8, 2),
+            &[
+                (3, fs_stat(b"a")),
+                (4, V3Message::Keepalive { nonce: 99 }),
+                (5, fs_stat(b"b")),
+            ],
+        );
+
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[0].message, V3Message::KeepaliveAck { nonce: 99 });
+    }
+
+    #[test]
+    fn fs_session_cancel_removes_queued_work_before_it_runs() {
+        // Three requests on one handle: the second is cancelled while it waits
+        // behind the first, so it must never reach the handler.
+        struct SlowFirst {
+            seen: Mutex<Vec<u64>>,
+        }
+
+        impl FsHandler for SlowFirst {
+            fn handle(
+                &self,
+                _state: &FsSessionState,
+                related_id: u64,
+                _request: V3Message,
+            ) -> V3Message {
+                let first = {
+                    let mut seen = self.seen.lock().unwrap();
+                    seen.push(related_id);
+                    seen.len() == 1
+                };
+                if first {
+                    thread::sleep(std::time::Duration::from_millis(250));
+                }
+                V3Message::Done { related_id }
+            }
+        }
+
+        let probe = Arc::new(SlowFirst {
+            seen: Mutex::new(Vec::new()),
+        });
+        let read = |offset: u64| V3Message::Read {
+            handle: 1,
+            offset,
+            length: 4096,
+            want_digest: false,
+        };
+        let replies = fs_run_with_handler(
+            Arc::clone(&probe) as Arc<dyn FsHandler>,
+            (8, 8),
+            &[
+                (3, read(0)),
+                (4, read(1)),
+                (5, V3Message::Cancel { related_id: 4 }),
+            ],
+        );
+
+        assert_eq!(*probe.seen.lock().unwrap(), vec![3], "cancelled work ran");
+        let cancelled = replies.iter().find(|frame| {
+            matches!(
+                &frame.message,
+                V3Message::Error {
+                    related_id: 4,
+                    code: FsErrorCode::Cancelled,
+                    ..
+                }
+            )
+        });
+        assert!(cancelled.is_some(), "no cancellation response: {replies:?}");
+        assert!(replies
+            .iter()
+            .any(|frame| frame.message == V3Message::Done { related_id: 3 }));
+    }
+
+    #[test]
+    fn fs_session_is_fail_closed_on_frame_order_and_grammar() {
+        let root = tempdir().unwrap();
+        let run = |frames: &[(u64, V3Message)]| {
+            Server::new(root.path())
+                .run(
+                    Cursor::new(fs_client_input(FS_V3_CLIENT, frames)),
+                    &mut Vec::new(),
+                )
+                .unwrap_err()
+        };
+
+        // A feature-gated request cannot precede the exchange that gates it.
+        let error = run(&[(2, V3Message::Keepalive { nonce: 1 })]);
+        assert!(error.to_string().contains("Features first"), "{error}");
+
+        // The exchange happens exactly once.
+        let error = run(&[
+            (2, V3Message::Features { features: 0 }),
+            (3, V3Message::Features { features: 0 }),
+        ]);
+        assert!(error.to_string().contains("twice"), "{error}");
+
+        // Duplicate message IDs are a session error, as in v2.
+        let error = run(&[
+            (2, V3Message::Features { features: 0 }),
+            (2, V3Message::Keepalive { nonce: 1 }),
+        ]);
+        assert!(error.to_string().contains("duplicate"), "{error}");
+
+        // A v2 frame after a v3 selection is refused by the envelope check;
+        // the session never retries it as the older grammar.
+        let mut input = encode_frame(1, &fs_session_handshake(FS_V3_CLIENT)).unwrap();
+        input.extend_from_slice(
+            &protocol_v3::encode_frame(2, &V3Message::Features { features: 0 }).unwrap(),
+        );
+        input.extend_from_slice(
+            &protocol_v2::encode_frame(3, &V2Message::Keepalive { nonce: 1 }).unwrap(),
+        );
+        let error = Server::new(root.path())
+            .run(Cursor::new(input), &mut Vec::new())
+            .unwrap_err();
+        assert!(matches!(error, ServerError::FsSession(_)), "{error}");
+        assert!(error.to_string().contains("wrong version"), "{error}");
+        assert_eq!(error.kind(), "protocol");
     }
 
     #[test]

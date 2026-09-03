@@ -78,18 +78,39 @@ pub const CAP_UNIX_MODES: u32 = 1 << 5;
 /// the session.
 pub const CAP_BROWSE_META: u32 = 1 << 6;
 
+/// Peer understands the protocol v3 filesystem message table.
+///
+/// v3 is selected only when both peers advertise this bit together with
+/// `CAP_VERSION_NEGOTIATION`; see `v2handshake.md`. The v3 grammar is decoded
+/// by `protocol_v3`, is fail-closed, and is never entered from a v2 decode
+/// failure. An older peer ignores the bit, so the pair degrades to v2 or v1.
+pub const CAP_FS_V3: u32 = 1 << 7;
+
 /// Capability bits with a defined meaning in the current contract.
-pub const KNOWN_CAPABILITIES: u32 =
-    CAP_DATA_ONLY | CAP_ZSTD | CAP_BROWSE_V2 | CAP_VERSION_NEGOTIATION | CAP_BROWSE_META;
+pub const KNOWN_CAPABILITIES: u32 = CAP_DATA_ONLY
+    | CAP_ZSTD
+    | CAP_BROWSE_V2
+    | CAP_VERSION_NEGOTIATION
+    | CAP_BROWSE_META
+    | CAP_FS_V3;
 
 /// Select the session grammar before the first non-handshake frame.
+///
+/// v3 is tried before v2 because it is the strictly richer grammar: a peer
+/// advertising `CAP_FS_V3` is expected to advertise `CAP_BROWSE_V2` too, so a
+/// v2-only partner still gets browse. Selection happens exactly once and is
+/// never revisited; a decode failure in the selected grammar is a session
+/// error, never a downgrade.
+///
+/// Only a `Role::Session` endpoint advertises `CAP_FS_V3`, so a push or pull
+/// continues to select v1 exactly as before.
 #[must_use]
 pub const fn negotiate_protocol_version(local: u32, remote: u32) -> u32 {
-    if local & (CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2)
-        == (CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2)
-        && remote & (CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2)
-            == (CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2)
-    {
+    const V3: u32 = CAP_VERSION_NEGOTIATION | CAP_FS_V3;
+    const V2: u32 = CAP_VERSION_NEGOTIATION | CAP_BROWSE_V2;
+    if local & V3 == V3 && remote & V3 == V3 {
+        3
+    } else if local & V2 == V2 && remote & V2 == V2 {
         2
     } else {
         1
@@ -2111,6 +2132,22 @@ mod tests {
         assert_eq!(negotiate_protocol_version(v2, v2), 2);
         assert_eq!(negotiate_protocol_version(v2, CAP_VERSION_NEGOTIATION), 1);
         assert_eq!(negotiate_protocol_version(v2, 0), 1);
+
+        // Every client/server pair in the compatibility matrix. v3 needs both
+        // bits on both sides; anything less falls to the best shared grammar,
+        // and a peer advertising only CAP_FS_V3 without negotiation is v1.
+        let v3 = v2 | CAP_FS_V3;
+        assert_eq!(negotiate_protocol_version(v3, v3), 3);
+        assert_eq!(negotiate_protocol_version(v3, v2), 2);
+        assert_eq!(negotiate_protocol_version(v2, v3), 2);
+        assert_eq!(negotiate_protocol_version(v3, CAP_VERSION_NEGOTIATION), 1);
+        assert_eq!(negotiate_protocol_version(v3, 0), 1);
+        assert_eq!(negotiate_protocol_version(v3, CAP_FS_V3), 1);
+        // A sync endpoint never advertises CAP_FS_V3, so a push or pull is
+        // unaffected by v3 existing at all.
+        let sync = CAP_ZSTD | CAP_VERSION_NEGOTIATION | CAP_FILTER_RULES;
+        assert_eq!(negotiate_protocol_version(sync, v3), 1);
+        assert_eq!(negotiate_protocol_version(v3, sync), 1);
         assert_eq!(
             common_capabilities(v2 | CAP_ZSTD, v2 | CAP_ZSTD),
             v2 | CAP_ZSTD
