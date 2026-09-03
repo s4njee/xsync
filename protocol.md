@@ -482,12 +482,29 @@ asked for it.
   8 MiB; a short read is legal only with `eof=true`, and `eof` means the server
   reached end of file rather than that it chose to return less — a short read
   for any other reason is not permitted. `ReadData.offset` echoes the request,
-  so a client matching responses needs only the id. `Write.data` is `1..=max write`. When a
-  digest is present it is BLAKE3 of `data`; a `Write` whose digest does not
-  match is refused with code `23 EINTEGRITY` and nothing is written.
+  so a client matching responses needs only the id.
+- `Write` requires a handle opened with `WRITE`; one opened read-only is
+  `EACCES` and a directory handle is `EISDIR`. `Write.data` is
+  `1..=max write`, and data longer than the `max write` the mount advertised is
+  `EINVAL`. When a digest is present it is BLAKE3 of `data`, verified before
+  the first byte reaches the file; a `Write` whose digest does not match is
+  refused with code `23 EINTEGRITY` and nothing is written.
+- A `Write` that fails part-way has already put some bytes in the file. The
+  server answers with the error rather than a short `WriteAck`, because a short
+  acknowledgement cannot say which bytes landed; a client that needs to know
+  re-reads the range.
+- An `APPEND` handle writes at the end of the file and ignores `Write.offset`.
+  `WriteAck` carries no offset of its own, so the offset an append landed at is
+  `new size - bytes written`; under the handle's exclusive domain that is
+  exact.
 - `WriteAck.stable` is true only when the bytes are already durable (export
   configured `sync`); otherwise `Flush` is the durability barrier and answers
-  `Done`. `Close` answers `Done` and releases the handle.
+  `Done`. A server with no `sync` option always reports `false`, which is
+  honest rather than optimistic: a client that needs durability must `Flush`.
+  `Flush` on a handle that was only read is not an error — there is simply
+  nothing outstanding — but on a directory handle it is `EISDIR`, because a
+  directory handle buffers nothing. `Close` answers `Done` and releases the
+  handle.
 - `Stat.target` is `0` path or `1` handle. For a path target the handle field
   must be `0`; for a handle target the path must be empty; otherwise the
   payload is a protocol error. `follow` selects `stat` over `lstat` and is

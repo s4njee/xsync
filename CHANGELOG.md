@@ -10,6 +10,10 @@ one end of a transfer actually has.
 ## [Unreleased]
 
 ### Added
+- Protocol v3 `Write`/`Flush`: positional writes with an optional BLAKE3 digest
+  verified before anything reaches the file, `APPEND` handles that ignore the
+  offset, and `Flush` as the durability barrier. `WriteAck.stable` is always
+  `false` until an export can be configured `sync`.
 - Protocol v3 `Read`: positional reads of an open file, optionally carrying a
   BLAKE3 digest of the bytes returned. Reads on one handle now run
   concurrently — they cannot observe each other, and serialising them would

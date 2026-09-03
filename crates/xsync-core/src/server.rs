@@ -1679,6 +1679,13 @@ impl FsHandler for ServerFsHandler {
                 length,
                 want_digest,
             } => read_handle(state, related_id, handle, offset, length, want_digest),
+            V3Message::Write {
+                handle,
+                offset,
+                digest,
+                data,
+            } => write_handle(state, related_id, handle, offset, digest, &data),
+            V3Message::Flush { handle } => flush_handle(state, related_id, handle),
             other => V3Message::Error {
                 related_id,
                 code: FsErrorCode::NotSupported,
@@ -2208,6 +2215,131 @@ fn read_handle(
         eof,
         digest,
         data,
+    }
+}
+
+#[cfg(unix)]
+fn write_at(file: &fs::File, buffer: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.write_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn write_at(file: &fs::File, buffer: &[u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_write(buffer, offset)
+}
+
+/// Write one byte range of an open file.
+fn write_handle(
+    state: &FsSessionState,
+    related_id: u64,
+    handle: u64,
+    offset: u64,
+    digest: Option<[u8; 32]>,
+    data: &[u8],
+) -> V3Message {
+    use protocol_v3::open_flags;
+
+    let Some(open) = state.handle(handle) else {
+        return fs_error(related_id, FsErrorCode::BadHandle, "no such handle");
+    };
+    let Some(file) = open.file.as_ref() else {
+        return fs_error(
+            related_id,
+            FsErrorCode::IsDirectory,
+            "handle is a directory and cannot be written",
+        );
+    };
+    if open.flags & open_flags::WRITE == 0 {
+        return fs_error(
+            related_id,
+            FsErrorCode::Access,
+            "handle was not opened for writing",
+        );
+    }
+    if data.len() > DEFAULT_FS_MAX_TRANSFER as usize {
+        return fs_error(
+            related_id,
+            FsErrorCode::Invalid,
+            "write length exceeds the mount's max_write",
+        );
+    }
+    // Verified before the first byte reaches the file: a corrupt payload must
+    // leave the destination exactly as it was, not half-written.
+    if let Some(expected) = digest {
+        if *blake3::hash(data).as_bytes() != expected {
+            return fs_error(
+                related_id,
+                FsErrorCode::Integrity,
+                "write payload does not match its digest; nothing was written",
+            );
+        }
+    }
+
+    // An APPEND handle writes at the end no matter what offset says, so it
+    // cannot use the positional call: `pwrite` against `O_APPEND` differs
+    // between Linux and the BSDs, and `Write for &File` appends on both.
+    let append = open.flags & open_flags::APPEND != 0;
+    let mut written = 0_usize;
+    while written < data.len() {
+        let result = if append {
+            io::Write::write(&mut &*file, &data[written..])
+        } else {
+            write_at(
+                file,
+                &data[written..],
+                offset.saturating_add(written as u64),
+            )
+        };
+        match result {
+            Ok(0) => {
+                return fs_error(
+                    related_id,
+                    FsErrorCode::Io,
+                    "write made no progress before the range was complete",
+                )
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            // A partial write has already reached the file. Reporting the
+            // error rather than a short WriteAck is the honest answer: the
+            // client must re-read the range to learn what landed.
+            Err(error) => return fs_io_error(related_id, &error, "write"),
+        }
+    }
+
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return fs_io_error(related_id, &error, "stat after write"),
+    };
+    V3Message::WriteAck {
+        related_id,
+        bytes_written: u32::try_from(written).unwrap_or(u32::MAX),
+        new_size: metadata.len(),
+        // Write-through to the page cache; `Flush` is the durability barrier.
+        // A `sync` export would make this true, and arrives with the exports
+        // file (E1-S2).
+        stable: false,
+        change_cookie: change_cookie(&metadata),
+    }
+}
+
+/// Make a handle's writes durable.
+fn flush_handle(state: &FsSessionState, related_id: u64, handle: u64) -> V3Message {
+    let Some(open) = state.handle(handle) else {
+        return fs_error(related_id, FsErrorCode::BadHandle, "no such handle");
+    };
+    let Some(file) = open.file.as_ref() else {
+        return fs_error(
+            related_id,
+            FsErrorCode::IsDirectory,
+            "handle is a directory and buffers nothing",
+        );
+    };
+    match file.sync_all() {
+        Ok(()) => V3Message::Done { related_id },
+        Err(error) => fs_io_error(related_id, &error, "flush"),
     }
 }
 
@@ -10461,6 +10593,165 @@ mod tests {
         )
     }
 
+    struct FsChannelWriter(crossbeam_channel::Sender<Vec<u8>>);
+    impl Write for FsChannelWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .send(buffer.to_vec())
+                .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct FsChannelReader {
+        rx: crossbeam_channel::Receiver<Vec<u8>>,
+        buffer: Vec<u8>,
+        position: usize,
+    }
+    impl FsChannelReader {
+        const fn new(rx: crossbeam_channel::Receiver<Vec<u8>>) -> Self {
+            Self {
+                rx,
+                buffer: Vec::new(),
+                position: 0,
+            }
+        }
+    }
+    impl Read for FsChannelReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.position >= self.buffer.len() {
+                let Ok(data) = self.rx.recv() else {
+                    return Ok(0);
+                };
+                self.buffer = data;
+                self.position = 0;
+            }
+            let available = &self.buffer[self.position..];
+            let count = available.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&available[..count]);
+            self.position += count;
+            Ok(count)
+        }
+    }
+
+    /// A live v3 session over in-process pipes.
+    ///
+    /// The scripted helpers feed a fixed byte stream, which cannot express
+    /// "await this reply, then decide what to send" -- and a real client has no
+    /// choice but to work that way, because it cannot name a handle until
+    /// `Opened` tells it the number. Tests whose subject spans several round
+    /// trips use this instead.
+    struct FsLiveSession {
+        to_server: Option<crossbeam_channel::Sender<Vec<u8>>>,
+        reader: FsChannelReader,
+        server: Option<thread::JoinHandle<Result<(), ServerError>>>,
+        next_id: u64,
+        /// Replies that arrived before the one being awaited. Responses are
+        /// unordered, so this is normal rather than exceptional.
+        pending: Vec<V3Frame>,
+    }
+
+    impl FsLiveSession {
+        fn start(mut server: Server) -> Self {
+            let (client_tx, server_rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
+            let (server_tx, client_rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
+            let thread = thread::spawn(move || {
+                server.run(FsChannelReader::new(server_rx), FsChannelWriter(server_tx))
+            });
+            let mut session = Self {
+                to_server: Some(client_tx),
+                reader: FsChannelReader::new(client_rx),
+                server: Some(thread),
+                next_id: 2,
+                pending: Vec::new(),
+            };
+
+            session.send_bytes(&encode_frame(1, &fs_session_handshake(FS_V3_CLIENT)).unwrap());
+            let mut decoder = FrameDecoder::new();
+            assert!(matches!(
+                decoder.read(&mut session.reader).unwrap().message,
+                Message::Handshake { .. }
+            ));
+            assert!(matches!(
+                decoder.read(&mut session.reader).unwrap().message,
+                Message::Ack { .. }
+            ));
+
+            let id = session.send(&V3Message::Features { features: 0 });
+            assert!(matches!(
+                session.await_reply(id),
+                V3Message::FeaturesAck { .. }
+            ));
+            let id = session.send(&fs_mount());
+            assert!(matches!(
+                session.await_reply(id),
+                V3Message::MountInfo { .. }
+            ));
+            session
+        }
+
+        fn send_bytes(&mut self, bytes: &[u8]) {
+            self.to_server
+                .as_ref()
+                .expect("session is still open")
+                .send(bytes.to_vec())
+                .expect("server is still running");
+        }
+
+        /// Send one request without waiting for it, returning its id.
+        fn send(&mut self, message: &V3Message) -> u64 {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.send_bytes(&protocol_v3::encode_frame(id, message).unwrap());
+            id
+        }
+
+        fn await_reply(&mut self, related_id: u64) -> V3Message {
+            if let Some(index) = self
+                .pending
+                .iter()
+                .position(|frame| fs_related_id(&frame.message) == Some(related_id))
+            {
+                return self.pending.remove(index).message;
+            }
+            loop {
+                let frame = protocol_v3::read_frame(&mut self.reader)
+                    .expect("v3 decode")
+                    .expect("server closed the session early");
+                if fs_related_id(&frame.message) == Some(related_id) {
+                    return frame.message;
+                }
+                self.pending.push(frame);
+            }
+        }
+
+        fn request(&mut self, message: &V3Message) -> V3Message {
+            let id = self.send(message);
+            self.await_reply(id)
+        }
+
+        /// Open a path and return the handle the server assigned.
+        fn open(&mut self, path: &[u8], flags: u32) -> u64 {
+            match self.request(&fs_open(path, flags, 0)) {
+                V3Message::Opened { handle, .. } => handle,
+                other => panic!("open failed: {other:?}"),
+            }
+        }
+
+        fn finish(mut self) {
+            drop(self.to_server.take());
+            self.server
+                .take()
+                .expect("joined once")
+                .join()
+                .expect("server thread panicked")
+                .expect("session ended with an error");
+        }
+    }
+
     const fn fs_related_id(message: &V3Message) -> Option<u64> {
         match message {
             V3Message::Error { related_id, .. }
@@ -10980,6 +11271,231 @@ mod tests {
             *recorder.seen.lock().unwrap(),
             vec!["read", "read", "flush", "read"]
         );
+    }
+
+    fn fs_write(handle: u64, offset: u64, data: &[u8], digest: Option<[u8; 32]>) -> V3Message {
+        V3Message::Write {
+            handle,
+            offset,
+            digest,
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn fs_write_lands_at_the_offset_and_reports_the_new_size() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"0123456789").unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (3, fs_open(b"file", open_flags::READ | open_flags::WRITE, 0)),
+                (4, fs_write(1, 2, b"AB", None)),
+                // Past the end, so the file grows.
+                (5, fs_write(1, 10, b"XY", None)),
+                (6, fs_read(1, 0, 32, false)),
+            ],
+        );
+
+        match fs_reply(&replies, 4) {
+            V3Message::WriteAck {
+                bytes_written,
+                new_size,
+                stable,
+                ..
+            } => {
+                assert_eq!(*bytes_written, 2);
+                assert_eq!(*new_size, 10, "an in-place write does not grow the file");
+                // Write-through: Flush is the durability barrier until an
+                // export can be configured `sync`.
+                assert!(!*stable);
+            }
+            other => panic!("expected WriteAck, got {other:?}"),
+        }
+        match fs_reply(&replies, 5) {
+            V3Message::WriteAck { new_size, .. } => assert_eq!(*new_size, 12),
+            other => panic!("expected WriteAck, got {other:?}"),
+        }
+        match fs_reply(&replies, 6) {
+            V3Message::ReadData { data, .. } => assert_eq!(data, b"01AB456789XY"),
+            other => panic!("expected ReadData, got {other:?}"),
+        }
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"01AB456789XY");
+    }
+
+    #[test]
+    fn fs_write_verifies_its_digest_before_touching_the_file() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"original").unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (3, fs_open(b"file", open_flags::WRITE, 0)),
+                (4, fs_write(1, 0, b"corrupted", Some([0xab; 32]))),
+                (
+                    5,
+                    fs_write(
+                        1,
+                        0,
+                        b"REPLACED",
+                        Some(*blake3::hash(b"REPLACED").as_bytes()),
+                    ),
+                ),
+            ],
+        );
+
+        match fs_reply(&replies, 4) {
+            V3Message::Error { code, .. } => assert_eq!(*code, FsErrorCode::Integrity),
+            other => panic!("expected EINTEGRITY, got {other:?}"),
+        }
+        assert!(matches!(fs_reply(&replies, 5), V3Message::WriteAck { .. }));
+        // The rejected write left nothing behind; the accepted one landed.
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"REPLACED");
+    }
+
+    #[test]
+    fn fs_write_refuses_a_bad_handle_a_directory_and_a_read_only_handle() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("file"), b"x").unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (
+                    3,
+                    fs_open(b"dir", open_flags::READ | open_flags::DIRECTORY, 0),
+                ),
+                (4, fs_open(b"file", open_flags::READ, 0)),
+                (5, fs_write(999, 0, b"x", None)),
+                (6, fs_write(1, 0, b"x", None)),
+                (7, fs_write(2, 0, b"x", None)),
+                (8, V3Message::Flush { handle: 1 }),
+                (9, V3Message::Flush { handle: 2 }),
+            ],
+        );
+
+        let code = |id: u64| match fs_reply(&replies, id) {
+            V3Message::Error { code, .. } => *code,
+            other => panic!("request {id}: expected Error, got {other:?}"),
+        };
+        assert_eq!(code(5), FsErrorCode::BadHandle);
+        assert_eq!(code(6), FsErrorCode::IsDirectory);
+        assert_eq!(code(7), FsErrorCode::Access);
+        assert_eq!(code(8), FsErrorCode::IsDirectory);
+        // Flushing a handle that was only read is harmless, not an error.
+        assert_eq!(*fs_reply(&replies, 9), V3Message::Done { related_id: 9 });
+        assert_eq!(fs::read(root.path().join("file")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn fs_append_handles_ignore_the_offset() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("log"), b"start:").unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (
+                    3,
+                    fs_open(b"log", open_flags::WRITE | open_flags::APPEND, 0),
+                ),
+                // Offset 0 would overwrite the file if it were honoured.
+                (4, fs_write(1, 0, b"one", None)),
+                (5, fs_write(1, 0, b"two", None)),
+            ],
+        );
+
+        for (id, expected_size) in [(4_u64, 9_u64), (5, 12)] {
+            match fs_reply(&replies, id) {
+                V3Message::WriteAck {
+                    bytes_written,
+                    new_size,
+                    ..
+                } => {
+                    assert_eq!(*new_size, expected_size);
+                    // WriteAck carries no offset field, so the offset an append
+                    // landed at is `new_size - bytes_written`. Under the
+                    // handle's exclusive domain that is exact.
+                    assert_eq!(*new_size - u64::from(*bytes_written), expected_size - 3);
+                }
+                other => panic!("request {id}: expected WriteAck, got {other:?}"),
+            }
+        }
+        assert_eq!(fs::read(root.path().join("log")).unwrap(), b"start:onetwo");
+    }
+
+    #[test]
+    fn fs_interleaved_writes_on_two_handles_match_an_in_process_model() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("file");
+        fs::write(&path, vec![b'.'; 64]).unwrap();
+
+        let mut session = FsLiveSession::start(Server::new(root.path()).with_fs_limits(64, 8));
+        let first = session.open(b"file", open_flags::WRITE);
+        let second = session.open(b"file", open_flags::WRITE);
+        assert_ne!(first, second);
+
+        // Two handles onto one file have separate ordering domains, so the
+        // server may interleave these freely. All sixteen go out before any
+        // reply is read, which is the pipelining the domains exist to allow.
+        let mut model = vec![b'.'; 64];
+        let mut ids = Vec::new();
+        for index in 0..16_u64 {
+            let handle = if index % 2 == 0 { first } else { second };
+            let byte = b'a' + u8::try_from(index).unwrap();
+            let offset = index * 4;
+            ids.push(session.send(&fs_write(handle, offset, &[byte; 4], None)));
+            model[offset as usize..offset as usize + 4].fill(byte);
+        }
+        for id in ids {
+            assert!(
+                matches!(session.await_reply(id), V3Message::WriteAck { .. }),
+                "write {id} failed"
+            );
+        }
+        session.finish();
+
+        // Non-overlapping ranges, so whatever order the server chose, the file
+        // must be exactly what the same writes produce locally.
+        assert_eq!(fs::read(&path).unwrap(), model);
+    }
+
+    #[test]
+    fn fs_flush_puts_the_bytes_on_disk() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        let path = root.path().join("file");
+        fs::write(&path, b"old").unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (3, fs_open(b"file", open_flags::WRITE, 0)),
+                (4, fs_write(1, 0, b"new", None)),
+                (5, V3Message::Flush { handle: 1 }),
+            ],
+        );
+
+        assert_eq!(*fs_reply(&replies, 5), V3Message::Done { related_id: 5 });
+        // Proving durability across a crash needs a separate process to kill,
+        // which arrives with the daemon (E1-S1). What is checkable here is that
+        // the flush reported success and the bytes are readable from the file
+        // rather than only through the handle.
+        assert_eq!(fs::read(&path).unwrap(), b"new");
     }
 
     #[test]

@@ -32,8 +32,9 @@ compatibility-matrix row and the f2/Kestrel consumer decision.
 | 1 | E1-S4 — Mount and advertised writability (Phase 1 scope) | **Done** 2026-09-03 |
 | 1 | E4-S1 — Open and close handles | **Done** 2026-09-03 |
 | 1 | E4-S2 — Positional read (server side) | **Done** 2026-09-03 |
-| 1 | E4-S3 — Positional write and flush | Next |
-| 1 | E4-S8, E5-S1–S3, E9-S1/S4/S6, E10-S1/S4 | Not started |
+| 1 | E4-S3 — Positional write and flush (server side) | **Done** 2026-09-03 |
+| 1 | E5-S1 / E5-S2 — Attributes and directory reading | Next |
+| 1 | E4-S8, E5-S3, E9-S1/S4/S6, E10-S1/S4 | Not started |
 | 2–6 | everything else | Not started |
 
 All of the above is on xsync branch `v3`, **uncommitted**. §0 below still describes the
@@ -752,20 +753,68 @@ As a client I can read any byte range of an open file, with pipelining.
 - **E8-S3** should measure before `DEFAULT_FS_MAX_TRANSFER` (1 MiB) or the pool size
   is tuned; both are currently reasoned guesses.
 
-#### X3-E4-S3 — Positional write and flush
+#### X3-E4-S3 — Positional write and flush — **Done (server side)**
+
+*Landed 2026-09-03 on xsync branch `v3`.*
+
 As a client I can write at an offset and know when the bytes are durable.
 
 **AC**
-- `Write(handle, offset, data, digest?)` → `WriteAck(related, bytes_written,
+- [x] `Write(handle, offset, data, digest?)` → `WriteAck(related, bytes_written,
   new_size, change_cookie)`; `data ≤ max_write` (negotiated, same bounds as read).
-- The server verifies the digest when present *before* the `pwrite`; a mismatch is
+- [x] The server verifies the digest when present *before* the `pwrite`; a mismatch is
   `EINTEGRITY`-class and nothing is written.
-- Semantics are **write-through to the OS page cache** (like NFS unstable writes):
-  `Flush(handle)` → `fsync`; `WriteAck` carries a `stable: bool` that is `true` only
-  if the export is configured `sync`.
-- `APPEND` handles ignore `offset` and return the actual offset written.
-- Test: interleave writes on two handles to one file; final content matches an
-  in-process model; `Flush` then kill -9 the daemon; content persists.
+- [x] Semantics are **write-through to the OS page cache**: `Flush(handle)` → `fsync`;
+  `WriteAck` carries `stable`. *(Always `false` today — there is no `sync` export
+  option until E1-S2, and reporting `true` without one would be a lie a client cannot
+  check.)*
+- [~] `APPEND` handles ignore `offset` and return the actual offset written. The
+  ignoring works; the *returning* does not fit — `WriteAck` is frozen with no offset
+  field, and adding one is a breaking change under `docs/protocol-ownership.md`. The
+  offset is derivable as `new_size - bytes_written`, which is exact under the handle's
+  exclusive domain, and `protocol.md` now says so.
+- [x] Test: interleave writes on two handles to one file; final content matches an
+  in-process model.
+- [ ] `Flush` then kill -9 the daemon; content persists. **Deferred:** there is no
+  daemon to kill until E1-S1. What is checked instead is that `Flush` succeeds and the
+  bytes are readable from the file rather than only through the handle.
+
+**Results**
+
+- `Write` refuses before touching the file — unknown handle `EBADF`, directory
+  handle `EISDIR`, read-only handle `EACCES`, oversized `EINVAL` — and verifies the
+  digest before the first byte lands, so a corrupt payload leaves the destination
+  exactly as it was rather than half-written. A test asserts the file still holds its
+  original contents after a rejected write.
+- **`APPEND` cannot use the positional call.** `pwrite` against an `O_APPEND`
+  descriptor appends on Linux and honours the offset on the BSDs; `Write for &File`
+  appends on both. So an append handle goes through the sequential path and a
+  positional one does not, which is a platform difference worth not discovering in
+  production.
+- A `Write` that fails part-way has already put bytes in the file. The server answers
+  with the error rather than a short `WriteAck`: a short acknowledgement cannot say
+  *which* bytes landed, so it would be less informative than the error.
+- **A new test harness, `FsLiveSession`.** The interleaved-writes test could not be
+  written as a script: a client cannot name a handle until `Opened` tells it the
+  number, and feeding a fixed byte stream meant the writes raced their own opens. The
+  harness runs a real session over in-process channels so a test can await a reply and
+  then decide what to send, buffering out-of-order replies as any client must. The
+  test now opens two handles, pipelines sixteen writes across them without awaiting,
+  and compares the file to an in-process model.
+- Six new tests: offsets and file growth, digest rejection leaving the file untouched,
+  the four refusals plus flush-on-a-read-handle being fine and flush-on-a-directory
+  not, `APPEND` ignoring its offset, interleaved writes against a model, and flush.
+
+**Next steps**
+
+- **E5-S1/S2 (`Stat`, `ReadDir`)** are what Excalibur needs next to list a directory;
+  `attrs_from_metadata` and the directory handles already exist, so `ReadDir` is
+  mostly paging and the cursor.
+- **E1-S2** brings the `sync` export option that makes `WriteAck.stable` meaningful.
+- **E4-S6** (staged resumable uploads) is where a client that wants atomic replacement
+  goes; plain `Write` deliberately does not stage.
+- `FsLiveSession` should be the default harness for anything spanning round trips; the
+  scripted helpers are only right for single-shot request/response checks.
 
 #### X3-E4-S4 — Truncate, allocate, sparse
 **AC**
@@ -1282,7 +1331,7 @@ method list to be revised against what the GUI actually needs once M1 is running
 
 | Phase | Stories | Unlocks |
 |---|---|---|
-| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, ~~E4-S2~~, **E4-S3 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
+| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, ~~E4-S2~~, ~~E4-S3~~, **E5-S1–S3 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
 | **2. Daemon, TLS, identity** | E1-S1–S3, E1-S5, E2-S1, E2-S3–S5, E10-S2, E10-S6, E12-S1–S3 | Connect without SSH; exports; principals; the "New Connection" dialog's xsync tab is complete. |
 | **3. Durability and coherence** | E3-S2, E3-S3, E3-S5, E4-S6, E4-S7, E6-S1, E6-S4, E6-S5, E5-S4, E5-S7 | Resumable uploads that survive drops; locks for edit-in-place; complete mutation set. |
 | **4. Live views and speed** | E7, E6-S2, E8-S1–S5, E5-S2 cursor fix, E5-S5, E4-S4, E4-S5 | Auto-refreshing listings, leases, compound open-read, sparse. |
