@@ -37,6 +37,8 @@ compatibility-matrix row and the f2/Kestrel consumer decision.
 | 1 | E5-S2 — Directory reading and cursors | **Done** 2026-09-03 |
 | 1 | E5-S3 — Capacity and filesystem facts | **Done** 2026-09-03 |
 | 1 | E9-S1 — `xsync-client` async crate (Phase 1 surface) | **Done** 2026-09-03 |
+| 3 | E4-S6 — Resumable, atomic uploads | **Done** 2026-09-03 |
+| 3 | E4-S7 — Compare-and-swap edits | **Done** 2026-09-03 |
 | 3 | E5-S4 — Complete mutation set | **Done** 2026-09-03 |
 | 1 | E10-S1 / E10-S4 — Confinement tests and fuzzing | Next |
 | 1 | E4-S8, E5-S1b, E9-S4/S6 | Not started |
@@ -837,36 +839,124 @@ As a client I can write at an offset and know when the bytes are durable.
   `DONTNEED` mapped to `posix_fadvise`/`F_RDADVISE` where available; no-op
   elsewhere; never an error.
 
-#### X3-E4-S6 — Resumable, atomic uploads
-As a client I can upload a large file in ranges, resume after a drop, and have the
-destination appear atomically and verified — the property xsync's sink already gives
-sync transfers.
+#### X3-E4-S6 — Resumable, atomic uploads — **Done**
+
+*2026-09-03. Types 70–78, frozen.*
 
 **AC**
-- `StageOpen(dest_path, size, digest?)` → `stage_id` and a resume token; the server
+- [x] `StageOpen(dest_path, size, digest?)` → `stage_id` and a resume token; the server
   stages in its existing deterministic temporary path under the destination
-  directory (`sink.rs`), with the same crash-cleanup rules.
-- `StageWrite(stage_id, offset, data, digest?)` ranges in any order; `StageStatus`
-  returns the committed range set (reusing `RangeTracker` / `ResumePage` semantics).
-- `StageCommit(stage_id, whole_file_digest, expect_cookie?)` verifies the complete
-  BLAKE3, optionally checks the destination's change cookie (CAS, generalising
-  `PublishRequest`), applies mode/mtime, then renames into place atomically.
-  `StageAbort` discards.
-- Stages survive reconnect (E3-S2) and daemon restart (token persisted next to the
-  temp file) for a configurable retention (default 24 h), then are garbage-collected.
-- Windows publication becomes crash-atomic (`BUGS.md` P1) as part of this story.
+  directory (`sink.rs`).
+- [x] `StageWrite(stage_id, offset, data, digest?)` ranges in any order; `StageStatus`
+  returns the committed range set.
+- [x] `StageCommit(stage_id, whole_file_digest, expect_cookie?)` verifies the complete
+  BLAKE3, optionally checks the destination's change cookie, applies mode/mtime, then
+  renames into place atomically. `StageAbort` discards.
+- [x] Stages survive **daemon restart** (token persisted next to the temp file) for a
+  configurable retention (default 24 h), then are garbage-collected.
+- [ ] …and reconnect *via E3-S2*. **Not needed, and not waited for:** see below.
+- [x] Windows publication becomes crash-atomic (`BUGS.md` P1) as part of this story.
 
-#### X3-E4-S7 — Compare-and-swap edits
-As an editor I can save a file back only if nobody else changed it.
+**Results**
+
+- **The stage lives on disk, not in the session, and that decouples this story from
+  E3-S2 entirely.** The range set is a sidecar beside the temporary file. A client that
+  drops reconnects on a brand-new session, hands back its token, and continues — there is
+  a test that does exactly that against a *second server object*, with no session resume
+  involved. Waiting for E3-S2 would have bought nothing: the hard part is durability
+  across a process restart, and session resume does not give that.
+- **`StageStatus` returns ranges, not a byte count.** A client that wrote out of order
+  has holes, and "you have 40,000 bytes" cannot say where they are. The set is what lets
+  a resuming client send only what it owes.
+- **The range set is persisted on every write, not on an interval.** It is what a
+  resuming client is *told*, and a set claiming bytes the file does not hold is worse
+  than no resume at all — it would silently skip them. Ranges coalesce on touch, so a
+  sequential upload ends with one range rather than thousands.
+- **Coverage is checked before the digest.** A stage with a gap would hash whatever the
+  filesystem left there — usually zeroes — and a zero-filled hole that fails the digest
+  is a confusing error, while one that passes is a corrupt publish. There is a test for
+  the gap case.
+- **The commit order is metadata, then rename**, matching `sink.rs`, so the published
+  file never appears with the wrong mode or time. The destination is untouched until that
+  rename; a test asserts the old contents are still readable mid-upload.
+- **`BUGS.md` P1 was fixed by deleting code.** Windows `commit_temp` removed the
+  destination and *then* renamed, so a crash between the two left nothing. But
+  `std::fs::rename` on Windows is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, which
+  already replaces a file atomically — the unconditional removal was the entire bug. A
+  destination that is a *directory* is still handled, on the failure path, exactly as the
+  Unix implementation handles it.
+- **`features::STAGE_RESUME` is now advertised.** It had been declared since the freeze
+  and never set by anything. Advertised, not *required*: the bitmap exists so peers of
+  different ages agree on what may be sent, and a client that does not know about staging
+  never sends a `Stage*` message. Refusing the verbs unless negotiated would add a
+  failure mode without adding a guarantee.
+- The retention sweep runs when a stage is **opened in that directory**, not on a timer.
+  A server with no uploads should not be walking export directories, and a stale stage
+  costs nothing until something else wants the space. Configurable via
+  `Server::with_stage_retention`.
+- Deliberately *not* reused: `RangeTracker`. Its overlap check is a linear scan over up
+  to 65,536 ranges, it rejects overlaps rather than coalescing them — a re-sent range
+  after a drop is the normal case here, not an error — and it is dead code elsewhere in
+  the tree. A small sorted merge does what this needs.
+
+**Next steps**
+
+- The sweep only runs in a directory something is staging into. A stage in a directory
+  nobody returns to lives until that changes; a periodic sweep belongs with the daemon
+  (Phase 2), which is the first thing with a lifecycle to hang it on.
+- `StageOpen`'s `size` and `digest` are accepted and currently unused. They become useful
+  with preallocation (E4-S5) and with rejecting a commit whose digest was known in
+  advance and does not match.
+- Cross-filesystem publication returns `EXDEV`, since the temporary is a sibling of the
+  destination and always on the same filesystem. Nothing to do; noted so it is not
+  mistaken for a gap.
+
+#### X3-E4-S7 — Compare-and-swap edits — **Done**
+
+*2026-09-03. Type 79, frozen.*
 
 **AC**
-- `StageCommit` with `expect_cookie` returns `ECHANGED` plus the current cookie and
-  attributes when the destination moved; the client decides (overwrite, keep both,
-  diff).
-- `Write` accepts an optional `expect_cookie` for small in-place edits without
-  staging.
-- `Publish` (v2) is documented as the whole-file special case and remains available
-  to v2 peers.
+- [x] `StageCommit` with `expect_cookie` reports the refusal plus the current cookie and
+  attributes when the destination moved; the client decides (overwrite, keep both, diff).
+- [x] An optional `expect_cookie` for small in-place edits without staging — as a
+  **separate message**, `WriteCas`. See below.
+- [x] `Publish` (v2) remains available to v2 peers and is the whole-file special case.
+
+**Results**
+
+- **The refusal is a reply, not an `Error`, and the reason is fail-closed design.** An
+  `Error` has nowhere to put the destination's current attributes, which is the entire
+  point of compare-and-swap — the client needs them to offer replace / keep both / diff.
+  So `StageResult` carries a `CommitOutcome` enum. A boolean would have a default reading
+  ("not refused" ⇒ published) that a caller can fall into by forgetting a check; matching
+  an enum has no such arm, and an unknown value is refused by the decoder.
+- **`ECHANGED` (25) and `features::STAGE_RESUME` had both been declared since the Phase 1
+  freeze and never constructed by anything.** This is their first producer.
+- **The cookie is checked immediately before the rename, not at `StageOpen`.** v2's
+  `PublishRequest` learned this the hard way and re-checks after its upload: a check taken
+  before the bytes move proves nothing about the moment of publication, which is the
+  moment that matters.
+- **An all-zero cookie means "create, and only create"** — a case v2 could not express at
+  all, because it answered `Changed` for a destination that did not exist. There is a
+  test that creates, then proves a second create-only commit refuses.
+- **`Write` could not take the cookie, so `WriteCas` exists instead.** Type 61 is in the
+  frozen Phase 1 table; adding a field would break every peer already speaking v3 and
+  every vector. This is the deviation the freeze forced, and it is the freeze working
+  rather than failing.
+- **`WriteCas` is documented as not being a lock**, in the protocol, the server and the
+  client. The check sits immediately before the write inside the handle's exclusive
+  ordering domain, so another *handle* can still write between them. It closes the case
+  it exists for — an editor saving over an edit made minutes ago — and nothing stronger.
+  Anything that must be atomic against a concurrent writer wants a stage.
+
+**Next steps**
+
+- **A real lock (E6-S1)** is what makes an in-place edit atomic against a concurrent
+  writer. `WriteCas` narrows the window; it does not close it.
+- `change_cookie` hashes strictly fewer inputs on Windows — `dev`/`ino`/`ctime` are
+  behind `#[cfg(unix)]`, leaving size and mtime. A same-size edit inside mtime
+  granularity yields an identical cookie there, so CAS is measurably weaker on Windows
+  than on Unix. Worth closing before Windows is a supported server (E1-S6).
 
 #### X3-E4-S8 — Handle lifecycle on failure
 **AC**
@@ -1545,7 +1635,7 @@ intersection; unknown bits are ignored.
 | 52–55 | Session | reserved (Phase 3) | `Resume`/`ResumeResult`, `Unmount`, `MountChanged`* |
 | 56–63 | Handles & I/O | **frozen** | `Open`/`Opened`, `Close`, `Read`/`ReadData`, `Write`/`WriteAck`, `Flush` |
 | 64–69 | Handles & I/O | reserved (Phases 3–4) | `SetSize`, `Allocate`, `Seek`/`SeekResult`, `Advise`, `HandleState` |
-| 70–79 | Staging | reserved (Phase 3) | `StageOpen`/`StageOpened`, `StageWrite`/`StageAck`, `StageStatus`/`StageRanges`, `StageCommit`/`StageResult`, `StageAbort` |
+| 70–79 | Staging and CAS | **frozen** | `StageOpen`/`StageOpened`, `StageWrite`/`StageAck`, `StageStatus`/`StageRanges`, `StageCommit`/`StageResult`, `StageAbort`, `WriteCas` |
 | 80–85 | Namespace | **frozen** | `Stat`/`Attrs`, `ReadDir`/`DirPage`, `StatFs`/`FsInfo` |
 | 86–95 | Namespace mutations | **frozen** | `Rename`, `Unlink`, `Rmdir`, `Mkdir`, `Symlink`, `Link`, `Chown`, `SetTimes`, `SetPermissions`, `Mutated` |
 | 96–99 | Namespace | reserved (Phase 4) | `Access`/`AccessResult`, two spare |

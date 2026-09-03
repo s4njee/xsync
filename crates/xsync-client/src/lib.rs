@@ -46,8 +46,8 @@ use xsync_core::protocol::{
 use xsync_core::protocol_v3::{self as v3, V3Message};
 
 pub use v3::{
-    attr_presence, features, supports, Access, Attrs, ErrorCode, Normalization, RenameMode,
-    StatTarget, TimeChange,
+    attr_presence, features, supports, Access, Attrs, CommitOutcome, ErrorCode, Normalization,
+    RenameMode, StatTarget, TimeChange,
 };
 
 /// Which optional `Attrs` blocks a request wants. See [`attr_presence`].
@@ -859,6 +859,53 @@ impl Mount {
         .await
     }
 
+    /// Begin or resume a staged upload (`xsyncv3.md` E4-S6).
+    ///
+    /// Pass an empty `resume_token` to start. The token that comes back
+    /// survives the connection *and* the server process, so a client that
+    /// reconnects hands it back here and continues from
+    /// [`Stage::staged_bytes`] rather than from zero.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the destination cannot be resolved or the stage cannot be
+    /// created.
+    pub async fn stage(
+        &self,
+        destination: &[u8],
+        size: u64,
+        mode: u32,
+        resume_token: &[u8],
+    ) -> Result<Stage> {
+        let reply = self
+            .connection
+            .call(&V3Message::StageOpen {
+                destination: destination.to_vec(),
+                size,
+                digest: None,
+                mode,
+                resume_token: resume_token.to_vec(),
+            })
+            .await?;
+        match reply {
+            V3Message::StageOpened {
+                stage_id,
+                resume_token,
+                staged_bytes,
+                ..
+            } => Ok(Stage {
+                connection: Arc::clone(&self.connection),
+                id: stage_id,
+                resume_token,
+                staged_bytes,
+                max_write: self.info.max_write,
+            }),
+            other => Err(Error::Unexpected(format!(
+                "expected StageOpened, got {other:?}"
+            ))),
+        }
+    }
+
     /// Send a mutation that answers with the new attributes.
     async fn mutate(&self, request: V3Message) -> Result<Attrs> {
         match self.connection.call(&request).await? {
@@ -990,6 +1037,68 @@ impl OpenFile {
             .call(&V3Message::Write {
                 handle: self.handle,
                 offset,
+                digest: Some(*blake3::hash(data).as_bytes()),
+                data: data.to_vec(),
+            })
+            .await?;
+        match reply {
+            V3Message::WriteAck {
+                bytes_written,
+                new_size,
+                stable,
+                change_cookie,
+                ..
+            } => Ok(Written {
+                bytes: bytes_written,
+                new_size,
+                stable,
+                change_cookie,
+            }),
+            other => Err(Error::Unexpected(format!(
+                "expected WriteAck, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Write, but only if the file still has the cookie you last saw (E4-S7).
+    ///
+    /// For a small in-place edit that does not justify staging. Fails with
+    /// [`ErrorCode::Changed`] when the file moved underneath, and writes
+    /// nothing in that case.
+    ///
+    /// **Not a lock.** The check happens immediately before the write, inside
+    /// the handle's exclusive ordering domain, so another *handle* can still
+    /// write between the two. It closes the case it exists for — saving over an
+    /// edit someone made minutes ago — and nothing stronger. A change that must
+    /// be atomic against a concurrent writer wants a stage, whose publication
+    /// is a rename.
+    ///
+    /// # Errors
+    ///
+    /// As [`OpenFile::write`], plus `ECHANGED` when the cookie does not match.
+    pub async fn write_if_unchanged(
+        &self,
+        offset: u64,
+        expect_cookie: [u8; 16],
+        data: &[u8],
+    ) -> Result<Written> {
+        if data.len() > self.max_write as usize {
+            return Err(Error::Server {
+                code: ErrorCode::Invalid,
+                errno: 0,
+                message: format!(
+                    "write of {} exceeds the mount's max_write {}",
+                    data.len(),
+                    self.max_write
+                ),
+            });
+        }
+        let reply = self
+            .connection
+            .call(&V3Message::WriteCas {
+                handle: self.handle,
+                offset,
+                expect_cookie,
                 digest: Some(*blake3::hash(data).as_bytes()),
                 data: data.to_vec(),
             })
@@ -1165,6 +1274,10 @@ const fn related_id(message: &V3Message) -> Option<u64> {
         | V3Message::DirPage { related_id, .. }
         | V3Message::FsInfo { related_id, .. }
         | V3Message::Mutated { related_id, .. }
+        | V3Message::StageOpened { related_id, .. }
+        | V3Message::StageAck { related_id, .. }
+        | V3Message::StageRanges { related_id, .. }
+        | V3Message::StageResult { related_id, .. }
         | V3Message::FeaturesAck { related_id, .. } => Some(*related_id),
         // A keepalive acknowledgement echoes its nonce rather than an id, and
         // the client sends the nonce as the id, so they agree.
@@ -1185,6 +1298,12 @@ const fn related_id(message: &V3Message) -> Option<u64> {
         | V3Message::Stat { .. }
         | V3Message::ReadDir { .. }
         | V3Message::StatFs
+        | V3Message::StageOpen { .. }
+        | V3Message::StageWrite { .. }
+        | V3Message::StageStatus { .. }
+        | V3Message::StageCommit { .. }
+        | V3Message::StageAbort { .. }
+        | V3Message::WriteCas { .. }
         | V3Message::Rename { .. }
         | V3Message::Unlink { .. }
         | V3Message::Rmdir { .. }
@@ -1227,4 +1346,167 @@ async fn read_v1<R: AsyncRead + Unpin>(
         .read(&mut Cursor::new(bytes))
         .map(|frame| frame.message)
         .map_err(|error| Error::Protocol(error.to_string()))
+}
+
+/// A staged upload in progress.
+///
+/// Dropping this leaves the stage on the server, which is the point: it is what
+/// a client comes back to. Call [`Stage::abort`] to discard it, or let the
+/// server's retention sweep take it.
+pub struct Stage {
+    connection: Arc<Connection>,
+    id: u64,
+    resume_token: Vec<u8>,
+    staged_bytes: u64,
+    max_write: u32,
+}
+
+impl Stage {
+    /// Hand this back to [`Mount::stage`] to resume after a disconnect.
+    #[must_use]
+    pub fn resume_token(&self) -> &[u8] {
+        &self.resume_token
+    }
+
+    /// Bytes already staged, as of the last reply.
+    #[must_use]
+    pub const fn staged_bytes(&self) -> u64 {
+        self.staged_bytes
+    }
+
+    /// Largest `data` one [`Stage::write`] accepts.
+    #[must_use]
+    pub const fn max_write(&self) -> u32 {
+        self.max_write
+    }
+
+    /// Write one range into the stage, digest-verified.
+    ///
+    /// Ranges may arrive in any order and may repeat: a range re-sent after a
+    /// drop is the normal case, and the server coalesces it.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the payload does not match its digest, the stage is unknown,
+    /// or the write fails.
+    pub async fn write(&mut self, offset: u64, data: &[u8]) -> Result<u32> {
+        let reply = self
+            .connection
+            .call(&V3Message::StageWrite {
+                stage_id: self.id,
+                offset,
+                digest: Some(*blake3::hash(data).as_bytes()),
+                data: data.to_vec(),
+            })
+            .await?;
+        match reply {
+            V3Message::StageAck {
+                bytes_written,
+                staged_bytes,
+                ..
+            } => {
+                self.staged_bytes = staged_bytes;
+                Ok(bytes_written)
+            }
+            other => Err(Error::Unexpected(format!(
+                "expected StageAck, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Every range the stage holds, paged until complete.
+    ///
+    /// This is what a resuming client asks to learn which bytes it still owes,
+    /// rather than assuming a prefix: ranges written out of order leave holes
+    /// that a byte count alone cannot describe.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the stage is unknown or a page cannot be read.
+    pub async fn ranges(&self) -> Result<Vec<(u64, u64)>> {
+        let mut all = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let reply = self
+                .connection
+                .call(&V3Message::StageStatus {
+                    stage_id: self.id,
+                    cursor,
+                })
+                .await?;
+            match reply {
+                V3Message::StageRanges {
+                    cursor: next,
+                    final_page,
+                    ranges,
+                    ..
+                } => {
+                    all.extend(ranges);
+                    if final_page {
+                        return Ok(all);
+                    }
+                    cursor = next;
+                }
+                other => Err(Error::Unexpected(format!(
+                    "expected StageRanges, got {other:?}"
+                )))?,
+            }
+        }
+    }
+
+    /// Verify the stage and publish it, optionally guarded by a cookie (E4-S7).
+    ///
+    /// `expect_cookie` is the destination's `change_cookie` as the caller last
+    /// saw it. All zeroes means "create, and only create". `None` publishes
+    /// unconditionally.
+    ///
+    /// Returns `Ok(Err(attrs))` when the guard refused — that is not a failure,
+    /// it is the answer, and `attrs` describes the destination as it now
+    /// stands so the caller can decide what to do.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the staged bytes do not match `digest`, the stage has gaps,
+    /// or publication fails.
+    pub async fn commit(
+        self,
+        digest: [u8; 32],
+        expect_cookie: Option<[u8; 16]>,
+        mtime_ns: Option<i64>,
+    ) -> Result<std::result::Result<Attrs, Attrs>> {
+        let reply = self
+            .connection
+            .call(&V3Message::StageCommit {
+                stage_id: self.id,
+                digest,
+                expect_cookie,
+                mtime_ns,
+            })
+            .await?;
+        match reply {
+            V3Message::StageResult { outcome, attrs, .. } => Ok(match outcome {
+                CommitOutcome::Committed => Ok(attrs),
+                CommitOutcome::Changed => Err(attrs),
+            }),
+            other => Err(Error::Unexpected(format!(
+                "expected StageResult, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Discard the stage and its temporary file.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the stage is unknown.
+    pub async fn abort(self) -> Result<()> {
+        match self
+            .connection
+            .call(&V3Message::StageAbort { stage_id: self.id })
+            .await?
+        {
+            V3Message::Done { .. } => Ok(()),
+            other => Err(Error::Unexpected(format!("expected Done, got {other:?}"))),
+        }
+    }
 }

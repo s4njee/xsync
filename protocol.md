@@ -333,6 +333,16 @@ normal terminal response.
 | 83 | DirPage | related request ID `u64`, cursor `u64`, final-page boolean, count, entries |
 | 84 | StatFs | *(no fields)* |
 | 85 | FsInfo | related request ID `u64`, block size `u32`, total bytes `u64`, free bytes `u64`, available bytes `u64`, total inodes `u64`, free inodes `u64`, fs type UTF-8, max name length `u32`, case-sensitive boolean, normalization `u8`, read-only boolean |
+| 70 | StageOpen | destination path, size `u64`, digest-present boolean, optional digest `[32]`, mode `u32`, resume token |
+| 71 | StageOpened | related request ID `u64`, stage ID `u64`, resume token, staged bytes `u64` |
+| 72 | StageWrite | stage ID `u64`, offset `u64`, digest-present boolean, optional digest `[32]`, data bytes |
+| 73 | StageAck | related request ID `u64`, bytes written `u32`, staged bytes `u64` |
+| 74 | StageStatus | stage ID `u64`, cursor `u64` |
+| 75 | StageRanges | related request ID `u64`, cursor `u64`, final-page boolean, count `u32`, then per range start `u64`, end `u64` |
+| 76 | StageCommit | stage ID `u64`, digest `[32]`, cookie-present boolean, optional expect cookie `[16]`, mtime-present boolean, optional mtime ns `i64` |
+| 77 | StageResult | related request ID `u64`, outcome `u8` (0 committed, 1 changed), attrs |
+| 78 | StageAbort | stage ID `u64` |
+| 79 | WriteCas | handle `u64`, offset `u64`, expect cookie `[16]`, digest-present boolean, optional digest `[32]`, data bytes |
 | 86 | Rename | source path, destination path, mode `u8` (0 `NOREPLACE`, 1 `REPLACE`, 2 `EXCHANGE`), attr mask `u32` |
 | 87 | Unlink | path |
 | 88 | Rmdir | path |
@@ -345,6 +355,36 @@ normal terminal response.
 | 95 | Mutated | related request ID `u64`, attrs |
 | 121 | Error | related request ID `u64`, code `u16`, platform errno `i32`, UTF-8 message |
 | 122 | Done | related request ID `u64` |
+
+`StageRanges` carries half-open `[start, end)` pairs, ascending, disjoint and
+non-empty. A set that overlaps or runs backwards is rejected: it describes no
+file, and accepting one would let a peer make a resuming client skip bytes it
+never sent.
+
+Types 70–79 are staged uploads and compare-and-swap. A stage is a temporary file
+beside its destination plus a **sidecar recording which ranges it holds**, so it
+outlives the connection that created it and the server process itself: a client
+reconnects on a new session, hands back the resume token, and continues.
+Session resume (types 52–55) is a different mechanism for a different problem
+and this does not depend on it. `StageCommit` verifies the whole-file digest,
+refuses a stage with gaps, applies mode and mtime to the temporary file, and
+then renames — so the destination never exists in a partial state.
+
+`expect_cookie` is the compare-and-swap. It is checked immediately before the
+rename, not at `StageOpen`: a check taken before the bytes are transferred
+proves nothing about the moment of publication. An **all-zero cookie means
+"create, and only create"** — the case v2's `Publish` could not express, because
+it answered `Changed` for a destination that did not exist. A refused commit is
+a `StageResult` with outcome `1`, not an `Error`: the caller needs the
+destination's current attributes to decide what to do, and an enum has no
+default arm that a caller can misread as success.
+
+`WriteCas` is the same guard for a small in-place edit that does not justify a
+stage. `Write` could not take an optional cookie because type 61 is in the
+frozen Phase 1 table. The check happens immediately before the write, inside the
+handle's exclusive ordering domain; **it is not a lock**, because another handle
+can still write between the check and the write. Anything that must be atomic
+against a concurrent writer wants a stage, whose publication is a rename.
 
 A *stat target* is the three fields `Stat` uses: tag `u8` (0 path, 1 handle),
 path, handle `u64`. Both fields are always present and the unused one must be
@@ -369,7 +409,7 @@ same file succeeds and does nothing, as POSIX `rename` does.
 
 Reserved for later phases and never reused: 44–49 (authentication and export
 discovery), 52–55 (session resume, unmount, `MountChanged`), 64–69 (`SetSize`,
-`Allocate`, `Seek`, `Advise`, `HandleState`), 70–79 (staged uploads), 96–99
+`Allocate`, `Seek`, `Advise`, `HandleState`), 96–99
 (`Access`/`AccessResult`, and two spare), 100–109 (locks and leases), 110–115
 (watches), 116–119 (compound), 120 (`Shutdown`), 123–127 (extended attributes —
 moved out of 86–99, which was assigned before anyone counted and holds four

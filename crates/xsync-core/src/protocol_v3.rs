@@ -76,6 +76,26 @@ pub mod types {
     pub const WRITE_ACK: u8 = 62;
     /// Make a handle's writes durable.
     pub const FLUSH: u8 = 63;
+    /// Begin or resume a staged upload (`xsyncv3.md` E4-S6).
+    pub const STAGE_OPEN: u8 = 70;
+    /// Stage identity and what is already on disk.
+    pub const STAGE_OPENED: u8 = 71;
+    /// One range into a stage.
+    pub const STAGE_WRITE: u8 = 72;
+    /// Outcome of a `StageWrite`.
+    pub const STAGE_ACK: u8 = 73;
+    /// Ask which ranges a stage already holds.
+    pub const STAGE_STATUS: u8 = 74;
+    /// The committed range set, paged.
+    pub const STAGE_RANGES: u8 = 75;
+    /// Verify and publish a stage.
+    pub const STAGE_COMMIT: u8 = 76;
+    /// Outcome of a `StageCommit`.
+    pub const STAGE_RESULT: u8 = 77;
+    /// Discard a stage.
+    pub const STAGE_ABORT: u8 = 78;
+    /// Positional write guarded by the destination's change cookie (E4-S7).
+    pub const WRITE_CAS: u8 = 79;
     /// Attributes of a path or handle.
     pub const STAT: u8 = 80;
     /// Attributes for a `Stat`.
@@ -294,6 +314,38 @@ impl Access {
             1 => Ok(Self::ReadOnly),
             _ => Err(V3CodecError::InvalidEnum {
                 field: "access",
+                value,
+            }),
+        }
+    }
+}
+
+/// How a `StageCommit` ended.
+///
+/// An enum rather than a boolean, and carried in the *reply* rather than
+/// signalled by an `Error`, for two reasons that pull the same way. A refused
+/// commit has to hand back the destination's current attributes — that is the
+/// whole point of compare-and-swap, and an `Error` has nowhere to put them. And
+/// a client must not be able to read the refusal as a success by ignoring a
+/// field: matching on an enum has no default arm that means "committed", where
+/// `if !refused` has exactly that shape when someone forgets to check it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CommitOutcome {
+    /// The stage was verified and published. `attrs` describes the new file.
+    Committed = 0,
+    /// `expect_cookie` did not match. Nothing was published, and `attrs`
+    /// describes the destination as it now stands.
+    Changed = 1,
+}
+
+impl CommitOutcome {
+    fn decode(value: u8) -> Result<Self, V3CodecError> {
+        match value {
+            0 => Ok(Self::Committed),
+            1 => Ok(Self::Changed),
+            _ => Err(V3CodecError::InvalidEnum {
+                field: "commit_outcome",
                 value,
             }),
         }
@@ -931,6 +983,130 @@ pub enum V3Message {
         /// The filesystem itself is read-only (distinct from the export).
         read_only: bool,
     },
+    /// Begin or resume a staged upload.
+    ///
+    /// The `resume_token` is what makes a stage outlive the connection that
+    /// created it: it is written beside the temporary file, so a client that
+    /// reconnects — or comes back after the server restarted — hands the same
+    /// token to `StageOpen` and continues. Session resume (E3-S2) is a
+    /// different mechanism for a different problem and this deliberately does
+    /// not depend on it.
+    StageOpen {
+        /// Where the finished file should end up, relative to the export root.
+        destination: Vec<u8>,
+        /// Expected final size, or `0` when the client does not know it yet.
+        size: u64,
+        /// BLAKE3 of the whole file, when known in advance.
+        digest: Option<[u8; 32]>,
+        /// Permission bits for the published file, before umask.
+        mode: u32,
+        /// Empty to start a stage; a token from a previous `StageOpened` to
+        /// resume one.
+        resume_token: Vec<u8>,
+    },
+    /// A stage's identity, and how much of it already exists.
+    StageOpened {
+        /// The `StageOpen` request.
+        related_id: u64,
+        /// Session-scoped handle for the stage.
+        stage_id: u64,
+        /// Hand this back to `StageOpen` to resume after a disconnect.
+        resume_token: Vec<u8>,
+        /// Bytes already staged, so a resuming client knows where to look.
+        staged_bytes: u64,
+    },
+    /// Write one range into a stage.
+    StageWrite {
+        /// From `StageOpened`.
+        stage_id: u64,
+        /// Byte offset in the finished file.
+        offset: u64,
+        /// BLAKE3 of `data`, verified before anything is written.
+        digest: Option<[u8; 32]>,
+        /// The bytes, `1..=max_write`.
+        data: Vec<u8>,
+    },
+    /// Outcome of a `StageWrite`.
+    StageAck {
+        /// The `StageWrite` request.
+        related_id: u64,
+        /// Bytes accepted.
+        bytes_written: u32,
+        /// Total bytes the stage now holds.
+        staged_bytes: u64,
+    },
+    /// Ask which ranges a stage already holds.
+    StageStatus {
+        /// From `StageOpened`.
+        stage_id: u64,
+        /// `0` to start; a cursor from a previous `StageRanges` to continue.
+        cursor: u64,
+    },
+    /// One page of a stage's committed range set.
+    StageRanges {
+        /// The `StageStatus` request.
+        related_id: u64,
+        /// Where to resume paging; meaningless when `final_page` is set.
+        cursor: u64,
+        /// No further pages follow.
+        final_page: bool,
+        /// Half-open `[start, end)` byte ranges, ascending and disjoint.
+        ranges: Vec<(u64, u64)>,
+    },
+    /// Verify a stage and publish it.
+    StageCommit {
+        /// From `StageOpened`.
+        stage_id: u64,
+        /// BLAKE3 of the finished file, checked before anything is published.
+        digest: [u8; 32],
+        /// The destination's expected `change_cookie` (E4-S7).
+        ///
+        /// `None` publishes unconditionally. `Some` publishes only if the
+        /// destination still has that cookie — or does not exist, when the
+        /// cookie is all zeroes, which is how "create, and only create" is
+        /// expressed.
+        expect_cookie: Option<[u8; 16]>,
+        /// Modification time to stamp, or `None` to leave the server's.
+        mtime_ns: Option<i64>,
+    },
+    /// Outcome of a `StageCommit`.
+    StageResult {
+        /// The `StageCommit` request.
+        related_id: u64,
+        /// Whether it published, or was refused by the cookie check.
+        outcome: CommitOutcome,
+        /// The destination afterwards: the new file, or the one in the way.
+        attrs: Attrs,
+    },
+    /// Discard a stage and its temporary file.
+    StageAbort {
+        /// From `StageOpened`.
+        stage_id: u64,
+    },
+    /// Positional write guarded by the destination's change cookie.
+    ///
+    /// E4-S7 asked for an optional `expect_cookie` on `Write`. `Write` is in
+    /// the frozen Phase 1 table, so a field cannot be added to it without
+    /// breaking every peer that already speaks v3; this is the same request
+    /// with the cookie required.
+    ///
+    /// The check happens immediately before the write, inside the handle's
+    /// exclusive ordering domain. That closes the case this exists for — an
+    /// editor saving over a file someone else edited minutes ago — and it is
+    /// **not** a lock: another handle can still write between the check and
+    /// the write. Locking is E6-S1.
+    WriteCas {
+        /// An open handle.
+        handle: u64,
+        /// Byte offset; ignored on an `APPEND` handle.
+        offset: u64,
+        /// The cookie the file must still have.
+        expect_cookie: [u8; 16],
+        /// BLAKE3 of `data`, verified before anything is written.
+        digest: Option<[u8; 32]>,
+        /// The bytes, `1..=max_write`.
+        data: Vec<u8>,
+    },
     /// Rename or exchange a path.
     Rename {
         /// Source path, relative to the export root.
@@ -1114,6 +1290,16 @@ pub const fn message_type(message: &V3Message) -> u8 {
         V3Message::DirPage { .. } => types::DIR_PAGE,
         V3Message::StatFs => types::STAT_FS,
         V3Message::FsInfo { .. } => types::FS_INFO,
+        V3Message::StageOpen { .. } => types::STAGE_OPEN,
+        V3Message::StageOpened { .. } => types::STAGE_OPENED,
+        V3Message::StageWrite { .. } => types::STAGE_WRITE,
+        V3Message::StageAck { .. } => types::STAGE_ACK,
+        V3Message::StageStatus { .. } => types::STAGE_STATUS,
+        V3Message::StageRanges { .. } => types::STAGE_RANGES,
+        V3Message::StageCommit { .. } => types::STAGE_COMMIT,
+        V3Message::StageResult { .. } => types::STAGE_RESULT,
+        V3Message::StageAbort { .. } => types::STAGE_ABORT,
+        V3Message::WriteCas { .. } => types::WRITE_CAS,
         V3Message::Rename { .. } => types::RENAME,
         V3Message::Unlink { .. } => types::UNLINK,
         V3Message::Rmdir { .. } => types::RMDIR,
@@ -1466,6 +1652,124 @@ pub fn encode(message: &V3Message) -> Result<Vec<u8>, V3CodecError> {
             writer.u8(*normalization as u8);
             writer.bool(*read_only);
         }
+        V3Message::StageOpen {
+            destination,
+            size,
+            digest,
+            mode,
+            resume_token,
+        } => {
+            writer.blob(destination, MAX_PATH, "destination")?;
+            writer.u64(*size);
+            writer.bool(digest.is_some());
+            if let Some(digest) = digest {
+                writer.bytes(digest);
+            }
+            writer.u32(*mode);
+            writer.blob(resume_token, MAX_NAME, "resume token")?;
+        }
+        V3Message::StageOpened {
+            related_id,
+            stage_id,
+            resume_token,
+            staged_bytes,
+        } => {
+            writer.u64(*related_id);
+            writer.u64(*stage_id);
+            writer.blob(resume_token, MAX_NAME, "resume token")?;
+            writer.u64(*staged_bytes);
+        }
+        V3Message::StageWrite {
+            stage_id,
+            offset,
+            digest,
+            data,
+        } => {
+            writer.u64(*stage_id);
+            writer.u64(*offset);
+            writer.bool(digest.is_some());
+            if let Some(digest) = digest {
+                writer.bytes(digest);
+            }
+            writer.blob(data, MAX_DATA, "stage data")?;
+        }
+        V3Message::StageAck {
+            related_id,
+            bytes_written,
+            staged_bytes,
+        } => {
+            writer.u64(*related_id);
+            writer.u32(*bytes_written);
+            writer.u64(*staged_bytes);
+        }
+        V3Message::StageStatus { stage_id, cursor } => {
+            writer.u64(*stage_id);
+            writer.u64(*cursor);
+        }
+        V3Message::StageRanges {
+            related_id,
+            cursor,
+            final_page,
+            ranges,
+        } => {
+            if ranges.len() > MAX_COLLECTION {
+                return Err(V3CodecError::Bound {
+                    field: "stage ranges",
+                    value: ranges.len(),
+                });
+            }
+            writer.u64(*related_id);
+            writer.u64(*cursor);
+            writer.bool(*final_page);
+            writer.u32(u32::try_from(ranges.len()).unwrap_or(u32::MAX));
+            for (start, end) in ranges {
+                writer.u64(*start);
+                writer.u64(*end);
+            }
+        }
+        V3Message::StageCommit {
+            stage_id,
+            digest,
+            expect_cookie,
+            mtime_ns,
+        } => {
+            writer.u64(*stage_id);
+            writer.bytes(digest);
+            writer.bool(expect_cookie.is_some());
+            if let Some(cookie) = expect_cookie {
+                writer.bytes(cookie);
+            }
+            writer.bool(mtime_ns.is_some());
+            if let Some(mtime) = mtime_ns {
+                writer.i64(*mtime);
+            }
+        }
+        V3Message::StageResult {
+            related_id,
+            outcome,
+            attrs,
+        } => {
+            writer.u64(*related_id);
+            writer.u8(*outcome as u8);
+            encode_attrs(&mut writer, attrs)?;
+        }
+        V3Message::StageAbort { stage_id } => writer.u64(*stage_id),
+        V3Message::WriteCas {
+            handle,
+            offset,
+            expect_cookie,
+            digest,
+            data,
+        } => {
+            writer.u64(*handle);
+            writer.u64(*offset);
+            writer.bytes(expect_cookie);
+            writer.bool(digest.is_some());
+            if let Some(digest) = digest {
+                writer.bytes(digest);
+            }
+            writer.blob(data, MAX_DATA, "write data")?;
+        }
         V3Message::Rename {
             source,
             destination,
@@ -1760,6 +2064,111 @@ pub fn decode(message_type: u8, payload: &[u8]) -> Result<V3Message, V3CodecErro
             normalization: Normalization::decode(reader.u8()?)?,
             read_only: reader.bool()?,
         },
+        types::STAGE_OPEN => {
+            let destination = reader.blob(MAX_PATH, "destination")?;
+            let size = reader.u64()?;
+            let digest = reader.bool()?.then(|| reader.array32()).transpose()?;
+            V3Message::StageOpen {
+                destination,
+                size,
+                digest,
+                mode: reader.u32()?,
+                resume_token: reader.blob(MAX_NAME, "resume token")?,
+            }
+        }
+        types::STAGE_OPENED => V3Message::StageOpened {
+            related_id: reader.u64()?,
+            stage_id: reader.u64()?,
+            resume_token: reader.blob(MAX_NAME, "resume token")?,
+            staged_bytes: reader.u64()?,
+        },
+        types::STAGE_WRITE => {
+            let stage_id = reader.u64()?;
+            let offset = reader.u64()?;
+            let digest = reader.bool()?.then(|| reader.array32()).transpose()?;
+            V3Message::StageWrite {
+                stage_id,
+                offset,
+                digest,
+                data: reader.blob(MAX_DATA, "stage data")?,
+            }
+        }
+        types::STAGE_ACK => V3Message::StageAck {
+            related_id: reader.u64()?,
+            bytes_written: reader.u32()?,
+            staged_bytes: reader.u64()?,
+        },
+        types::STAGE_STATUS => V3Message::StageStatus {
+            stage_id: reader.u64()?,
+            cursor: reader.u64()?,
+        },
+        types::STAGE_RANGES => {
+            let related_id = reader.u64()?;
+            let cursor = reader.u64()?;
+            let final_page = reader.bool()?;
+            let count = reader.u32()? as usize;
+            if count > MAX_COLLECTION {
+                return Err(V3CodecError::Bound {
+                    field: "stage ranges",
+                    value: count,
+                });
+            }
+            let mut ranges = Vec::with_capacity(count);
+            let mut previous_end = 0_u64;
+            for _ in 0..count {
+                let start = reader.u64()?;
+                let end = reader.u64()?;
+                // Ascending, disjoint and non-empty. A range set that overlaps
+                // or runs backwards describes no file, and accepting one would
+                // let a peer make a resuming client skip bytes it never sent.
+                if end <= start || start < previous_end {
+                    return Err(V3CodecError::Inconsistent(
+                        "stage ranges must be ascending, disjoint and non-empty",
+                    ));
+                }
+                previous_end = end;
+                ranges.push((start, end));
+            }
+            V3Message::StageRanges {
+                related_id,
+                cursor,
+                final_page,
+                ranges,
+            }
+        }
+        types::STAGE_COMMIT => {
+            let stage_id = reader.u64()?;
+            let digest = reader.array32()?;
+            let expect_cookie = reader.bool()?.then(|| reader.array16()).transpose()?;
+            let mtime_ns = reader.bool()?.then(|| reader.i64()).transpose()?;
+            V3Message::StageCommit {
+                stage_id,
+                digest,
+                expect_cookie,
+                mtime_ns,
+            }
+        }
+        types::STAGE_RESULT => V3Message::StageResult {
+            related_id: reader.u64()?,
+            outcome: CommitOutcome::decode(reader.u8()?)?,
+            attrs: decode_attrs(&mut reader)?,
+        },
+        types::STAGE_ABORT => V3Message::StageAbort {
+            stage_id: reader.u64()?,
+        },
+        types::WRITE_CAS => {
+            let handle = reader.u64()?;
+            let offset = reader.u64()?;
+            let expect_cookie = reader.array16()?;
+            let digest = reader.bool()?.then(|| reader.array32()).transpose()?;
+            V3Message::WriteCas {
+                handle,
+                offset,
+                expect_cookie,
+                digest,
+                data: reader.blob(MAX_DATA, "write data")?,
+            }
+        }
         types::RENAME => V3Message::Rename {
             source: reader.blob(MAX_PATH, "source")?,
             destination: reader.blob(MAX_PATH, "destination")?,
@@ -2394,6 +2803,59 @@ mod tests {
                 normalization: Normalization::Nfc,
                 read_only: false,
             },
+            V3Message::StageOpen {
+                destination: b"big.mkv".to_vec(),
+                size: 1 << 30,
+                digest: Some([0x5a; 32]),
+                mode: 0o644,
+                resume_token: Vec::new(),
+            },
+            V3Message::StageOpened {
+                related_id: 20,
+                stage_id: 3,
+                resume_token: b"tok".to_vec(),
+                staged_bytes: 4096,
+            },
+            V3Message::StageWrite {
+                stage_id: 3,
+                offset: 4096,
+                digest: None,
+                data: b"chunk".to_vec(),
+            },
+            V3Message::StageAck {
+                related_id: 21,
+                bytes_written: 5,
+                staged_bytes: 4101,
+            },
+            V3Message::StageStatus {
+                stage_id: 3,
+                cursor: 0,
+            },
+            V3Message::StageRanges {
+                related_id: 22,
+                cursor: 0,
+                final_page: true,
+                ranges: vec![(0, 4096), (8192, 12288)],
+            },
+            V3Message::StageCommit {
+                stage_id: 3,
+                digest: [0x5a; 32],
+                expect_cookie: Some([0x11; 16]),
+                mtime_ns: Some(-1),
+            },
+            V3Message::StageResult {
+                related_id: 23,
+                outcome: CommitOutcome::Changed,
+                attrs: full_attrs(),
+            },
+            V3Message::StageAbort { stage_id: 3 },
+            V3Message::WriteCas {
+                handle: 10,
+                offset: 0,
+                expect_cookie: [0x22; 16],
+                digest: Some([0x33; 32]),
+                data: b"edit".to_vec(),
+            },
             V3Message::Rename {
                 source: b"a.txt".to_vec(),
                 destination: b"b.txt".to_vec(),
@@ -2478,6 +2940,46 @@ mod tests {
         ] {
             assert!(covered.contains(&value), "{name} is not round-tripped");
         }
+    }
+
+    #[test]
+    fn stage_ranges_must_be_ascending_and_disjoint() {
+        // A range set that overlaps or runs backwards describes no file, and
+        // accepting one would let a peer make a resuming client skip bytes it
+        // never sent.
+        for ranges in [
+            vec![(0_u64, 10_u64), (5, 20)], // overlapping
+            vec![(10_u64, 20_u64), (0, 5)], // descending
+            vec![(10_u64, 10_u64)],         // empty
+            vec![(20_u64, 10_u64)],         // inverted
+        ] {
+            let payload = encode(&V3Message::StageRanges {
+                related_id: 1,
+                cursor: 0,
+                final_page: true,
+                ranges: ranges.clone(),
+            })
+            .unwrap();
+            assert!(
+                decode(types::STAGE_RANGES, &payload).is_err(),
+                "accepted {ranges:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_commit_outcome_cannot_be_defaulted_into_success() {
+        // The refusal is carried in the reply, not as an Error, so the client
+        // gets the destination's current attributes. An unknown value must be
+        // refused rather than read as `Committed`.
+        let mut payload = encode(&V3Message::StageResult {
+            related_id: 1,
+            outcome: CommitOutcome::Committed,
+            attrs: full_attrs(),
+        })
+        .unwrap();
+        payload[8] = 7;
+        assert!(decode(types::STAGE_RESULT, &payload).is_err());
     }
 
     #[test]

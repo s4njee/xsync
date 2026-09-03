@@ -753,18 +753,33 @@ fn commit_temp(temp_path: &Path, final_path: &Path) -> Result<(), SinkError> {
     }
 }
 
+/// Publish the staged file, replacing whatever is there.
+///
+/// Was `BUGS.md` P1: this used to `remove_existing` unconditionally and *then*
+/// rename, so a crash between the two left no destination at all. The fix is to
+/// delete the removal, not to add anything — `std::fs::rename` on Windows is
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, which already replaces an
+/// existing *file* in one atomic step. It refuses only when the destination is
+/// a directory, so that case is handled on the failure path exactly as the Unix
+/// implementation above handles it, and the destination is never absent.
 #[cfg(windows)]
 fn commit_temp(temp_path: &Path, final_path: &Path) -> Result<(), SinkError> {
-    if let Ok(metadata) = fs::symlink_metadata(final_path) {
-        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+    match fs::rename(temp_path, final_path) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            // A directory in the way is the one thing the atomic replace will
+            // not do. Removing it is a visible window, but the alternative is
+            // refusing to replace a directory with a file at all.
+            let replaced_directory = fs::symlink_metadata(final_path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+            if !replaced_directory {
+                return Err(io_error("commit verified temp file", final_path, first));
+            }
             remove_existing(final_path)?;
+            fs::rename(temp_path, final_path)
+                .map_err(|source| io_error("commit verified temp file", final_path, source))
         }
     }
-
-    remove_existing(final_path)?;
-
-    fs::rename(temp_path, final_path)
-        .map_err(|source| io_error("commit verified temp file", final_path, source))
 }
 
 fn remove_existing(path: &Path) -> Result<(), SinkError> {

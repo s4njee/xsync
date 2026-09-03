@@ -55,7 +55,15 @@ pulls still need a sender-provided complete digest and a comparison before
 publication; per-range digests now protect each received segment, but cannot
 prove the complete file's ordering and contents alone.
 
-### P1 — Windows publication is not crash-atomic
+### P1 — Windows publication is not crash-atomic — **fixed 2026-09-03** (`xsyncv3.md` E4-S6)
+
+`std::fs::rename` on Windows is `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`,
+which already replaces an existing file atomically. The unconditional
+`remove_existing` was the whole bug; deleting it is the whole fix. A destination
+that is a *directory* is still handled, on the failure path, the way the Unix
+implementation handles it.
+
+Original report:
 
 The Windows `commit_temp` implementation removes the existing destination
 before renaming the staged file. A crash or rename failure can leave no

@@ -159,6 +159,50 @@ VALID: list[tuple[str, str, int, bytes, str]] = [
         'related_id=8, block_size=4096, total_bytes=1000, free_bytes=500, available_bytes=400, total_inodes=10, '
         'free_inodes=5, fs_type="apfs", max_name_len=255, case_sensitive=false, normalization=nfc, read_only=false',
     ),
+    # E4-S6 staging and E4-S7 compare-and-swap (types 70-79).
+    ("stage-open-fresh", "request", 70, blob(b"big.mkv") + u64(1 << 30) + boolean(False) + u32(0o644) + blob(b""), "destination=[6269672e6d6b76], size=1073741824, digest_present=false, mode=420, resume_token=[] (start a new stage)"),
+    ("stage-open-resume", "request", 70, blob(b"big.mkv") + u64(1 << 30) + boolean(True) + bytes([0x5A]) * 32 + u32(0o644) + blob(b"tok"), "destination=[6269672e6d6b76], size=1073741824, digest_present=true, digest=[5a;32], mode=420, resume_token=[746f6b]"),
+    ("stage-opened", "response", 71, u64(20) + u64(3) + blob(b"tok") + u64(4096), "related_id=20, stage_id=3, resume_token=[746f6b], staged_bytes=4096"),
+    ("stage-write", "request", 72, u64(3) + u64(4096) + boolean(False) + blob(b"chunk"), 'stage_id=3, offset=4096, digest_present=false, data="chunk"'),
+    ("stage-ack", "response", 73, u64(21) + u32(5) + u64(4101), "related_id=21, bytes_written=5, staged_bytes=4101"),
+    ("stage-status", "request", 74, u64(3) + u64(0), "stage_id=3, cursor=0"),
+    (
+        "stage-ranges-two",
+        "response",
+        75,
+        u64(22) + u64(0) + boolean(True) + u32(2) + u64(0) + u64(4096) + u64(8192) + u64(12288),
+        "related_id=22, cursor=0, final=true, count=2, ranges=[0,4096) [8192,12288) — ascending and disjoint, which the decoder enforces",
+    ),
+    (
+        "stage-commit-cas",
+        "request",
+        76,
+        u64(3) + bytes([0x5A]) * 32 + boolean(True) + bytes([0x11]) * 16 + boolean(True) + i64(-1),
+        "stage_id=3, digest=[5a;32], expect_cookie_present=true, expect_cookie=[11;16], mtime_present=true, mtime_ns=-1",
+    ),
+    (
+        "stage-commit-create-only",
+        "request",
+        76,
+        u64(3) + bytes([0x5A]) * 32 + boolean(True) + bytes([0x00]) * 16 + boolean(False),
+        "stage_id=3, digest=[5a;32], expect_cookie=[00;16] (all zeroes means create and only create), mtime absent",
+    ),
+    (
+        "stage-result-changed",
+        "response",
+        77,
+        u64(23) + u8(1) + attrs(1, 0o644, 12, 5, COOKIE(0x66)),
+        "related_id=23, outcome=1 (CHANGED — the guard refused; attrs describe the destination as it now stands), "
+        "attrs(presence=0, kind=1, mode=420, size=12, mtime_ns=5, cookie=[66;16])",
+    ),
+    ("stage-abort", "request", 78, u64(3), "stage_id=3"),
+    (
+        "write-cas",
+        "request",
+        79,
+        u64(10) + u64(0) + bytes([0x22]) * 16 + boolean(True) + bytes([0x33]) * 32 + blob(b"edit"),
+        'handle=10, offset=0, expect_cookie=[22;16], digest_present=true, digest=[33;32], data="edit"',
+    ),
     # E5-S4 mutations (types 86-95).
     ("rename-noreplace", "request", 86, blob(b"a") + blob(b"b") + u8(0) + u32(0), "source=[61], destination=[62], mode=0 (NOREPLACE), attr_mask=0"),
     ("rename-exchange", "request", 86, blob(b"a") + blob(b"b") + u8(2) + u32(0x201), "source=[61], destination=[62], mode=2 (EXCHANGE), attr_mask=0x201 (OWNER|NAMES)"),
@@ -225,6 +269,10 @@ MALFORMED: list[tuple[str, int, bytes, str]] = [
     ("truncated-attrs", 57, u64(3) + u64(10) + u32(0) + u8(1), "truncated attrs"),
     ("stat-handle-with-path", 80, u8(1) + blob(b"a") + u64(10) + boolean(False) + u32(0), "stat target inconsistent"),
     ("readdir-zero-entries", 82, u64(11) + u64(0) + u32(0) + u32(0), "page size out of range"),
+    ("stage-ranges-overlapping", 75, u64(1) + u64(0) + boolean(True) + u32(2) + u64(0) + u64(10) + u64(5) + u64(20), "stage ranges out of order"),
+    ("stage-ranges-descending", 75, u64(1) + u64(0) + boolean(True) + u32(2) + u64(10) + u64(20) + u64(0) + u64(5), "stage ranges out of order"),
+    ("stage-ranges-empty-range", 75, u64(1) + u64(0) + boolean(True) + u32(1) + u64(10) + u64(10), "stage ranges out of order"),
+    ("stage-result-unknown-outcome", 77, u64(1) + u8(7) + attrs(1, 0, 0, 0, COOKIE(0)), "invalid commit outcome"),
     ("rename-unknown-mode", 86, blob(b"a") + blob(b"b") + u8(3) + u32(0), "invalid rename mode"),
     (
         "set-times-unknown-tag",

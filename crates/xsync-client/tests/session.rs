@@ -423,3 +423,285 @@ async fn a_read_only_export_refuses_every_mutation() {
     assert!(root.path().join("file").exists());
     assert!(!root.path().join("new").exists());
 }
+
+#[tokio::test]
+async fn a_staged_upload_publishes_atomically_and_verified() {
+    let root = tempdir().unwrap();
+    std::fs::write(root.path().join("target.bin"), b"old contents").unwrap();
+    let address = serve(root.path().to_path_buf(), false);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+
+    // A repeating byte pattern, so a range written at the wrong offset shows up
+    // as wrong content rather than as a plausible-looking file.
+    let payload: Vec<u8> = (0..40_000_u32)
+        .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
+        .collect();
+    let mut stage = mount
+        .stage(b"target.bin", payload.len() as u64, 0o644, b"")
+        .await
+        .expect("stage");
+    assert_eq!(stage.staged_bytes(), 0);
+
+    // Out of order and overlapping, which is what a resuming client does.
+    stage.write(20_000, &payload[20_000..]).await.expect("tail");
+    stage.write(0, &payload[..25_000]).await.expect("head");
+
+    // The destination is untouched until the commit: that is the whole point
+    // of staging, and a reader mid-upload must not see a half-written file.
+    assert_eq!(
+        std::fs::read(root.path().join("target.bin")).unwrap(),
+        b"old contents"
+    );
+
+    let ranges = stage.ranges().await.expect("ranges");
+    assert_eq!(ranges, vec![(0, payload.len() as u64)], "gaps: {ranges:?}");
+
+    let published = stage
+        .commit(*blake3::hash(&payload).as_bytes(), None, None)
+        .await
+        .expect("commit")
+        .expect("published");
+    assert_eq!(published.size, payload.len() as u64);
+    assert_eq!(
+        std::fs::read(root.path().join("target.bin")).unwrap(),
+        payload
+    );
+}
+
+#[tokio::test]
+async fn a_stage_with_a_hole_is_refused_rather_than_published() {
+    let root = tempdir().unwrap();
+    let address = serve(root.path().to_path_buf(), false);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+
+    let mut stage = mount
+        .stage(b"gappy.bin", 100, 0o644, b"")
+        .await
+        .expect("stage");
+    // Byte 0..10 and 50..60: the middle was never sent. Publishing would give
+    // a file of zeroes where the client believes its data is.
+    stage.write(0, &[1_u8; 10]).await.expect("head");
+    stage.write(50, &[2_u8; 10]).await.expect("tail");
+    assert_eq!(
+        stage.ranges().await.expect("ranges"),
+        vec![(0, 10), (50, 60)]
+    );
+
+    let refused = stage.commit([0_u8; 32], None, None).await;
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Server {
+                code: ErrorCode::Invalid,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert!(!root.path().join("gappy.bin").exists());
+}
+
+#[tokio::test]
+async fn a_stage_that_fails_its_digest_publishes_nothing() {
+    let root = tempdir().unwrap();
+    let address = serve(root.path().to_path_buf(), false);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+
+    let mut stage = mount
+        .stage(b"wrong.bin", 4, 0o644, b"")
+        .await
+        .expect("stage");
+    stage.write(0, b"data").await.expect("write");
+    let refused = stage.commit([0xAB_u8; 32], None, None).await;
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Server {
+                code: ErrorCode::Integrity,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    assert!(!root.path().join("wrong.bin").exists());
+}
+
+#[tokio::test]
+async fn a_stage_resumes_on_a_brand_new_connection() {
+    // The property E4-S6 exists for, and the reason the range set lives in a
+    // sidecar rather than in session state: this is a *different session*
+    // against a *different server object*, with no session resume involved.
+    let root = tempdir().unwrap();
+    let payload: Vec<u8> = (0..30_000_u32)
+        .map(|byte| u8::try_from(byte % 251).unwrap_or(0))
+        .collect();
+
+    let token = {
+        let address = serve(root.path().to_path_buf(), false);
+        let client = connect(&address).await;
+        let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+        let mut stage = mount
+            .stage(b"resumed.bin", payload.len() as u64, 0o644, b"")
+            .await
+            .expect("stage");
+        stage
+            .write(0, &payload[..10_000])
+            .await
+            .expect("first half");
+        stage.resume_token().to_vec()
+        // The connection drops here.
+    };
+
+    let address = serve(root.path().to_path_buf(), false);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+    let mut stage = mount
+        .stage(b"resumed.bin", payload.len() as u64, 0o644, &token)
+        .await
+        .expect("resume");
+
+    // It knows what it already has, so the client sends only the rest.
+    assert_eq!(stage.staged_bytes(), 10_000);
+    assert_eq!(stage.ranges().await.expect("ranges"), vec![(0, 10_000)]);
+
+    stage.write(10_000, &payload[10_000..]).await.expect("rest");
+    let published = stage
+        .commit(*blake3::hash(&payload).as_bytes(), None, None)
+        .await
+        .expect("commit")
+        .expect("published");
+    assert_eq!(published.size, payload.len() as u64);
+    assert_eq!(
+        std::fs::read(root.path().join("resumed.bin")).unwrap(),
+        payload
+    );
+}
+
+#[tokio::test]
+async fn compare_and_swap_refuses_a_destination_that_moved() {
+    let root = tempdir().unwrap();
+    std::fs::write(root.path().join("doc.txt"), b"original").unwrap();
+    let address = serve(root.path().to_path_buf(), false);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+
+    // What an editor would have: the cookie as of when it read the file.
+    let opened = mount.open(b"doc.txt", READ).await.expect("open");
+    let cookie = opened.attrs().change_cookie;
+    opened.close().await.expect("close");
+
+    // Somebody else edits it. Sleep so the mtime actually differs — the cookie
+    // hashes mtime, and a same-second write on a coarse clock would not move it.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(root.path().join("doc.txt"), b"someone else's edit").unwrap();
+
+    let mut stage = mount.stage(b"doc.txt", 8, 0o644, b"").await.expect("stage");
+    stage.write(0, b"my edits").await.expect("write");
+    let outcome = stage
+        .commit(*blake3::hash(b"my edits").as_bytes(), Some(cookie), None)
+        .await
+        .expect("commit resolves");
+
+    // A refusal is an answer, not an error, and it carries the destination as
+    // it now stands so the caller can offer replace / keep both / diff.
+    let current = outcome.expect_err("the guard should have refused");
+    assert_ne!(current.change_cookie, cookie);
+    assert_eq!(
+        std::fs::read(root.path().join("doc.txt")).unwrap(),
+        b"someone else's edit",
+        "the CAS refusal must not have published"
+    );
+}
+
+#[tokio::test]
+async fn an_all_zero_cookie_means_create_and_only_create() {
+    // The case v2's PublishRequest could not express: it answered Changed for
+    // a destination that did not exist, so there was no create-only mode.
+    let root = tempdir().unwrap();
+    let address = serve(root.path().to_path_buf(), false);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+
+    let mut stage = mount.stage(b"new.txt", 5, 0o644, b"").await.expect("stage");
+    stage.write(0, b"fresh").await.expect("write");
+    stage
+        .commit(*blake3::hash(b"fresh").as_bytes(), Some([0_u8; 16]), None)
+        .await
+        .expect("commit")
+        .expect("created");
+    assert_eq!(
+        std::fs::read(root.path().join("new.txt")).unwrap(),
+        b"fresh"
+    );
+
+    // Now it exists, so the same create-only commit must refuse.
+    let mut second = mount.stage(b"new.txt", 6, 0o644, b"").await.expect("stage");
+    second.write(0, b"second").await.expect("write");
+    let refused = second
+        .commit(*blake3::hash(b"second").as_bytes(), Some([0_u8; 16]), None)
+        .await
+        .expect("commit resolves");
+    assert!(refused.is_err(), "create-only overwrote an existing file");
+    assert_eq!(
+        std::fs::read(root.path().join("new.txt")).unwrap(),
+        b"fresh"
+    );
+}
+
+#[tokio::test]
+async fn a_guarded_write_refuses_a_file_that_changed() {
+    let root = tempdir().unwrap();
+    std::fs::write(root.path().join("small.txt"), b"aaaa").unwrap();
+    let address = serve(root.path().to_path_buf(), false);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+
+    let file = mount.open(b"small.txt", READ | WRITE).await.expect("open");
+    let cookie = file.attrs().change_cookie;
+
+    // A guarded write with the right cookie goes through...
+    let written = file
+        .write_if_unchanged(0, cookie, b"bbbb")
+        .await
+        .expect("guarded write");
+    assert_eq!(written.bytes, 4);
+
+    // ...and the same cookie is now stale, so a second one is refused.
+    let refused = file.write_if_unchanged(0, cookie, b"cccc").await;
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Server {
+                code: ErrorCode::Changed,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    file.close().await.expect("close");
+    assert_eq!(
+        std::fs::read(root.path().join("small.txt")).unwrap(),
+        b"bbbb"
+    );
+}
+
+#[tokio::test]
+async fn staging_is_refused_on_a_read_only_export() {
+    let root = tempdir().unwrap();
+    let address = serve(root.path().to_path_buf(), true);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+
+    let refused = mount.stage(b"nope.bin", 4, 0o644, b"").await;
+    assert!(read_only(&refused));
+    // And nothing was staged: no temporary file was created.
+    let leftovers: Vec<_> = std::fs::read_dir(root.path())
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".xsync."))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+}

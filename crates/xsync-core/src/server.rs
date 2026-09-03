@@ -1593,6 +1593,12 @@ struct FsSessionState {
     /// see room at once and overshoot the cap by the width of the pool.
     reserved_handles: AtomicU64,
     max_handles: u64,
+    /// Staged uploads in progress (`xsyncv3.md` E4-S6).
+    stages: RwLock<HashMap<u64, Arc<Stage>>>,
+    /// Never reused within a session, and never `0`.
+    next_stage: AtomicU64,
+    /// How long an abandoned stage survives before it is swept.
+    stage_retention: Duration,
 }
 
 /// A reserved handle slot, released on drop unless the open committed.
@@ -1718,6 +1724,43 @@ impl FsHandler for ServerFsHandler {
                 follow,
                 attr_mask,
             } => stat_target(state, related_id, &target, follow, attr_mask),
+            V3Message::StageOpen {
+                destination,
+                mode,
+                resume_token,
+                ..
+            } => stage_open(state, related_id, &destination, mode, &resume_token),
+            V3Message::StageWrite {
+                stage_id,
+                offset,
+                digest,
+                data,
+            } => stage_write(state, related_id, stage_id, offset, digest, &data),
+            V3Message::StageStatus { stage_id, cursor } => {
+                stage_status(state, related_id, stage_id, cursor)
+            }
+            V3Message::StageCommit {
+                stage_id,
+                digest,
+                expect_cookie,
+                mtime_ns,
+            } => stage_commit(state, related_id, stage_id, digest, expect_cookie, mtime_ns),
+            V3Message::StageAbort { stage_id } => stage_abort(state, related_id, stage_id),
+            V3Message::WriteCas {
+                handle,
+                offset,
+                expect_cookie,
+                digest,
+                data,
+            } => write_cas(
+                state,
+                related_id,
+                handle,
+                offset,
+                expect_cookie,
+                digest,
+                &data,
+            ),
             V3Message::Rename {
                 source,
                 destination,
@@ -2684,6 +2727,15 @@ fn fs_is_write_class(request: &V3Message) -> bool {
         // exists to prevent — so the list is exhaustive rather than a
         // wildcard, and adding a message to the enum forces a decision here.
         V3Message::Write { .. }
+        // Every staging verb that touches the filesystem. `StageAbort` is here
+        // too: it removes a temporary file, and on a read-only mount there is
+        // no stage to abort, so gating it costs nothing and keeps the rule
+        // "no write-class request reaches the filesystem" literally true.
+        | V3Message::StageOpen { .. }
+        | V3Message::StageWrite { .. }
+        | V3Message::StageCommit { .. }
+        | V3Message::StageAbort { .. }
+        | V3Message::WriteCas { .. }
         | V3Message::Rename { .. }
         | V3Message::Unlink { .. }
         | V3Message::Rmdir { .. }
@@ -2712,6 +2764,12 @@ fn fs_is_write_class(request: &V3Message) -> bool {
         | V3Message::DirPage { .. }
         | V3Message::StatFs
         | V3Message::FsInfo { .. }
+        // Reading which ranges a stage holds writes nothing.
+        | V3Message::StageStatus { .. }
+        | V3Message::StageOpened { .. }
+        | V3Message::StageAck { .. }
+        | V3Message::StageRanges { .. }
+        | V3Message::StageResult { .. }
         | V3Message::Mutated { .. }
         | V3Message::Error { .. }
         | V3Message::Done { .. } => false,
@@ -2810,6 +2868,568 @@ fn fs_pump_handle(domains: &mut HashMap<u64, HandleDomain>, handle: u64) -> Vec<
         domains.remove(&handle);
     }
     ready
+}
+
+/// A staged upload: a temporary file, and a record of what is in it.
+///
+/// The record is a **sidecar next to the temporary file**, not session state.
+/// That is the whole point of E4-S6: a stage has to outlive the connection that
+/// created it, and it must survive the server process restarting. Session
+/// resume (E3-S2) is a different mechanism for a different problem, and this
+/// deliberately does not wait for it — a client reconnects on a brand-new
+/// session, hands back the token, and continues.
+#[derive(Debug)]
+struct Stage {
+    /// Destination, as the wire names it.
+    destination: Vec<u8>,
+    /// Where the bytes are accumulating.
+    temporary: PathBuf,
+    /// Where the range set is recorded.
+    sidecar: PathBuf,
+    /// Permission bits to publish with.
+    mode: u32,
+    /// Opaque identity the client hands back to resume.
+    token: [u8; 16],
+    /// Half-open `[start, end)` ranges already written, ascending and disjoint.
+    ranges: Mutex<Vec<(u64, u64)>>,
+}
+
+/// The sidecar's magic and version. A file that does not start with these is
+/// not ours and is left alone rather than parsed or deleted.
+const STAGE_MAGIC: &[u8; 4] = b"XSSG";
+const STAGE_VERSION: u8 = 1;
+
+impl Stage {
+    /// Merge a written range into the set, then persist it.
+    ///
+    /// Persisted on every write rather than at intervals: the set is what a
+    /// resuming client is told, and a set that claims bytes the file does not
+    /// hold is worse than no resume at all — it would skip them silently.
+    fn record(&self, start: u64, end: u64) -> io::Result<u64> {
+        let mut ranges = self
+            .ranges
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        insert_range(&mut ranges, start, end);
+        let staged = ranges.iter().map(|(start, end)| end - start).sum();
+        write_sidecar(
+            &self.sidecar,
+            &self.token,
+            self.mode,
+            &self.destination,
+            &ranges,
+        )?;
+        Ok(staged)
+    }
+
+    fn staged_bytes(&self) -> u64 {
+        self.ranges
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|(start, end)| end - start)
+            .sum()
+    }
+
+    fn snapshot(&self) -> Vec<(u64, u64)> {
+        self.ranges
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Whether the ranges cover `[0, size)` with no gap.
+    fn covers(&self, size: u64) -> bool {
+        let ranges = self
+            .ranges
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match ranges.first() {
+            None => size == 0,
+            Some((start, _)) if *start != 0 => false,
+            Some(_) => ranges.len() == 1 && ranges[0].1 >= size,
+        }
+    }
+}
+
+/// Insert `[start, end)` into an ascending, disjoint set, coalescing overlaps.
+///
+/// Coalescing rather than rejecting an overlap: a client re-sending a range
+/// after a drop is the normal case, not an error, and the bytes it re-sends are
+/// the same bytes.
+fn insert_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    if end <= start {
+        return;
+    }
+    let mut merged = (start, end);
+    ranges.retain(|&(existing_start, existing_end)| {
+        // Touching counts as overlapping, so `[0,4)` and `[4,8)` become `[0,8)`
+        // and a sequential upload ends with one range rather than thousands.
+        if existing_start > merged.1 || existing_end < merged.0 {
+            return true;
+        }
+        merged.0 = merged.0.min(existing_start);
+        merged.1 = merged.1.max(existing_end);
+        false
+    });
+    let at = ranges.partition_point(|&(existing_start, _)| existing_start < merged.0);
+    ranges.insert(at, merged);
+}
+
+/// Write the sidecar atomically: a half-written one would claim bytes.
+fn write_sidecar(
+    path: &Path,
+    token: &[u8; 16],
+    mode: u32,
+    destination: &[u8],
+    ranges: &[(u64, u64)],
+) -> io::Result<()> {
+    let mut bytes = Vec::with_capacity(64 + ranges.len() * 16);
+    bytes.extend_from_slice(STAGE_MAGIC);
+    bytes.push(STAGE_VERSION);
+    bytes.extend_from_slice(token);
+    bytes.extend_from_slice(&mode.to_le_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(destination.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(destination);
+    bytes.extend_from_slice(
+        &u32::try_from(ranges.len())
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
+    for (start, end) in ranges {
+        bytes.extend_from_slice(&start.to_le_bytes());
+        bytes.extend_from_slice(&end.to_le_bytes());
+    }
+    let temporary = path.with_extension("writing");
+    fs::write(&temporary, &bytes)?;
+    fs::rename(&temporary, path)
+}
+
+/// What a sidecar records about a stage.
+#[derive(Debug)]
+struct StageRecord {
+    token: [u8; 16],
+    destination: Vec<u8>,
+    ranges: Vec<(u64, u64)>,
+}
+
+/// Read a sidecar, or `None` if it is absent, foreign or unreadable.
+///
+/// Unreadable is treated as absent rather than as an error: the worst outcome
+/// is that a client re-uploads bytes it had already sent, and the alternative
+/// is a corrupt file blocking a destination forever.
+fn read_sidecar(path: &Path) -> Option<StageRecord> {
+    let bytes = fs::read(path).ok()?;
+    let mut at = 0_usize;
+    let mut take = |count: usize| -> Option<&[u8]> {
+        let end = at.checked_add(count)?;
+        let slice = bytes.get(at..end)?;
+        at = end;
+        Some(slice)
+    };
+    if take(4)? != STAGE_MAGIC || take(1)?[0] != STAGE_VERSION {
+        return None;
+    }
+    let token: [u8; 16] = take(16)?.try_into().ok()?;
+    // The mode is rewritten by whoever reopens the stage, so it is read past
+    // rather than returned.
+    let _mode = u32::from_le_bytes(take(4)?.try_into().ok()?);
+    let destination_len = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    let destination = take(destination_len)?.to_vec();
+    let count = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    let mut ranges = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let start = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        let end = u64::from_le_bytes(take(8)?.try_into().ok()?);
+        ranges.push((start, end));
+    }
+    Some(StageRecord {
+        token,
+        destination,
+        ranges,
+    })
+}
+
+/// Begin or resume a staged upload.
+fn stage_open(
+    state: &FsSessionState,
+    related_id: u64,
+    destination: &[u8],
+    mode: u32,
+    resume_token: &[u8],
+) -> V3Message {
+    let sink = match Sink::new(&state.root) {
+        Ok(sink) => sink,
+        Err(error) => return fs_error(related_id, FsErrorCode::Io, &error.to_string()),
+    };
+    let wire = match WirePath::from_wire(destination.to_vec()) {
+        Ok(wire) => wire,
+        Err(error) => return fs_error(related_id, FsErrorCode::Invalid, &error.to_string()),
+    };
+    // The sink's own path check is the confinement here: it refuses absolute
+    // paths, traversal, and a symlinked ancestor, exactly as `browse_stat_path`
+    // does for the other verbs.
+    let temporary = match sink.temporary_path(wire) {
+        Ok(path) => path,
+        Err(error) => return fs_error(related_id, FsErrorCode::Access, &error.to_string()),
+    };
+    let sidecar = temporary.with_extension("stage");
+
+    sweep_stale_stages(temporary.parent(), state.stage_retention);
+
+    // An existing sidecar for this destination is a stage to continue, not a
+    // collision. A token that does not match it is a client resuming something
+    // that has since been replaced, and it starts over rather than writing into
+    // a file whose contents it cannot account for.
+    let existing = read_sidecar(&sidecar).filter(|record| {
+        record.destination == destination
+            && (resume_token.is_empty() || resume_token == record.token)
+    });
+    let (token, ranges) = match existing {
+        Some(record) if temporary.exists() => (record.token, record.ranges),
+        _ => {
+            let mut token = [0_u8; 16];
+            token.copy_from_slice(&blake3::hash(&random_stage_seed()).as_bytes()[..16]);
+            // A fresh stage starts from an empty file, so a leftover one cannot
+            // contribute bytes nobody sent.
+            if let Err(error) = fs::write(&temporary, b"") {
+                return fs_io_error(related_id, &error, "create stage");
+            }
+            (token, Vec::new())
+        }
+    };
+    if let Err(error) = write_sidecar(&sidecar, &token, mode, destination, &ranges) {
+        return fs_io_error(related_id, &error, "record stage");
+    }
+
+    let upload = Arc::new(Stage {
+        destination: destination.to_vec(),
+        temporary,
+        sidecar,
+        mode,
+        token,
+        ranges: Mutex::new(ranges),
+    });
+    let staged_bytes = upload.staged_bytes();
+    let stage_id = state.next_stage.fetch_add(1, Ordering::SeqCst);
+    state
+        .stages
+        .write()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(stage_id, upload);
+
+    V3Message::StageOpened {
+        related_id,
+        stage_id,
+        resume_token: token.to_vec(),
+        staged_bytes,
+    }
+}
+
+/// A seed for a stage token. Not a secret: a token only has to be unguessable
+/// enough that two stages in one directory do not collide.
+fn random_stage_seed() -> Vec<u8> {
+    /// Distinguishes two stages opened in the same nanosecond by one process,
+    /// which a clock alone does not.
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let mut seed = Vec::with_capacity(24);
+    seed.extend_from_slice(
+        &SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    seed.extend_from_slice(&u64::from(std::process::id()).to_le_bytes());
+    seed.extend_from_slice(&SEQUENCE.fetch_add(1, Ordering::Relaxed).to_le_bytes());
+    seed
+}
+
+/// Remove stages in one directory that nobody has touched for `retention`.
+///
+/// Runs when a stage is opened in that directory rather than on a timer: a
+/// server with no uploads should not be walking export directories, and a stale
+/// stage costs nothing until something else wants the space.
+fn sweep_stale_stages(directory: Option<&Path>, retention: Duration) {
+    let Some(directory) = directory else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(".xsync.tmp.") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| {
+                now.duration_since(modified)
+                    .is_ok_and(|age| age > retention)
+            });
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("stage"));
+    }
+}
+
+/// The stage a request names, or the error to answer with.
+fn stage_of(state: &FsSessionState, stage_id: u64) -> Option<Arc<Stage>> {
+    state
+        .stages
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&stage_id)
+        .map(Arc::clone)
+}
+
+fn stage_write(
+    state: &FsSessionState,
+    related_id: u64,
+    stage_id: u64,
+    offset: u64,
+    digest: Option<[u8; 32]>,
+    data: &[u8],
+) -> V3Message {
+    let Some(upload) = stage_of(state, stage_id) else {
+        return fs_error(related_id, FsErrorCode::BadHandle, "no such stage");
+    };
+    if data.is_empty() || data.len() > DEFAULT_FS_MAX_TRANSFER as usize {
+        return fs_error(related_id, FsErrorCode::Invalid, "stage write out of range");
+    }
+    // Verified before a byte lands, exactly as `Write` does: a corrupt payload
+    // must leave the stage as it was, not half-updated with a range recorded
+    // for bytes that are wrong.
+    if let Some(expected) = digest {
+        if *blake3::hash(data).as_bytes() != expected {
+            return fs_error(
+                related_id,
+                FsErrorCode::Integrity,
+                "stage payload does not match its digest; nothing was written",
+            );
+        }
+    }
+    let file = match fs::OpenOptions::new().write(true).open(&upload.temporary) {
+        Ok(file) => file,
+        Err(error) => return fs_io_error(related_id, &error, "open stage"),
+    };
+    #[cfg(unix)]
+    let written = {
+        use std::os::unix::fs::FileExt;
+        file.write_at(data, offset)
+    };
+    #[cfg(not(unix))]
+    let written = {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write(data))
+    };
+    let written = match written {
+        Ok(written) => written,
+        Err(error) => return fs_io_error(related_id, &error, "stage write"),
+    };
+    // The range recorded is what actually landed, not what was offered. A short
+    // write that recorded the full range would tell a resuming client it had
+    // bytes it never received.
+    let staged_bytes = match upload.record(offset, offset + written as u64) {
+        Ok(staged) => staged,
+        Err(error) => return fs_io_error(related_id, &error, "record stage range"),
+    };
+    V3Message::StageAck {
+        related_id,
+        bytes_written: u32::try_from(written).unwrap_or(u32::MAX),
+        staged_bytes,
+    }
+}
+
+fn stage_status(state: &FsSessionState, related_id: u64, stage_id: u64, cursor: u64) -> V3Message {
+    let Some(upload) = stage_of(state, stage_id) else {
+        return fs_error(related_id, FsErrorCode::BadHandle, "no such stage");
+    };
+    let all = upload.snapshot();
+    let start = usize::try_from(cursor).unwrap_or(usize::MAX).min(all.len());
+    let end = all
+        .len()
+        .min(start.saturating_add(MAX_STAGE_RANGES_PER_PAGE));
+    V3Message::StageRanges {
+        related_id,
+        cursor: end as u64,
+        final_page: end == all.len(),
+        ranges: all[start..end].to_vec(),
+    }
+}
+
+/// Ranges in one `StageRanges`. Bounded so a fragmented stage pages rather than
+/// building a frame that will not fit.
+const MAX_STAGE_RANGES_PER_PAGE: usize = 4096;
+
+fn stage_abort(state: &FsSessionState, related_id: u64, stage_id: u64) -> V3Message {
+    let upload = state
+        .stages
+        .write()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&stage_id);
+    let Some(upload) = upload else {
+        return fs_error(related_id, FsErrorCode::BadHandle, "no such stage");
+    };
+    let _ = fs::remove_file(&upload.temporary);
+    let _ = fs::remove_file(&upload.sidecar);
+    V3Message::Done { related_id }
+}
+
+fn stage_commit(
+    state: &FsSessionState,
+    related_id: u64,
+    stage_id: u64,
+    digest: [u8; 32],
+    expect_cookie: Option<[u8; 16]>,
+    mtime_ns: Option<i64>,
+) -> V3Message {
+    let Some(upload) = stage_of(state, stage_id) else {
+        return fs_error(related_id, FsErrorCode::BadHandle, "no such stage");
+    };
+    let destination = match browse_stat_path(&state.root, &upload.destination) {
+        Ok(path) => path,
+        Err(error) => return fs_path_error(related_id, &error),
+    };
+
+    let staged = match fs::metadata(&upload.temporary) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => return fs_io_error(related_id, &error, "stat stage"),
+    };
+    // Coverage before content: a stage with a hole would hash whatever the
+    // filesystem put there — usually zeroes — and a zero-filled gap that
+    // happens to match no digest is a confusing failure, while one that does
+    // match is a corrupt publish.
+    if !upload.covers(staged) {
+        return fs_error(
+            related_id,
+            FsErrorCode::Invalid,
+            "stage has gaps; every byte must be written before it is committed",
+        );
+    }
+    let contents = match fs::read(&upload.temporary) {
+        Ok(contents) => contents,
+        Err(error) => return fs_io_error(related_id, &error, "read stage"),
+    };
+    if *blake3::hash(&contents).as_bytes() != digest {
+        return fs_error(
+            related_id,
+            FsErrorCode::Integrity,
+            "staged file does not match its digest; nothing was published",
+        );
+    }
+
+    // The compare-and-swap (E4-S7), checked here rather than at StageOpen. v2's
+    // `PublishRequest` learned this the hard way and re-checks after the upload
+    // too: a check taken before the bytes are transferred proves nothing about
+    // the moment of publication, which is the moment that matters.
+    if let Some(expected) = expect_cookie {
+        let current = fs::symlink_metadata(&destination).ok();
+        let matches = match &current {
+            // An all-zero cookie means "create, and only create" — the case v2
+            // could not express at all, because it answered `Changed` for a
+            // destination that did not exist.
+            None => expected == [0_u8; 16],
+            Some(metadata) => change_cookie(metadata) == expected,
+        };
+        if !matches {
+            let attrs = current.map_or_else(
+                || protocol_v3::Attrs::minimal(0, 0, 0, 0, [0_u8; 16]),
+                |metadata| attrs_from_metadata(&metadata, &destination, 0),
+            );
+            return V3Message::StageResult {
+                related_id,
+                outcome: protocol_v3::CommitOutcome::Changed,
+                attrs,
+            };
+        }
+    }
+
+    // Metadata before the rename, so the published file never appears with the
+    // wrong mode or time — the ordering `sink.rs` already uses.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) =
+            fs::set_permissions(&upload.temporary, fs::Permissions::from_mode(upload.mode))
+        {
+            return fs_io_error(related_id, &error, "set stage permissions");
+        }
+    }
+    if let Some(mtime) = mtime_ns {
+        let time = filetime::FileTime::from_unix_time(
+            mtime.div_euclid(1_000_000_000),
+            u32::try_from(mtime.rem_euclid(1_000_000_000)).unwrap_or(0),
+        );
+        if let Err(error) = filetime::set_file_mtime(&upload.temporary, time) {
+            return fs_io_error(related_id, &error, "set stage mtime");
+        }
+    }
+    if let Err(error) = fs::rename(&upload.temporary, &destination) {
+        return fs_io_error(related_id, &error, "publish stage");
+    }
+    let _ = fs::remove_file(&upload.sidecar);
+    state
+        .stages
+        .write()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&stage_id);
+
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata) => V3Message::StageResult {
+            related_id,
+            outcome: protocol_v3::CommitOutcome::Committed,
+            attrs: attrs_from_metadata(&metadata, &destination, 0),
+        },
+        Err(error) => fs_io_error(related_id, &error, "stat published file"),
+    }
+}
+
+/// Positional write guarded by the destination's change cookie (E4-S7).
+fn write_cas(
+    state: &FsSessionState,
+    related_id: u64,
+    handle: u64,
+    offset: u64,
+    expect_cookie: [u8; 16],
+    digest: Option<[u8; 32]>,
+    data: &[u8],
+) -> V3Message {
+    let Some(open) = state.handle(handle) else {
+        return fs_error(related_id, FsErrorCode::BadHandle, "no such handle");
+    };
+    let Some(file) = open.file.as_ref() else {
+        return fs_error(related_id, FsErrorCode::IsDirectory, "not a file handle");
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return fs_io_error(related_id, &error, "stat before compare-and-swap"),
+    };
+    if change_cookie(&metadata) != expect_cookie {
+        return fs_error(
+            related_id,
+            FsErrorCode::Changed,
+            "the file changed since it was read; nothing was written",
+        );
+    }
+    // The check and the write are not one operation — another handle can write
+    // between them. This closes the case it exists for, an editor saving over
+    // an edit made minutes ago, and is documented as not being a lock.
+    write_handle(state, related_id, handle, offset, digest, data)
 }
 
 /// The mutation handlers (`xsyncv3.md` E5-S4).
@@ -3219,6 +3839,7 @@ pub struct Server {
     capabilities: u32,
     fs_features: u64,
     fs_max_in_flight: usize,
+    fs_stage_retention: Duration,
     fs_workers: usize,
     fs_read_only: bool,
     fs_max_handles: usize,
@@ -3243,11 +3864,17 @@ impl Server {
                 | CAP_BROWSE_META
                 | CAP_FS_V3
                 | if cfg!(unix) { CAP_UNIX_MODES } else { 0 },
-            // Every optional v3 feature gates a later phase, so an honest
-            // server offers none of them yet. A client that asks for one gets
-            // it back cleared and must not send the messages it gates.
-            fs_features: 0,
+            // Staged resumable uploads are real as of `xsyncv3.md` E4-S6, so
+            // the bit that has always described them is now advertised.
+            // Advertised, not *required*: the bitmap exists so peers of
+            // different ages agree on what may be sent, and a client that does
+            // not know about staging simply never sends a `Stage*` message.
+            // Refusing the verbs unless they were negotiated would add a
+            // failure mode without adding a guarantee. Every other optional
+            // feature still gates a later phase and is honestly withheld.
+            fs_features: protocol_v3::features::STAGE_RESUME,
             fs_max_in_flight: DEFAULT_FS_MAX_IN_FLIGHT,
+            fs_stage_retention: DEFAULT_STAGE_RETENTION,
             fs_workers: DEFAULT_FS_WORKERS,
             fs_read_only: false,
             fs_max_handles: DEFAULT_FS_MAX_HANDLES,
@@ -3282,6 +3909,17 @@ impl Server {
         );
         self.fs_max_in_flight = max_in_flight;
         self.fs_workers = workers;
+        self
+    }
+
+    /// How long an abandoned stage survives before `StageOpen` sweeps it.
+    ///
+    /// The sweep runs when a stage is opened in that directory rather than on a
+    /// timer: a server with no uploads should not be walking export directories,
+    /// and a stale stage costs nothing until something else wants the space.
+    #[must_use]
+    pub const fn with_stage_retention(mut self, retention: Duration) -> Self {
+        self.fs_stage_retention = retention;
         self
     }
 
@@ -3528,6 +4166,9 @@ impl Server {
             next_handle: AtomicU64::new(1),
             reserved_handles: AtomicU64::new(0),
             max_handles: self.fs_max_handles as u64,
+            stages: RwLock::new(HashMap::new()),
+            next_stage: AtomicU64::new(1),
+            stage_retention: self.fs_stage_retention,
         });
         let (work, jobs) = crossbeam_channel::unbounded::<FsJob>();
         for _ in 0..self.fs_workers {
@@ -5948,6 +6589,13 @@ pub const MAX_PIPELINED_FRAMES: usize = 2048;
 /// E1-S5). Past it a request is refused with `ELIMIT`; it never stalls the
 /// session, because a stalled reader cannot service a keepalive or a cancel.
 pub const DEFAULT_FS_MAX_IN_FLIGHT: usize = 64;
+
+/// How long an abandoned stage survives before it is swept.
+///
+/// `xsyncv3.md` E4-S6's default. Long enough that a laptop closed for the night
+/// can resume in the morning, short enough that a forgotten upload does not
+/// hold its bytes forever.
+const DEFAULT_STAGE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Largest `Read.length` and `Write.data` a v3 session accepts, advertised in
 /// `MountInfo`. The envelope caps this at `MAX_DATA_SEGMENT` (8 MiB); 1 MiB is
@@ -11488,6 +12136,10 @@ mod tests {
             | V3Message::DirPage { related_id, .. }
             | V3Message::FsInfo { related_id, .. }
             | V3Message::Mutated { related_id, .. }
+            | V3Message::StageOpened { related_id, .. }
+            | V3Message::StageAck { related_id, .. }
+            | V3Message::StageRanges { related_id, .. }
+            | V3Message::StageResult { related_id, .. }
             | V3Message::FeaturesAck { related_id, .. } => Some(*related_id),
             // Listed rather than wildcarded: a response type added to the enum
             // and missed here is invisible to `await_reply`, which then blocks
@@ -11506,6 +12158,12 @@ mod tests {
             | V3Message::Stat { .. }
             | V3Message::ReadDir { .. }
             | V3Message::StatFs
+            | V3Message::StageOpen { .. }
+            | V3Message::StageWrite { .. }
+            | V3Message::StageStatus { .. }
+            | V3Message::StageCommit { .. }
+            | V3Message::StageAbort { .. }
+            | V3Message::WriteCas { .. }
             | V3Message::Rename { .. }
             | V3Message::Unlink { .. }
             | V3Message::Rmdir { .. }
