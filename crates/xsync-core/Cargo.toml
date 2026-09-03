@@ -28,6 +28,12 @@ fslock = "0.2"
 globset = "0.4"
 ignore = "0.4"
 libc = "0.2"
+# `renameat2`/`renamex_np` for Rename's NOREPLACE and EXCHANGE modes
+# (`xsyncv3.md` E5-S4). std::fs::rename is POSIX rename: it always replaces,
+# and the check-then-rename alternative is a race. rustix wraps both platforms'
+# calls safely, which is the first option in Decision 9's order; it was already
+# in the tree transitively, so this adds no new crate to audit.
+rustix = { version = "1", features = ["fs"] }
 md-5 = "0.10"
 redb = "2.6.3"
 serde_json = "1"

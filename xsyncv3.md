@@ -37,6 +37,7 @@ compatibility-matrix row and the f2/Kestrel consumer decision.
 | 1 | E5-S2 — Directory reading and cursors | **Done** 2026-09-03 |
 | 1 | E5-S3 — Capacity and filesystem facts | **Done** 2026-09-03 |
 | 1 | E9-S1 — `xsync-client` async crate (Phase 1 surface) | **Done** 2026-09-03 |
+| 3 | E5-S4 — Complete mutation set | **Done** 2026-09-03 |
 | 1 | E10-S1 / E10-S4 — Confinement tests and fuzzing | Next |
 | 1 | E4-S8, E5-S1b, E9-S4/S6 | Not started |
 | 2–6 | everything else | Not started |
@@ -1033,20 +1034,93 @@ Excalibur's list has no owner column, so nothing waits on it today.
 - **E8-S5** should measure `StatFs`; a status bar polling it must not cost a probe,
   which is why the facts are cached.
 
-#### X3-E5-S4 — Complete mutation set
+#### X3-E5-S4 — Complete mutation set — **Done**
+
+*2026-09-03. Types 86–95, frozen.*
+
 **AC**
-- `Rename(src, dst, flags)` with `flags ∈ {NOREPLACE (today's behaviour), REPLACE,
-  EXCHANGE}`; `REPLACE` is atomic on the same filesystem; `EXDEV` remains an error
-  (no server-side copy fallback — the client does copy+delete explicitly).
-- `Unlink(path)` removes exactly one non-directory; `Rmdir(path)` removes exactly one
+- [x] `Rename(src, dst, flags)` with `flags ∈ {NOREPLACE, REPLACE, EXCHANGE}`; `REPLACE`
+  is atomic on the same filesystem; `EXDEV` remains an error (no server-side copy
+  fallback — the client does copy+delete explicitly).
+- [x] `Unlink(path)` removes exactly one non-directory; `Rmdir(path)` removes exactly one
   *empty* directory (`ENOTEMPTY` otherwise). Recursive `Delete` (v2) remains as the
   explicit bulk operation with progress.
-- `Mkdir(path, mode)` (single level, as today); `MkdirAll` is a client-side loop.
-- `Symlink(target, path)`, `Link(existing, new)`, `Chown(path|handle, uid?, gid?)`,
+- [x] `Mkdir(path, mode)` (single level); `MkdirAll` is a client-side loop.
+- [x] `Symlink(target, path)`, `Link(existing, new)`, `Chown(path|handle, uid?, gid?)`,
   `SetTimes(path|handle, atime?, mtime?, follow)` with `UTIME_NOW`/`UTIME_OMIT`
-  semantics, `Chmod` (exists as `SetPermissions`).
-- All mutations are refused with `EROFS` on `ro` mounts before any syscall and
+  semantics, `SetPermissions`.
+- [x] All mutations are refused with `EROFS` on `ro` mounts before any syscall and
   return the new `Attrs`/cookie on success.
+
+**Results**
+
+- **"flags" became an enum.** The three behaviours are mutually exclusive, and a bitmask
+  can encode `NOREPLACE | EXCHANGE`, a contradiction every call site would then have to
+  reject. An unknown value is refused by the decoder like every other v3 enum, so a
+  server that does not implement a mode cannot silently do a different one.
+- **`NOREPLACE` and `EXCHANGE` are real, on both platforms.** `std::fs::rename` is POSIX
+  rename: it always replaces, and check-then-rename is a race. `rustix::fs::renameat_with`
+  wraps `renameat2` on Linux and `renamex_np` on macOS, so both modes are genuinely
+  atomic and no hand-written `unsafe` was needed — the first option in §7 Decision 9's
+  order, not the last. `rustix` was already in the tree, so it added no crate to audit.
+- **A `Rename` whose two paths are hard links to the same inode succeeds and does
+  nothing.** That is POSIX, and it cost a test failure to remember: the first version of
+  the client integration test used `link` to make a second name and then renamed one onto
+  the other, expecting the source to disappear. It did not, and it should not. Written
+  down in `protocol.md` so the next person reads it before debugging it.
+- **`Unlink` decides "not a directory" itself** rather than letting the platform answer.
+  Linux returns `EISDIR` for `unlink` on a directory and macOS returns `EPERM`; a client
+  cannot branch on a code that depends on the server's host.
+- **One reply type for nine verbs.** `Mutated` carries the new `Attrs`, so a client gets
+  the fresh `change_cookie` without a follow-up `Stat` — which matters for E4-S7's CAS.
+  The two removals answer `Done`: there is nothing left to describe, and inventing attrs
+  for a path that no longer exists would be a lie with a shape.
+- **`UTIME_NOW` is resolved by the server**, because the client's clock is not the one
+  the filesystem stamps with, and one reading serves both fields so `atime` and `mtime`
+  both set to `Now` cannot land a nanosecond apart. An omitted field is read back and
+  rewritten, which `utimensat` would not need to do — `filetime` has no symlink-safe
+  single-field call. That is a narrow race against another writer, and the alternative
+  was refusing the request.
+- **A `TimeChange` is the same width whatever its tag.** A decoder that had to branch on
+  a peer-chosen tag to know how far to advance is one bad byte from desynchronising.
+- **The EROFS gate is an exhaustive match, not a wildcard.** `fs_is_write_class` lists
+  every message rather than defaulting, so adding a verb to the enum forces a decision
+  about whether it writes. A live test sends all nine at a read-only export and asserts
+  each is refused *and* that nothing on disk changed.
+- **Both ends of a two-path mutation are confined.** A `Rename` that only checked its
+  source would let a client move a file anywhere the server process can write; there is a
+  test for each direction, and for `Link` and `Mkdir`.
+- **A `Symlink` target is deliberately not confined.** It is opaque text; storing it
+  resolves nothing, and every read *through* the link goes back through
+  `browse_stat_path`, which refuses to traverse out of the export. The test creates a
+  link to `../../etc/passwd`, checks it is stored verbatim, and then checks that opening
+  through it is refused.
+- **Two hangs, one cause, found by tests.** Both the test harness's `fs_related_id` and
+  the client's `related_id` matched responses with a `_ => None` fallback, so `Mutated`
+  routed to nobody and the caller waited forever on a reply that had already arrived — a
+  hang that looks like a server fault rather than a missing match arm. Both are
+  exhaustive now.
+- The vectors are extended the same way as Phase 1: an independent Python implementation
+  of the `protocol.md` layout, cross-checked byte-exact by Rust. 34 valid and 16
+  malformed vectors now, and `corpus_covers_every_phase_one_type_once` lists the new
+  types so a message without a vector fails the build.
+
+**A finding about the reserved ranges:** 86–99 was assigned to fifteen named messages in
+fourteen slots, before the response type any of them needed. The mutations took 86–95;
+`Access`/`AccessResult` keep 96–97; extended attributes (E5-S5) moved to **123–127**.
+Worth checking the other reserved ranges against their lists before they are needed.
+
+**Next steps**
+
+- **E4-S6/E4-S7** (staging and `expect_cookie`) are the rest of what Excalibur's M2
+  needs. `Mutated` already returns the cookie those will compare against.
+- `Access`/`AccessResult` (96–97) is still unassigned in code.
+- `Chown` and `SetTimes` accept a handle target but resolve it to the handle's *path*
+  rather than using `fchown`/`futimens`. That is correct for a session that holds the
+  file open, and wrong if the path is renamed underneath it — a real but narrow gap, and
+  closing it means FFI for three calls that Decision 9 now permits.
+- Recursive delete is still v2's `Delete`. A v3 client that wants a tree removed loops
+  `Unlink`/`Rmdir` itself, which is what lets it report progress and stop.
 
 #### X3-E5-S5 — Extended attributes
 **AC**
@@ -1473,7 +1547,9 @@ intersection; unknown bits are ignored.
 | 64–69 | Handles & I/O | reserved (Phases 3–4) | `SetSize`, `Allocate`, `Seek`/`SeekResult`, `Advise`, `HandleState` |
 | 70–79 | Staging | reserved (Phase 3) | `StageOpen`/`StageOpened`, `StageWrite`/`StageAck`, `StageStatus`/`StageRanges`, `StageCommit`/`StageResult`, `StageAbort` |
 | 80–85 | Namespace | **frozen** | `Stat`/`Attrs`, `ReadDir`/`DirPage`, `StatFs`/`FsInfo` |
-| 86–99 | Namespace | reserved (Phases 3–4) | `Rename3`, `Unlink`, `Rmdir`, `Mkdir3`, `Symlink`, `Link`, `Chown`, `SetTimes`, `Access`/`AccessResult`, `ListXattr`, `GetXattr`, `SetXattr`, `RemoveXattr`, `XattrResult` |
+| 86–95 | Namespace mutations | **frozen** | `Rename`, `Unlink`, `Rmdir`, `Mkdir`, `Symlink`, `Link`, `Chown`, `SetTimes`, `SetPermissions`, `Mutated` |
+| 96–99 | Namespace | reserved (Phase 4) | `Access`/`AccessResult`, two spare |
+| 123–127 | Extended attributes | reserved (Phase 4) | `ListXattr`, `GetXattr`, `SetXattr`, `RemoveXattr`, `XattrResult` |
 | 100–109 | Locks | reserved (Phase 3–4) | `Lock`/`LockResult`, `Unlock`, `TestLock`/`TestLockResult`, `LeaseBreak`*, `LeaseAck` |
 | 110–115 | Notify | reserved (Phase 4) | `Watch`/`Watched`, `Unwatch`, `WatchEvent`*, `WatchOverflow`* |
 | 116–119 | Compound | reserved (Phase 4) | `Compound`/`CompoundResult` |

@@ -45,7 +45,10 @@ use xsync_core::protocol::{
 };
 use xsync_core::protocol_v3::{self as v3, V3Message};
 
-pub use v3::{attr_presence, features, supports, Access, Attrs, ErrorCode, Normalization};
+pub use v3::{
+    attr_presence, features, supports, Access, Attrs, ErrorCode, Normalization, RenameMode,
+    StatTarget, TimeChange,
+};
 
 /// Which optional `Attrs` blocks a request wants. See [`attr_presence`].
 pub type AttrMask = u32;
@@ -690,6 +693,189 @@ impl Mount {
             other => Err(Error::Unexpected(format!("expected Opened, got {other:?}"))),
         }
     }
+
+    /// Rename or exchange a path (`xsyncv3.md` E5-S4).
+    ///
+    /// Returns the attributes of the destination afterwards, so a caller that
+    /// needs the new `change_cookie` does not have to `Stat` for it.
+    ///
+    /// `EXDEV` is returned rather than worked around: a rename across
+    /// filesystems is a copy and a delete, which can half-succeed, and only the
+    /// caller can decide whether that trade is acceptable.
+    ///
+    /// # Errors
+    ///
+    /// Fails when either path cannot be resolved, the mode's condition is not
+    /// met (`EEXIST` for `NoReplace`, `ENOENT` for `Exchange`), the two paths
+    /// are on different filesystems, or the mount is not writable.
+    pub async fn rename(
+        &self,
+        source: &[u8],
+        destination: &[u8],
+        mode: RenameMode,
+    ) -> Result<Attrs> {
+        self.mutate(V3Message::Rename {
+            source: source.to_vec(),
+            destination: destination.to_vec(),
+            mode,
+            attr_mask: 0,
+        })
+        .await
+    }
+
+    /// Remove one file, symlink or other non-directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EISDIR` on a directory — use [`Self::rmdir`] — and with the
+    /// server's error otherwise.
+    pub async fn unlink(&self, path: &[u8]) -> Result<()> {
+        self.mutate_done(V3Message::Unlink {
+            path: path.to_vec(),
+        })
+        .await
+    }
+
+    /// Remove one *empty* directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `ENOTEMPTY` when the directory has entries. Removing a tree
+    /// is the caller's loop, so that the caller can report progress and stop.
+    pub async fn rmdir(&self, path: &[u8]) -> Result<()> {
+        self.mutate_done(V3Message::Rmdir {
+            path: path.to_vec(),
+        })
+        .await
+    }
+
+    /// Create one directory level, with `mode` before the server's umask.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `ENOENT` when the parent does not exist: this is `mkdir`, not
+    /// `mkdir -p`, and creating the parents is a caller-side loop.
+    pub async fn mkdir(&self, path: &[u8], mode: u32) -> Result<Attrs> {
+        self.mutate(V3Message::Mkdir {
+            path: path.to_vec(),
+            mode,
+            attr_mask: 0,
+        })
+        .await
+    }
+
+    /// Create a symbolic link at `path` pointing at `target`.
+    ///
+    /// `target` is stored verbatim and is never resolved or confined; reads
+    /// through the link are confined when they happen.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `path` exists or its parent does not.
+    pub async fn symlink(&self, target: &[u8], path: &[u8]) -> Result<Attrs> {
+        self.mutate(V3Message::Symlink {
+            target: target.to_vec(),
+            path: path.to_vec(),
+            attr_mask: 0,
+        })
+        .await
+    }
+
+    /// Create a hard link at `path` to `existing`.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EXDEV` across filesystems and `EPERM` on a directory.
+    pub async fn link(&self, existing: &[u8], path: &[u8]) -> Result<Attrs> {
+        self.mutate(V3Message::Link {
+            existing: existing.to_vec(),
+            path: path.to_vec(),
+            attr_mask: 0,
+        })
+        .await
+    }
+
+    /// Change owner and/or group. `None` leaves that half alone.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EPERM` unless the server's identity may make the change.
+    pub async fn chown(
+        &self,
+        path: &[u8],
+        uid: Option<u32>,
+        gid: Option<u32>,
+        follow: bool,
+    ) -> Result<Attrs> {
+        self.mutate(V3Message::Chown {
+            target: StatTarget::Path(path.to_vec()),
+            uid,
+            gid,
+            follow,
+            attr_mask: 0,
+        })
+        .await
+    }
+
+    /// Change access and/or modification times.
+    ///
+    /// [`TimeChange::Now`] is resolved by the *server*, because its clock is
+    /// the one the filesystem stamps with.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the path cannot be resolved or the times cannot be set.
+    pub async fn set_times(
+        &self,
+        path: &[u8],
+        atime: TimeChange,
+        mtime: TimeChange,
+        follow: bool,
+    ) -> Result<Attrs> {
+        self.mutate(V3Message::SetTimes {
+            target: StatTarget::Path(path.to_vec()),
+            atime,
+            mtime,
+            follow,
+            attr_mask: 0,
+        })
+        .await
+    }
+
+    /// Change permission bits.
+    ///
+    /// # Errors
+    ///
+    /// Fails with `EOPNOTSUPP` for `follow: false` on a symlink: there is no
+    /// portable `lchmod`, and following one would change the mode of something
+    /// the caller did not name.
+    pub async fn set_permissions(&self, path: &[u8], mode: u32, follow: bool) -> Result<Attrs> {
+        self.mutate(V3Message::SetPermissions {
+            target: StatTarget::Path(path.to_vec()),
+            mode,
+            follow,
+            attr_mask: 0,
+        })
+        .await
+    }
+
+    /// Send a mutation that answers with the new attributes.
+    async fn mutate(&self, request: V3Message) -> Result<Attrs> {
+        match self.connection.call(&request).await? {
+            V3Message::Mutated { attrs, .. } => Ok(attrs),
+            other => Err(Error::Unexpected(format!(
+                "expected Mutated, got {other:?}"
+            ))),
+        }
+    }
+
+    /// Send a mutation that answers with nothing.
+    async fn mutate_done(&self, request: V3Message) -> Result<()> {
+        match self.connection.call(&request).await? {
+            V3Message::Done { .. } => Ok(()),
+            other => Err(Error::Unexpected(format!("expected Done, got {other:?}"))),
+        }
+    }
 }
 
 /// An open file or directory.
@@ -978,11 +1164,36 @@ const fn related_id(message: &V3Message) -> Option<u64> {
         | V3Message::WriteAck { related_id, .. }
         | V3Message::DirPage { related_id, .. }
         | V3Message::FsInfo { related_id, .. }
+        | V3Message::Mutated { related_id, .. }
         | V3Message::FeaturesAck { related_id, .. } => Some(*related_id),
         // A keepalive acknowledgement echoes its nonce rather than an id, and
         // the client sends the nonce as the id, so they agree.
         V3Message::KeepaliveAck { nonce } => Some(*nonce),
-        _ => None,
+        // Listed rather than wildcarded. A response type added to the enum and
+        // missed here is routed to nobody, so the caller waits forever on a
+        // reply that already arrived — a hang, not an error, and it looks like
+        // a server fault rather than a missing match arm.
+        V3Message::Cancel { .. }
+        | V3Message::Keepalive { .. }
+        | V3Message::Features { .. }
+        | V3Message::Mount { .. }
+        | V3Message::Open { .. }
+        | V3Message::Close { .. }
+        | V3Message::Read { .. }
+        | V3Message::Write { .. }
+        | V3Message::Flush { .. }
+        | V3Message::Stat { .. }
+        | V3Message::ReadDir { .. }
+        | V3Message::StatFs
+        | V3Message::Rename { .. }
+        | V3Message::Unlink { .. }
+        | V3Message::Rmdir { .. }
+        | V3Message::Mkdir { .. }
+        | V3Message::Symlink { .. }
+        | V3Message::Link { .. }
+        | V3Message::Chown { .. }
+        | V3Message::SetTimes { .. }
+        | V3Message::SetPermissions { .. } => None,
     }
 }
 

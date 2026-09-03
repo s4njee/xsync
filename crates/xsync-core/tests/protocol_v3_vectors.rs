@@ -45,7 +45,7 @@ fn corpus_valid_vectors_decode_and_re_encode_byte_exact() {
         );
         count += 1;
     }
-    assert_eq!(count, 22);
+    assert_eq!(count, 34);
 }
 
 #[test]
@@ -71,6 +71,9 @@ fn corpus_malformed_vectors_fail_closed() {
             "truncated attrs" => "truncated",
             "stat target inconsistent" => "stat target",
             "page size out of range" => "max entries",
+            "invalid rename mode" => "rename_mode",
+            "invalid time change tag" => "time_change",
+            "nanoseconds out of range" => "nanos",
             other => panic!("unknown malformed rule for {}: {other}", fields[0]),
         };
         assert!(
@@ -80,7 +83,7 @@ fn corpus_malformed_vectors_fail_closed() {
         );
         count += 1;
     }
-    assert_eq!(count, 12);
+    assert_eq!(count, 16);
 }
 
 #[test]
@@ -92,7 +95,10 @@ fn corpus_covers_every_phase_one_type_once() {
         .map(|fields| fields[2].parse().unwrap())
         .collect();
     let expected: BTreeSet<u8> = [
-        18, 42, 43, 50, 51, 56, 57, 58, 59, 60, 61, 62, 63, 80, 81, 82, 83, 84, 85, 121, 122,
+        18, 42, 43, 50, 51, 56, 57, 58, 59, 60, 61, 62, 63, 80, 81, 82, 83, 84, 85,
+        // E5-S4 mutations.
+        86, 87, 88, 89, 90, 91, 92, 93, 94, 95, //
+        121, 122,
     ]
     .into_iter()
     .collect();

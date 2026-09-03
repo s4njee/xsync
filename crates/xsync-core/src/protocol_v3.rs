@@ -88,6 +88,26 @@ pub mod types {
     pub const STAT_FS: u8 = 84;
     /// Reply to `StatFs`.
     pub const FS_INFO: u8 = 85;
+    /// Rename or exchange a path (`xsyncv3.md` E5-S4).
+    pub const RENAME: u8 = 86;
+    /// Remove exactly one non-directory.
+    pub const UNLINK: u8 = 87;
+    /// Remove exactly one empty directory.
+    pub const RMDIR: u8 = 88;
+    /// Create one directory level.
+    pub const MKDIR: u8 = 89;
+    /// Create a symbolic link.
+    pub const SYMLINK: u8 = 90;
+    /// Create a hard link.
+    pub const LINK: u8 = 91;
+    /// Change owner and/or group.
+    pub const CHOWN: u8 = 92;
+    /// Change access and/or modification times.
+    pub const SET_TIMES: u8 = 93;
+    /// Change permission bits.
+    pub const SET_PERMISSIONS: u8 = 94;
+    /// Shared reply for the mutations that leave something to describe.
+    pub const MUTATED: u8 = 95;
     /// Request-scoped failure.
     pub const ERROR: u8 = 121;
     /// Request-scoped success with no payload.
@@ -274,6 +294,110 @@ impl Access {
             1 => Ok(Self::ReadOnly),
             _ => Err(V3CodecError::InvalidEnum {
                 field: "access",
+                value,
+            }),
+        }
+    }
+}
+
+/// What `Rename` should do when the destination already exists.
+///
+/// An enum rather than the bitmask the story called "flags": the three
+/// behaviours are mutually exclusive, and a bitmask can encode a contradiction
+/// (`NOREPLACE | EXCHANGE`) that then has to be rejected at every call site. A
+/// value the decoder does not know is refused, as everywhere else in v3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RenameMode {
+    /// Fail with `EEXIST` when the destination exists. The v2 behaviour.
+    NoReplace = 0,
+    /// Replace the destination atomically. Both must be on one filesystem.
+    Replace = 1,
+    /// Swap the two paths atomically; both must exist.
+    Exchange = 2,
+}
+
+impl RenameMode {
+    fn decode(value: u8) -> Result<Self, V3CodecError> {
+        match value {
+            0 => Ok(Self::NoReplace),
+            1 => Ok(Self::Replace),
+            2 => Ok(Self::Exchange),
+            _ => Err(V3CodecError::InvalidEnum {
+                field: "rename_mode",
+                value,
+            }),
+        }
+    }
+}
+
+/// One timestamp in a `SetTimes`, with `utimensat`'s three cases.
+///
+/// `Omit` and `Now` are distinct from any value the client could send: `Now`
+/// must be resolved by the *server*, because the client's clock is not the one
+/// the filesystem stamps with, and `Omit` has to leave the existing value
+/// alone rather than rewrite it with what a stat happened to return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeChange {
+    /// Leave this timestamp as it is (`UTIME_OMIT`).
+    Omit,
+    /// Set it to the server's current time (`UTIME_NOW`).
+    Now,
+    /// Set it to an explicit time.
+    Set {
+        /// Seconds since the Unix epoch; negative is before it.
+        seconds: i64,
+        /// Nanoseconds within the second, `0..1_000_000_000`.
+        nanos: u32,
+    },
+}
+
+impl TimeChange {
+    const OMIT: u8 = 0;
+    const NOW: u8 = 1;
+    const SET: u8 = 2;
+
+    fn encode(self, writer: &mut Writer) {
+        match self {
+            Self::Omit => {
+                writer.u8(Self::OMIT);
+                writer.i64(0);
+                writer.u32(0);
+            }
+            Self::Now => {
+                writer.u8(Self::NOW);
+                writer.i64(0);
+                writer.u32(0);
+            }
+            Self::Set { seconds, nanos } => {
+                writer.u8(Self::SET);
+                writer.i64(seconds);
+                writer.u32(nanos);
+            }
+        }
+    }
+
+    fn decode(reader: &mut Reader) -> Result<Self, V3CodecError> {
+        // Fixed width whatever the tag, so the frame layout does not depend on
+        // a value the peer chose — a decoder that had to branch on the tag to
+        // know how far to advance is one bad byte away from desynchronising.
+        let tag = reader.u8()?;
+        let seconds = reader.i64()?;
+        let nanos = reader.u32()?;
+        match tag {
+            Self::OMIT => Ok(Self::Omit),
+            Self::NOW => Ok(Self::Now),
+            Self::SET => {
+                if nanos >= 1_000_000_000 {
+                    return Err(V3CodecError::Bound {
+                        field: "nanos",
+                        value: nanos as usize,
+                    });
+                }
+                Ok(Self::Set { seconds, nanos })
+            }
+            value => Err(V3CodecError::InvalidEnum {
+                field: "time_change",
                 value,
             }),
         }
@@ -807,6 +931,102 @@ pub enum V3Message {
         /// The filesystem itself is read-only (distinct from the export).
         read_only: bool,
     },
+    /// Rename or exchange a path.
+    Rename {
+        /// Source path, relative to the export root.
+        source: Vec<u8>,
+        /// Destination path, relative to the export root.
+        destination: Vec<u8>,
+        /// What to do about an existing destination.
+        mode: RenameMode,
+        /// Optional `Attrs` blocks wanted for the result.
+        attr_mask: u32,
+    },
+    /// Remove exactly one non-directory.
+    Unlink {
+        /// Path to remove.
+        path: Vec<u8>,
+    },
+    /// Remove exactly one empty directory.
+    Rmdir {
+        /// Directory to remove.
+        path: Vec<u8>,
+    },
+    /// Create one directory level.
+    Mkdir {
+        /// Directory to create; its parent must exist.
+        path: Vec<u8>,
+        /// Permission bits before umask.
+        mode: u32,
+        /// Optional `Attrs` blocks wanted for the result.
+        attr_mask: u32,
+    },
+    /// Create a symbolic link.
+    Symlink {
+        /// What the link should point at. Stored verbatim, never resolved.
+        target: Vec<u8>,
+        /// Where to create the link, relative to the export root.
+        path: Vec<u8>,
+        /// Optional `Attrs` blocks wanted for the result.
+        attr_mask: u32,
+    },
+    /// Create a hard link.
+    Link {
+        /// The existing path.
+        existing: Vec<u8>,
+        /// The new name for it.
+        path: Vec<u8>,
+        /// Optional `Attrs` blocks wanted for the result.
+        attr_mask: u32,
+    },
+    /// Change owner and/or group.
+    Chown {
+        /// Path or open handle.
+        target: StatTarget,
+        /// New owner, or `None` to leave it.
+        uid: Option<u32>,
+        /// New group, or `None` to leave it.
+        gid: Option<u32>,
+        /// Whether to follow a final symlink.
+        follow: bool,
+        /// Optional `Attrs` blocks wanted for the result.
+        attr_mask: u32,
+    },
+    /// Change access and/or modification times.
+    SetTimes {
+        /// Path or open handle.
+        target: StatTarget,
+        /// What to do with the access time.
+        atime: TimeChange,
+        /// What to do with the modification time.
+        mtime: TimeChange,
+        /// Whether to follow a final symlink.
+        follow: bool,
+        /// Optional `Attrs` blocks wanted for the result.
+        attr_mask: u32,
+    },
+    /// Change permission bits.
+    SetPermissions {
+        /// Path or open handle.
+        target: StatTarget,
+        /// New mode bits.
+        mode: u32,
+        /// Whether to follow a final symlink.
+        follow: bool,
+        /// Optional `Attrs` blocks wanted for the result.
+        attr_mask: u32,
+    },
+    /// What a mutation left behind.
+    ///
+    /// One reply for every mutation that produces or changes something, so the
+    /// client gets the new `change_cookie` without a follow-up `Stat`. The
+    /// removals answer `Done` instead: there is nothing left to describe.
+    Mutated {
+        /// The request.
+        related_id: u64,
+        /// Attributes of the affected path after the change.
+        attrs: Attrs,
+    },
     /// Request-scoped failure.
     Error {
         /// The failed request.
@@ -894,6 +1114,16 @@ pub const fn message_type(message: &V3Message) -> u8 {
         V3Message::DirPage { .. } => types::DIR_PAGE,
         V3Message::StatFs => types::STAT_FS,
         V3Message::FsInfo { .. } => types::FS_INFO,
+        V3Message::Rename { .. } => types::RENAME,
+        V3Message::Unlink { .. } => types::UNLINK,
+        V3Message::Rmdir { .. } => types::RMDIR,
+        V3Message::Mkdir { .. } => types::MKDIR,
+        V3Message::Symlink { .. } => types::SYMLINK,
+        V3Message::Link { .. } => types::LINK,
+        V3Message::Chown { .. } => types::CHOWN,
+        V3Message::SetTimes { .. } => types::SET_TIMES,
+        V3Message::SetPermissions { .. } => types::SET_PERMISSIONS,
+        V3Message::Mutated { .. } => types::MUTATED,
         V3Message::Error { .. } => types::ERROR,
         V3Message::Done { .. } => types::DONE,
     }
@@ -1177,18 +1407,7 @@ pub fn encode(message: &V3Message) -> Result<Vec<u8>, V3CodecError> {
             follow,
             attr_mask,
         } => {
-            match target {
-                StatTarget::Path(path) => {
-                    writer.u8(0);
-                    writer.blob(path, MAX_PATH, "path")?;
-                    writer.u64(0);
-                }
-                StatTarget::Handle(handle) => {
-                    writer.u8(1);
-                    writer.blob(&[], MAX_PATH, "path")?;
-                    writer.u64(*handle);
-                }
-            }
+            encode_stat_target(&mut writer, target)?;
             writer.bool(*follow);
             writer.u32(*attr_mask);
         }
@@ -1246,6 +1465,93 @@ pub fn encode(message: &V3Message) -> Result<Vec<u8>, V3CodecError> {
             writer.bool(*case_sensitive);
             writer.u8(*normalization as u8);
             writer.bool(*read_only);
+        }
+        V3Message::Rename {
+            source,
+            destination,
+            mode,
+            attr_mask,
+        } => {
+            writer.blob(source, MAX_PATH, "source")?;
+            writer.blob(destination, MAX_PATH, "destination")?;
+            writer.u8(*mode as u8);
+            writer.u32(*attr_mask);
+        }
+        V3Message::Unlink { path } | V3Message::Rmdir { path } => {
+            writer.blob(path, MAX_PATH, "path")?;
+        }
+        V3Message::Mkdir {
+            path,
+            mode,
+            attr_mask,
+        } => {
+            writer.blob(path, MAX_PATH, "path")?;
+            writer.u32(*mode);
+            writer.u32(*attr_mask);
+        }
+        V3Message::Symlink {
+            target,
+            path,
+            attr_mask,
+        } => {
+            // The target is not a path in the export: it is opaque text that
+            // may point anywhere, including outside. It is bounded like a path
+            // and confined nowhere, because storing it is not following it.
+            writer.blob(target, MAX_PATH, "target")?;
+            writer.blob(path, MAX_PATH, "path")?;
+            writer.u32(*attr_mask);
+        }
+        V3Message::Link {
+            existing,
+            path,
+            attr_mask,
+        } => {
+            writer.blob(existing, MAX_PATH, "existing")?;
+            writer.blob(path, MAX_PATH, "path")?;
+            writer.u32(*attr_mask);
+        }
+        V3Message::Chown {
+            target,
+            uid,
+            gid,
+            follow,
+            attr_mask,
+        } => {
+            encode_stat_target(&mut writer, target)?;
+            writer.bool(uid.is_some());
+            writer.u32(uid.unwrap_or(0));
+            writer.bool(gid.is_some());
+            writer.u32(gid.unwrap_or(0));
+            writer.bool(*follow);
+            writer.u32(*attr_mask);
+        }
+        V3Message::SetTimes {
+            target,
+            atime,
+            mtime,
+            follow,
+            attr_mask,
+        } => {
+            encode_stat_target(&mut writer, target)?;
+            atime.encode(&mut writer);
+            mtime.encode(&mut writer);
+            writer.bool(*follow);
+            writer.u32(*attr_mask);
+        }
+        V3Message::SetPermissions {
+            target,
+            mode,
+            follow,
+            attr_mask,
+        } => {
+            encode_stat_target(&mut writer, target)?;
+            writer.u32(*mode);
+            writer.bool(*follow);
+            writer.u32(*attr_mask);
+        }
+        V3Message::Mutated { related_id, attrs } => {
+            writer.u64(*related_id);
+            encode_attrs(&mut writer, attrs)?;
         }
         V3Message::Error {
             related_id,
@@ -1411,36 +1717,11 @@ pub fn decode(message_type: u8, payload: &[u8]) -> Result<V3Message, V3CodecErro
         types::FLUSH => V3Message::Flush {
             handle: reader.u64()?,
         },
-        types::STAT => {
-            let tag = reader.u8()?;
-            let path = reader.blob(MAX_PATH, "path")?;
-            let handle = reader.u64()?;
-            let target = match tag {
-                0 if handle == 0 => StatTarget::Path(path),
-                0 => {
-                    return Err(V3CodecError::Inconsistent(
-                        "stat target handle must be zero for a path target",
-                    ))
-                }
-                1 if path.is_empty() => StatTarget::Handle(handle),
-                1 => {
-                    return Err(V3CodecError::Inconsistent(
-                        "stat target path must be empty for a handle target",
-                    ))
-                }
-                value => {
-                    return Err(V3CodecError::InvalidEnum {
-                        field: "stat target",
-                        value,
-                    })
-                }
-            };
-            V3Message::Stat {
-                target,
-                follow: reader.bool()?,
-                attr_mask: reader.u32()?,
-            }
-        }
+        types::STAT => V3Message::Stat {
+            target: decode_stat_target(&mut reader)?,
+            follow: reader.bool()?,
+            attr_mask: reader.u32()?,
+        },
         types::ATTRS => V3Message::AttrsResponse {
             related_id: reader.u64()?,
             attrs: decode_attrs(&mut reader)?,
@@ -1478,6 +1759,70 @@ pub fn decode(message_type: u8, payload: &[u8]) -> Result<V3Message, V3CodecErro
             case_sensitive: reader.bool()?,
             normalization: Normalization::decode(reader.u8()?)?,
             read_only: reader.bool()?,
+        },
+        types::RENAME => V3Message::Rename {
+            source: reader.blob(MAX_PATH, "source")?,
+            destination: reader.blob(MAX_PATH, "destination")?,
+            mode: RenameMode::decode(reader.u8()?)?,
+            attr_mask: reader.u32()?,
+        },
+        types::UNLINK => V3Message::Unlink {
+            path: reader.blob(MAX_PATH, "path")?,
+        },
+        types::RMDIR => V3Message::Rmdir {
+            path: reader.blob(MAX_PATH, "path")?,
+        },
+        types::MKDIR => V3Message::Mkdir {
+            path: reader.blob(MAX_PATH, "path")?,
+            mode: reader.u32()?,
+            attr_mask: reader.u32()?,
+        },
+        types::SYMLINK => V3Message::Symlink {
+            target: reader.blob(MAX_PATH, "target")?,
+            path: reader.blob(MAX_PATH, "path")?,
+            attr_mask: reader.u32()?,
+        },
+        types::LINK => V3Message::Link {
+            existing: reader.blob(MAX_PATH, "existing")?,
+            path: reader.blob(MAX_PATH, "path")?,
+            attr_mask: reader.u32()?,
+        },
+        types::CHOWN => {
+            let target = decode_stat_target(&mut reader)?;
+            let owner_present = reader.bool()?;
+            let owner = reader.u32()?;
+            let group_present = reader.bool()?;
+            let group = reader.u32()?;
+            V3Message::Chown {
+                target,
+                uid: owner_present.then_some(owner),
+                gid: group_present.then_some(group),
+                follow: reader.bool()?,
+                attr_mask: reader.u32()?,
+            }
+        }
+        types::SET_TIMES => {
+            let target = decode_stat_target(&mut reader)?;
+            V3Message::SetTimes {
+                target,
+                atime: TimeChange::decode(&mut reader)?,
+                mtime: TimeChange::decode(&mut reader)?,
+                follow: reader.bool()?,
+                attr_mask: reader.u32()?,
+            }
+        }
+        types::SET_PERMISSIONS => {
+            let target = decode_stat_target(&mut reader)?;
+            V3Message::SetPermissions {
+                target,
+                mode: reader.u32()?,
+                follow: reader.bool()?,
+                attr_mask: reader.u32()?,
+            }
+        }
+        types::MUTATED => V3Message::Mutated {
+            related_id: reader.u64()?,
+            attrs: decode_attrs(&mut reader)?,
         },
         types::ERROR => V3Message::Error {
             related_id: reader.u64()?,
@@ -1566,6 +1911,50 @@ fn validate_mount_info(
         }
     }
     Ok(())
+}
+
+/// A `StatTarget` on the wire: a tag, then both fields, always.
+///
+/// Fixed width whichever arm it is, so the frame layout never depends on a
+/// value the peer chose. Shared by `Stat` and by the mutations that can name
+/// either a path or an open handle, which is the only reason it is a function.
+fn encode_stat_target(writer: &mut Writer, target: &StatTarget) -> Result<(), V3CodecError> {
+    match target {
+        StatTarget::Path(path) => {
+            writer.u8(0);
+            writer.blob(path, MAX_PATH, "path")?;
+            writer.u64(0);
+        }
+        StatTarget::Handle(handle) => {
+            writer.u8(1);
+            writer.blob(&[], MAX_PATH, "path")?;
+            writer.u64(*handle);
+        }
+    }
+    Ok(())
+}
+
+fn decode_stat_target(reader: &mut Reader<'_>) -> Result<StatTarget, V3CodecError> {
+    let tag = reader.u8()?;
+    let path = reader.blob(MAX_PATH, "path")?;
+    let handle = reader.u64()?;
+    // The unused half of the pair must be zero. A sender that filled both said
+    // two things, and guessing which one it meant is how a mutation lands on
+    // the wrong file.
+    match tag {
+        0 if handle == 0 => Ok(StatTarget::Path(path)),
+        0 => Err(V3CodecError::Inconsistent(
+            "stat target handle must be zero for a path target",
+        )),
+        1 if path.is_empty() => Ok(StatTarget::Handle(handle)),
+        1 => Err(V3CodecError::Inconsistent(
+            "stat target path must be empty for a handle target",
+        )),
+        value => Err(V3CodecError::InvalidEnum {
+            field: "stat target",
+            value,
+        }),
+    }
 }
 
 fn encode_attrs(writer: &mut Writer, attrs: &Attrs) -> Result<(), V3CodecError> {
@@ -2005,6 +2394,60 @@ mod tests {
                 normalization: Normalization::Nfc,
                 read_only: false,
             },
+            V3Message::Rename {
+                source: b"a.txt".to_vec(),
+                destination: b"b.txt".to_vec(),
+                mode: RenameMode::Exchange,
+                attr_mask: attr_presence::OWNER,
+            },
+            V3Message::Unlink {
+                path: b"a.txt".to_vec(),
+            },
+            V3Message::Rmdir {
+                path: b"empty".to_vec(),
+            },
+            V3Message::Mkdir {
+                path: b"new".to_vec(),
+                mode: 0o755,
+                attr_mask: 0,
+            },
+            V3Message::Symlink {
+                target: b"../outside".to_vec(),
+                path: b"link".to_vec(),
+                attr_mask: attr_presence::SYMLINK_TARGET,
+            },
+            V3Message::Link {
+                existing: b"a.txt".to_vec(),
+                path: b"b.txt".to_vec(),
+                attr_mask: 0,
+            },
+            V3Message::Chown {
+                target: StatTarget::Path(b"a.txt".to_vec()),
+                uid: Some(1000),
+                gid: None,
+                follow: false,
+                attr_mask: attr_presence::OWNER,
+            },
+            V3Message::SetTimes {
+                target: StatTarget::Handle(4),
+                atime: TimeChange::Omit,
+                mtime: TimeChange::Set {
+                    seconds: -1,
+                    nanos: 999_999_999,
+                },
+                follow: true,
+                attr_mask: 0,
+            },
+            V3Message::SetPermissions {
+                target: StatTarget::Path(b"a.txt".to_vec()),
+                mode: 0o640,
+                follow: true,
+                attr_mask: 0,
+            },
+            V3Message::Mutated {
+                related_id: 11,
+                attrs: full_attrs(),
+            },
             V3Message::Error {
                 related_id: 9,
                 code: ErrorCode::ReadOnly,
@@ -2013,6 +2456,98 @@ mod tests {
             },
             V3Message::Done { related_id: 9 },
         ]
+    }
+
+    #[test]
+    fn every_mutation_type_is_in_the_round_trip_table() {
+        // The table is hand-written, so a message added to the enum but not to
+        // it would be encoded by nothing and decoded by no test.
+        let covered: std::collections::BTreeSet<u8> =
+            every_message().iter().map(message_type).collect();
+        for (name, value) in [
+            ("Rename", types::RENAME),
+            ("Unlink", types::UNLINK),
+            ("Rmdir", types::RMDIR),
+            ("Mkdir", types::MKDIR),
+            ("Symlink", types::SYMLINK),
+            ("Link", types::LINK),
+            ("Chown", types::CHOWN),
+            ("SetTimes", types::SET_TIMES),
+            ("SetPermissions", types::SET_PERMISSIONS),
+            ("Mutated", types::MUTATED),
+        ] {
+            assert!(covered.contains(&value), "{name} is not round-tripped");
+        }
+    }
+
+    #[test]
+    fn an_unknown_rename_mode_is_refused_rather_than_defaulted() {
+        // Defaulting would turn a mode this server does not implement into a
+        // rename it does — quietly replacing a file the client asked never to
+        // replace.
+        let mut payload = encode(&V3Message::Rename {
+            source: b"a".to_vec(),
+            destination: b"b".to_vec(),
+            mode: RenameMode::Replace,
+            attr_mask: 0,
+        })
+        .unwrap();
+        let mode_at = payload.len() - 5;
+        payload[mode_at] = 9;
+        assert!(decode(types::RENAME, &payload).is_err());
+    }
+
+    #[test]
+    fn a_time_change_keeps_its_width_whatever_the_tag() {
+        // The frame layout must not depend on a value the peer chose.
+        let widths: std::collections::BTreeSet<usize> = [
+            TimeChange::Omit,
+            TimeChange::Now,
+            TimeChange::Set {
+                seconds: 1,
+                nanos: 2,
+            },
+        ]
+        .into_iter()
+        .map(|change| {
+            let mut writer = Writer::default();
+            change.encode(&mut writer);
+            writer.bytes.len()
+        })
+        .collect();
+        assert_eq!(
+            widths.len(),
+            1,
+            "tags encode to different widths: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_nanosecond_is_refused() {
+        let mut writer = Writer::default();
+        writer.u8(2); // SET
+        writer.i64(0);
+        writer.u32(1_000_000_000);
+        let mut reader = Reader {
+            bytes: &writer.bytes,
+            offset: 0,
+        };
+        assert!(TimeChange::decode(&mut reader).is_err());
+    }
+
+    #[test]
+    fn a_stat_target_may_not_fill_both_halves() {
+        // Shared by Stat and by every mutation that names a path or a handle,
+        // so this one check covers all of them.
+        let mut writer = Writer::default();
+        writer.u8(0); // path target...
+        writer.blob(b"a.txt", MAX_PATH, "path").unwrap();
+        writer.u64(7); // ...but a handle as well.
+        let mut reader = Reader {
+            bytes: &writer.bytes,
+            offset: 0,
+        };
+        assert!(decode_stat_target(&mut reader).is_err());
     }
 
     #[test]

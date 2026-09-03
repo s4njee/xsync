@@ -64,3 +64,12 @@ Three crates resolve to two versions each: `shlex`, `syn`, and `windows-sys`.
 All are forced by upstream dependencies rather than by this workspace's own
 manifests, so `deny.toml` sets `multiple-versions = "warn"`: new duplicates stay
 visible without a transitive bump breaking the build.
+
+## `rustix` *(added 2026-09-03, E5-S4)*
+
+`Rename`'s `NOREPLACE` and `EXCHANGE` modes need `renameat2` on Linux and
+`renamex_np` on macOS. `std::fs::rename` is POSIX rename — it always replaces —
+and check-then-rename is a race, so there is no safe std equivalent. `rustix`
+wraps both platforms' calls safely, which is the first option in the preference
+order rather than the last, and it was already in the dependency tree
+transitively: naming it directly adds no package to audit and no new licence.

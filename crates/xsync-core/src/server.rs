@@ -46,6 +46,8 @@ use crate::protocol::{
     MAX_COLLECTION_COUNT, MAX_COMPLETE_PAYLOAD, MAX_DATA_SEGMENT,
 };
 use crate::protocol_v2::{self, V2CodecError, V2Frame, V2Message};
+use rustix::fs::{RenameFlags, CWD};
+
 use crate::protocol_v2::{BrowseEntry, MutationStatus, StatStatus};
 use crate::protocol_v3::{
     self, ErrorCode as FsErrorCode, StatTarget, V3CodecError, V3Frame, V3Message,
@@ -1716,6 +1718,49 @@ impl FsHandler for ServerFsHandler {
                 follow,
                 attr_mask,
             } => stat_target(state, related_id, &target, follow, attr_mask),
+            V3Message::Rename {
+                source,
+                destination,
+                mode,
+                attr_mask,
+            } => rename_paths(state, related_id, &source, &destination, mode, attr_mask),
+            V3Message::Unlink { path } => unlink_path(state, related_id, &path),
+            V3Message::Rmdir { path } => rmdir_path(state, related_id, &path),
+            V3Message::Mkdir {
+                path,
+                mode,
+                attr_mask,
+            } => mkdir_path(state, related_id, &path, mode, attr_mask),
+            V3Message::Symlink {
+                target,
+                path,
+                attr_mask,
+            } => symlink_path(state, related_id, &target, &path, attr_mask),
+            V3Message::Link {
+                existing,
+                path,
+                attr_mask,
+            } => link_paths(state, related_id, &existing, &path, attr_mask),
+            V3Message::Chown {
+                target,
+                uid,
+                gid,
+                follow,
+                attr_mask,
+            } => chown_target(state, related_id, &target, uid, gid, follow, attr_mask),
+            V3Message::SetTimes {
+                target,
+                atime,
+                mtime,
+                follow,
+                attr_mask,
+            } => set_times_target(state, related_id, &target, atime, mtime, follow, attr_mask),
+            V3Message::SetPermissions {
+                target,
+                mode,
+                follow,
+                attr_mask,
+            } => set_permissions_target(state, related_id, &target, mode, follow, attr_mask),
             V3Message::ReadDir {
                 handle,
                 cursor,
@@ -2634,8 +2679,42 @@ fn fs_is_write_class(request: &V3Message) -> bool {
                     | open_flags::APPEND)
                 != 0
         }
-        V3Message::Write { .. } => true,
-        _ => false,
+        // Every mutation. A verb missing from this list would reach the
+        // filesystem on a read-only mount, which is the one thing the gate
+        // exists to prevent — so the list is exhaustive rather than a
+        // wildcard, and adding a message to the enum forces a decision here.
+        V3Message::Write { .. }
+        | V3Message::Rename { .. }
+        | V3Message::Unlink { .. }
+        | V3Message::Rmdir { .. }
+        | V3Message::Mkdir { .. }
+        | V3Message::Symlink { .. }
+        | V3Message::Link { .. }
+        | V3Message::Chown { .. }
+        | V3Message::SetTimes { .. }
+        | V3Message::SetPermissions { .. } => true,
+        V3Message::Cancel { .. }
+        | V3Message::Keepalive { .. }
+        | V3Message::KeepaliveAck { .. }
+        | V3Message::Features { .. }
+        | V3Message::FeaturesAck { .. }
+        | V3Message::Mount { .. }
+        | V3Message::MountInfo { .. }
+        | V3Message::Opened { .. }
+        | V3Message::Close { .. }
+        | V3Message::Read { .. }
+        | V3Message::ReadData { .. }
+        | V3Message::WriteAck { .. }
+        | V3Message::Flush { .. }
+        | V3Message::Stat { .. }
+        | V3Message::AttrsResponse { .. }
+        | V3Message::ReadDir { .. }
+        | V3Message::DirPage { .. }
+        | V3Message::StatFs
+        | V3Message::FsInfo { .. }
+        | V3Message::Mutated { .. }
+        | V3Message::Error { .. }
+        | V3Message::Done { .. } => false,
     }
 }
 
@@ -2731,6 +2810,387 @@ fn fs_pump_handle(domains: &mut HashMap<u64, HandleDomain>, handle: u64) -> Vec<
         domains.remove(&handle);
     }
     ready
+}
+
+/// The mutation handlers (`xsyncv3.md` E5-S4).
+///
+/// Every one of them is refused before it gets here when the mount is
+/// read-only: `fs_is_write_class` lists them, and the session thread answers
+/// `EROFS` without dispatching. That is the AC's "before any syscall", and it
+/// holds for a verb added to this file only if it is added to that list too —
+/// there is a test that walks the list.
+///
+/// The ones that leave something behind answer `Mutated` with the new `Attrs`,
+/// so a client gets the fresh `change_cookie` without a follow-up `Stat`. The
+/// two removals answer `Done`: there is nothing left to describe.
+fn mutated_reply(related_id: u64, path: &Path, follow: bool, attr_mask: u32) -> V3Message {
+    let metadata = if follow {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    match metadata {
+        Ok(metadata) => V3Message::Mutated {
+            related_id,
+            attrs: attrs_from_metadata(&metadata, path, attr_mask),
+        },
+        // The mutation itself succeeded; only describing it failed. Saying so
+        // is more useful than reporting a failure that did not happen, and a
+        // client that cannot read the new attributes can still `Stat` later.
+        Err(error) => fs_io_error(related_id, &error, "stat after mutation"),
+    }
+}
+
+/// Resolve one path argument, or the error to answer with.
+fn mutation_path(state: &FsSessionState, path: &[u8]) -> Result<PathBuf, Box<V3Message>> {
+    // Boxed because `V3Message` is a large enum and this is the cold path;
+    // an unboxed `Err` would widen every caller's return value.
+    browse_stat_path(&state.root, path).map_err(|error| Box::new(fs_path_error(0, &error)))
+}
+
+/// Resolve a `path`-or-`handle` target for the metadata mutations.
+///
+/// A handle target uses the path the handle was opened on rather than its
+/// descriptor: `chown`/`chmod`/`utimensat` have `f*` variants, but reaching
+/// them from a `std::fs::File` means FFI for three calls that the path form
+/// answers exactly as well for a session that already holds the file open.
+fn mutation_target(state: &FsSessionState, target: &StatTarget) -> Result<PathBuf, Box<V3Message>> {
+    match target {
+        StatTarget::Path(path) => mutation_path(state, path),
+        StatTarget::Handle(handle) => state
+            .handle(*handle)
+            .map(|open| open.path.clone())
+            .ok_or_else(|| Box::new(fs_error(0, FsErrorCode::BadHandle, "no such handle"))),
+    }
+}
+
+/// Re-stamp an error produced before the related id was known.
+fn with_related(message: Box<V3Message>, related_id: u64) -> V3Message {
+    match *message {
+        V3Message::Error {
+            code,
+            platform_errno,
+            message,
+            ..
+        } => V3Message::Error {
+            related_id,
+            code,
+            platform_errno,
+            message,
+        },
+        other => other,
+    }
+}
+
+fn rename_paths(
+    state: &FsSessionState,
+    related_id: u64,
+    source: &[u8],
+    destination: &[u8],
+    mode: protocol_v3::RenameMode,
+    attr_mask: u32,
+) -> V3Message {
+    // Both ends are confined. A rename that only checked its source would let
+    // a client move a file to anywhere the server process can write.
+    let source = match mutation_path(state, source) {
+        Ok(path) => path,
+        Err(error) => return with_related(error, related_id),
+    };
+    let destination = match mutation_path(state, destination) {
+        Ok(path) => path,
+        Err(error) => return with_related(error, related_id),
+    };
+
+    let result = match mode {
+        // POSIX rename replaces, which is what this mode asks for.
+        protocol_v3::RenameMode::Replace => fs::rename(&source, &destination),
+        protocol_v3::RenameMode::NoReplace => {
+            renameat_with(&source, &destination, RenameFlags::NOREPLACE)
+        }
+        protocol_v3::RenameMode::Exchange => {
+            renameat_with(&source, &destination, RenameFlags::EXCHANGE)
+        }
+    };
+    match result {
+        // EXDEV stays an error: a server-side copy would turn one atomic
+        // request into a long one that can half-succeed, and the client is the
+        // only party that can decide whether that trade is acceptable.
+        Err(error) => fs_io_error(related_id, &error, "rename"),
+        Ok(()) => mutated_reply(related_id, &destination, false, attr_mask),
+    }
+}
+
+/// `renameat2` on Linux, `renamex_np` on macOS, through rustix.
+fn renameat_with(source: &Path, destination: &Path, flags: RenameFlags) -> io::Result<()> {
+    rustix::fs::renameat_with(CWD, source, CWD, destination, flags).map_err(io::Error::from)
+}
+
+fn unlink_path(state: &FsSessionState, related_id: u64, path: &[u8]) -> V3Message {
+    let native = match mutation_path(state, path) {
+        Ok(native) => native,
+        Err(error) => return with_related(error, related_id),
+    };
+    // "Exactly one non-directory" is checked rather than left to the platform:
+    // Linux answers EISDIR for `unlink` on a directory and macOS answers
+    // EPERM, and a client cannot branch on a code that differs by host.
+    match fs::symlink_metadata(&native) {
+        Ok(metadata) if metadata.is_dir() => fs_error(
+            related_id,
+            FsErrorCode::IsDirectory,
+            "Unlink removes files; use Rmdir",
+        ),
+        Ok(_) => match fs::remove_file(&native) {
+            Ok(()) => V3Message::Done { related_id },
+            Err(error) => fs_io_error(related_id, &error, "unlink"),
+        },
+        Err(error) => fs_io_error(related_id, &error, "unlink"),
+    }
+}
+
+fn rmdir_path(state: &FsSessionState, related_id: u64, path: &[u8]) -> V3Message {
+    let native = match mutation_path(state, path) {
+        Ok(native) => native,
+        Err(error) => return with_related(error, related_id),
+    };
+    // The export root is not the client's to remove, and `remove_dir` on it
+    // would succeed if it happened to be empty.
+    if native == state.root {
+        return fs_error(
+            related_id,
+            FsErrorCode::Access,
+            "the export root cannot be removed",
+        );
+    }
+    // `remove_dir` is rmdir: it refuses a non-empty directory with ENOTEMPTY
+    // and a non-directory with ENOTDIR, which is exactly the contract.
+    match fs::remove_dir(&native) {
+        Ok(()) => V3Message::Done { related_id },
+        Err(error) => fs_io_error(related_id, &error, "rmdir"),
+    }
+}
+
+fn mkdir_path(
+    state: &FsSessionState,
+    related_id: u64,
+    path: &[u8],
+    mode: u32,
+    attr_mask: u32,
+) -> V3Message {
+    let native = match mutation_path(state, path) {
+        Ok(native) => native,
+        Err(error) => return with_related(error, related_id),
+    };
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    // One level, never `create_dir_all`: a client that asked for `a/b/c` and
+    // silently got `a` and `b` as well cannot tell what it made, and cannot
+    // undo it.
+    match builder.create(&native) {
+        Ok(()) => mutated_reply(related_id, &native, false, attr_mask),
+        Err(error) => fs_io_error(related_id, &error, "mkdir"),
+    }
+}
+
+fn symlink_path(
+    state: &FsSessionState,
+    related_id: u64,
+    target: &[u8],
+    path: &[u8],
+    attr_mask: u32,
+) -> V3Message {
+    let native = match mutation_path(state, path) {
+        Ok(native) => native,
+        Err(error) => return with_related(error, related_id),
+    };
+    // The *target* is not confined, and deliberately: a symlink's contents are
+    // opaque text, storing it resolves nothing, and every read through it goes
+    // back through `browse_stat_path`, which refuses to traverse a link out of
+    // the export. Rejecting targets here would forbid links the export itself
+    // may legitimately contain, while adding no protection the read path does
+    // not already give.
+    #[cfg(unix)]
+    let result = {
+        use std::os::unix::ffi::OsStrExt;
+        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), &native)
+    };
+    #[cfg(not(unix))]
+    let result = Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symlinks are not created on this platform",
+    ));
+    match result {
+        Ok(()) => mutated_reply(related_id, &native, false, attr_mask),
+        Err(error) => fs_io_error(related_id, &error, "symlink"),
+    }
+}
+
+fn link_paths(
+    state: &FsSessionState,
+    related_id: u64,
+    existing: &[u8],
+    path: &[u8],
+    attr_mask: u32,
+) -> V3Message {
+    let existing = match mutation_path(state, existing) {
+        Ok(native) => native,
+        Err(error) => return with_related(error, related_id),
+    };
+    let native = match mutation_path(state, path) {
+        Ok(native) => native,
+        Err(error) => return with_related(error, related_id),
+    };
+    match fs::hard_link(&existing, &native) {
+        Ok(()) => mutated_reply(related_id, &native, false, attr_mask),
+        Err(error) => fs_io_error(related_id, &error, "link"),
+    }
+}
+
+fn chown_target(
+    state: &FsSessionState,
+    related_id: u64,
+    target: &StatTarget,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    follow: bool,
+    attr_mask: u32,
+) -> V3Message {
+    let native = match mutation_target(state, target) {
+        Ok(native) => native,
+        Err(error) => return with_related(error, related_id),
+    };
+    #[cfg(unix)]
+    let result = if follow {
+        std::os::unix::fs::chown(&native, uid, gid)
+    } else {
+        std::os::unix::fs::lchown(&native, uid, gid)
+    };
+    #[cfg(not(unix))]
+    let result = {
+        let _ = (uid, gid, follow);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ownership is not settable on this platform",
+        ))
+    };
+    match result {
+        Ok(()) => mutated_reply(related_id, &native, follow, attr_mask),
+        Err(error) => fs_io_error(related_id, &error, "chown"),
+    }
+}
+
+fn set_times_target(
+    state: &FsSessionState,
+    related_id: u64,
+    target: &StatTarget,
+    atime: protocol_v3::TimeChange,
+    mtime: protocol_v3::TimeChange,
+    follow: bool,
+    attr_mask: u32,
+) -> V3Message {
+    use protocol_v3::TimeChange;
+
+    let native = match mutation_target(state, target) {
+        Ok(native) => native,
+        Err(error) => return with_related(error, related_id),
+    };
+    if matches!(atime, TimeChange::Omit) && matches!(mtime, TimeChange::Omit) {
+        // Both omitted is a no-op, not an error: it is what a client that
+        // wanted neither would send, and touching the file to answer it would
+        // be the one thing it asked us not to do.
+        return mutated_reply(related_id, &native, follow, attr_mask);
+    }
+
+    // `UTIME_NOW` is resolved here rather than by the client, because the
+    // client's clock is not the one this filesystem stamps with. One reading
+    // for both fields, so `atime` and `mtime` set to `Now` in one request
+    // cannot land a nanosecond apart.
+    let now = filetime::FileTime::now();
+    let existing = if follow {
+        fs::metadata(&native)
+    } else {
+        fs::symlink_metadata(&native)
+    };
+    let existing = match existing {
+        Ok(metadata) => metadata,
+        Err(error) => return fs_io_error(related_id, &error, "set times"),
+    };
+    // An omitted field is rewritten with what it already held. `utimensat`
+    // would leave it untouched; `filetime` sets both or one, and the one-field
+    // calls do not have a symlink form. Reading it back is a narrow race
+    // against another writer, and the alternative is refusing the request.
+    let resolve = |change: TimeChange, current: filetime::FileTime| match change {
+        TimeChange::Omit => current,
+        TimeChange::Now => now,
+        TimeChange::Set { seconds, nanos } => filetime::FileTime::from_unix_time(seconds, nanos),
+    };
+    let atime = resolve(atime, filetime::FileTime::from_last_access_time(&existing));
+    let mtime = resolve(
+        mtime,
+        filetime::FileTime::from_last_modification_time(&existing),
+    );
+
+    let result = if follow {
+        filetime::set_file_times(&native, atime, mtime)
+    } else {
+        filetime::set_symlink_file_times(&native, atime, mtime)
+    };
+    match result {
+        Ok(()) => mutated_reply(related_id, &native, follow, attr_mask),
+        Err(error) => fs_io_error(related_id, &error, "set times"),
+    }
+}
+
+fn set_permissions_target(
+    state: &FsSessionState,
+    related_id: u64,
+    target: &StatTarget,
+    mode: u32,
+    follow: bool,
+    attr_mask: u32,
+) -> V3Message {
+    let native = match mutation_target(state, target) {
+        Ok(native) => native,
+        Err(error) => return with_related(error, related_id),
+    };
+    if !follow {
+        // There is no portable `lchmod`, and Linux has no way to chmod a
+        // symlink at all. Following one silently would change the mode of
+        // whatever it points at, which is not what `follow: false` asked for.
+        match fs::symlink_metadata(&native) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return fs_error(
+                    related_id,
+                    FsErrorCode::NotSupported,
+                    "permissions cannot be set on a symlink itself",
+                )
+            }
+            Ok(_) => {}
+            Err(error) => return fs_io_error(related_id, &error, "set permissions"),
+        }
+    }
+    #[cfg(unix)]
+    let result = {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&native, fs::Permissions::from_mode(mode))
+    };
+    #[cfg(not(unix))]
+    let result = {
+        let _ = mode;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "permission bits are not settable on this platform",
+        ))
+    };
+    match result {
+        Ok(()) => mutated_reply(related_id, &native, follow, attr_mask),
+        Err(error) => fs_io_error(related_id, &error, "set permissions"),
+    }
 }
 
 fn fs_error(related_id: u64, code: FsErrorCode, message: &str) -> V3Message {
@@ -11027,8 +11487,34 @@ mod tests {
             | V3Message::WriteAck { related_id, .. }
             | V3Message::DirPage { related_id, .. }
             | V3Message::FsInfo { related_id, .. }
+            | V3Message::Mutated { related_id, .. }
             | V3Message::FeaturesAck { related_id, .. } => Some(*related_id),
-            _ => None,
+            // Listed rather than wildcarded: a response type added to the enum
+            // and missed here is invisible to `await_reply`, which then blocks
+            // forever on a reply the server did send. That cost an afternoon
+            // once.
+            V3Message::Cancel { .. }
+            | V3Message::Keepalive { .. }
+            | V3Message::KeepaliveAck { .. }
+            | V3Message::Features { .. }
+            | V3Message::Mount { .. }
+            | V3Message::Open { .. }
+            | V3Message::Close { .. }
+            | V3Message::Read { .. }
+            | V3Message::Write { .. }
+            | V3Message::Flush { .. }
+            | V3Message::Stat { .. }
+            | V3Message::ReadDir { .. }
+            | V3Message::StatFs
+            | V3Message::Rename { .. }
+            | V3Message::Unlink { .. }
+            | V3Message::Rmdir { .. }
+            | V3Message::Mkdir { .. }
+            | V3Message::Symlink { .. }
+            | V3Message::Link { .. }
+            | V3Message::Chown { .. }
+            | V3Message::SetTimes { .. }
+            | V3Message::SetPermissions { .. } => None,
         }
     }
 
@@ -11699,6 +12185,439 @@ mod tests {
         assert_eq!(fs::read(root.path().join("log")).unwrap(), b"start:onetwo");
     }
 
+    /// Send one mutation and return the reply, for the tests below.
+    fn mutate(session: &mut FsLiveSession, request: &V3Message) -> V3Message {
+        let id = session.send(request);
+        session.await_reply(id)
+    }
+
+    fn error_code(message: &V3Message) -> Option<FsErrorCode> {
+        match message {
+            V3Message::Error { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn fs_mkdir_creates_one_level_and_reports_the_new_directory() {
+        let root = tempdir().unwrap();
+        let mut session = FsLiveSession::start(Server::new(root.path()));
+
+        let reply = mutate(
+            &mut session,
+            &V3Message::Mkdir {
+                path: b"made".to_vec(),
+                mode: 0o755,
+                attr_mask: 0,
+            },
+        );
+        // The new attributes come back with the mutation, so a client does not
+        // need a follow-up Stat to learn the change cookie.
+        let V3Message::Mutated { attrs, .. } = reply else {
+            panic!("expected Mutated, got {reply:?}");
+        };
+        assert_eq!(attrs.kind, 2, "not a directory: {attrs:?}");
+
+        // One level only: `mkdir`, not `mkdir -p`.
+        let deep = mutate(
+            &mut session,
+            &V3Message::Mkdir {
+                path: b"a/b/c".to_vec(),
+                mode: 0o755,
+                attr_mask: 0,
+            },
+        );
+        assert_eq!(error_code(&deep), Some(FsErrorCode::NoEntry), "{deep:?}");
+        session.finish();
+
+        assert!(root.path().join("made").is_dir());
+        assert!(!root.path().join("a").exists());
+    }
+
+    #[test]
+    fn fs_rename_modes_differ_where_the_destination_exists() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("from"), b"source").unwrap();
+        fs::write(root.path().join("to"), b"destination").unwrap();
+        let mut session = FsLiveSession::start(Server::new(root.path()));
+
+        // NoReplace refuses rather than clobbering.
+        let refused = mutate(
+            &mut session,
+            &V3Message::Rename {
+                source: b"from".to_vec(),
+                destination: b"to".to_vec(),
+                mode: protocol_v3::RenameMode::NoReplace,
+                attr_mask: 0,
+            },
+        );
+        assert_eq!(
+            error_code(&refused),
+            Some(FsErrorCode::Exists),
+            "{refused:?}"
+        );
+        assert_eq!(fs::read(root.path().join("to")).unwrap(), b"destination");
+
+        // Exchange swaps them, leaving both paths present.
+        let swapped = mutate(
+            &mut session,
+            &V3Message::Rename {
+                source: b"from".to_vec(),
+                destination: b"to".to_vec(),
+                mode: protocol_v3::RenameMode::Exchange,
+                attr_mask: 0,
+            },
+        );
+        assert!(matches!(swapped, V3Message::Mutated { .. }), "{swapped:?}");
+        assert_eq!(fs::read(root.path().join("from")).unwrap(), b"destination");
+        assert_eq!(fs::read(root.path().join("to")).unwrap(), b"source");
+
+        // Replace overwrites and leaves only the destination.
+        let replaced = mutate(
+            &mut session,
+            &V3Message::Rename {
+                source: b"from".to_vec(),
+                destination: b"to".to_vec(),
+                mode: protocol_v3::RenameMode::Replace,
+                attr_mask: 0,
+            },
+        );
+        assert!(
+            matches!(replaced, V3Message::Mutated { .. }),
+            "{replaced:?}"
+        );
+        session.finish();
+
+        assert!(!root.path().join("from").exists());
+        assert_eq!(fs::read(root.path().join("to")).unwrap(), b"destination");
+    }
+
+    #[test]
+    fn fs_unlink_and_rmdir_each_refuse_the_other_kind() {
+        // Linux answers EISDIR for unlink on a directory and macOS answers
+        // EPERM. A client cannot branch on a code that differs by host, so the
+        // server decides before calling.
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("dir/inside"), b"x").unwrap();
+        fs::write(root.path().join("file"), b"x").unwrap();
+        let mut session = FsLiveSession::start(Server::new(root.path()));
+
+        let wrong_kind = mutate(
+            &mut session,
+            &V3Message::Unlink {
+                path: b"dir".to_vec(),
+            },
+        );
+        assert_eq!(
+            error_code(&wrong_kind),
+            Some(FsErrorCode::IsDirectory),
+            "{wrong_kind:?}"
+        );
+
+        let not_empty = mutate(
+            &mut session,
+            &V3Message::Rmdir {
+                path: b"dir".to_vec(),
+            },
+        );
+        assert_eq!(
+            error_code(&not_empty),
+            Some(FsErrorCode::NotEmpty),
+            "{not_empty:?}"
+        );
+
+        // The export root is not the client's to remove.
+        let root_removal = mutate(&mut session, &V3Message::Rmdir { path: Vec::new() });
+        assert_eq!(
+            error_code(&root_removal),
+            Some(FsErrorCode::Access),
+            "{root_removal:?}"
+        );
+
+        assert!(matches!(
+            mutate(
+                &mut session,
+                &V3Message::Unlink {
+                    path: b"file".to_vec()
+                }
+            ),
+            V3Message::Done { .. }
+        ));
+        assert!(matches!(
+            mutate(
+                &mut session,
+                &V3Message::Unlink {
+                    path: b"dir/inside".to_vec()
+                }
+            ),
+            V3Message::Done { .. }
+        ));
+        assert!(matches!(
+            mutate(
+                &mut session,
+                &V3Message::Rmdir {
+                    path: b"dir".to_vec()
+                }
+            ),
+            V3Message::Done { .. }
+        ));
+        session.finish();
+
+        assert!(!root.path().join("file").exists());
+        assert!(!root.path().join("dir").exists());
+    }
+
+    #[test]
+    fn fs_symlink_stores_its_target_verbatim_without_following_it() {
+        let root = tempdir().unwrap();
+        let mut session = FsLiveSession::start(Server::new(root.path()));
+
+        // A target pointing outside the export is stored, not resolved. Every
+        // read *through* it still goes back through the confinement check.
+        let reply = mutate(
+            &mut session,
+            &V3Message::Symlink {
+                target: b"../../etc/passwd".to_vec(),
+                path: b"escape".to_vec(),
+                attr_mask: protocol_v3::attr_presence::SYMLINK_TARGET,
+            },
+        );
+        let V3Message::Mutated { attrs, .. } = reply else {
+            panic!("expected Mutated, got {reply:?}");
+        };
+        assert_eq!(attrs.kind, 3, "not a symlink: {attrs:?}");
+        assert_eq!(
+            attrs.symlink_target.as_deref(),
+            Some(&b"../../etc/passwd"[..])
+        );
+
+        // And opening through it is refused, which is where confinement lives.
+        let id = session.send(&V3Message::Open {
+            path: b"escape".to_vec(),
+            flags: protocol_v3::open_flags::READ,
+            mode: 0,
+            attr_mask: 0,
+        });
+        assert!(
+            matches!(session.await_reply(id), V3Message::Error { .. }),
+            "reading through an escaping link was allowed"
+        );
+        session.finish();
+    }
+
+    #[test]
+    fn fs_set_times_omits_what_it_was_told_to_omit() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("file");
+        fs::write(&path, b"x").unwrap();
+        let mut session = FsLiveSession::start(Server::new(root.path()));
+
+        let before = fs::metadata(&path).unwrap();
+        let atime_before = filetime::FileTime::from_last_access_time(&before);
+
+        let reply = mutate(
+            &mut session,
+            &V3Message::SetTimes {
+                target: StatTarget::Path(b"file".to_vec()),
+                atime: protocol_v3::TimeChange::Omit,
+                mtime: protocol_v3::TimeChange::Set {
+                    seconds: 1_000_000,
+                    nanos: 0,
+                },
+                follow: true,
+                attr_mask: 0,
+            },
+        );
+        assert!(matches!(reply, V3Message::Mutated { .. }), "{reply:?}");
+        session.finish();
+
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(
+            filetime::FileTime::from_last_modification_time(&after).unix_seconds(),
+            1_000_000
+        );
+        assert_eq!(
+            filetime::FileTime::from_last_access_time(&after),
+            atime_before,
+            "an omitted timestamp was rewritten"
+        );
+    }
+
+    #[test]
+    fn fs_set_permissions_changes_the_mode_and_refuses_a_symlink_itself() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("file");
+        fs::write(&path, b"x").unwrap();
+        std::os::unix::fs::symlink("file", root.path().join("link")).unwrap();
+        let mut session = FsLiveSession::start(Server::new(root.path()));
+
+        let reply = mutate(
+            &mut session,
+            &V3Message::SetPermissions {
+                target: StatTarget::Path(b"file".to_vec()),
+                mode: 0o640,
+                follow: true,
+                attr_mask: 0,
+            },
+        );
+        assert!(matches!(reply, V3Message::Mutated { .. }), "{reply:?}");
+
+        // There is no portable lchmod, and following the link would change the
+        // mode of something the caller did not name.
+        let refused = mutate(
+            &mut session,
+            &V3Message::SetPermissions {
+                target: StatTarget::Path(b"link".to_vec()),
+                mode: 0o600,
+                follow: false,
+                attr_mask: 0,
+            },
+        );
+        assert_eq!(
+            error_code(&refused),
+            Some(FsErrorCode::NotSupported),
+            "{refused:?}"
+        );
+        session.finish();
+
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn fs_every_mutation_is_refused_on_a_read_only_mount_before_it_runs() {
+        // The AC's "before any syscall": the session thread answers EROFS
+        // without dispatching, so nothing below reaches the filesystem.
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"x").unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        let mut session = FsLiveSession::start(Server::new(root.path()).read_only(true));
+
+        let mutations = vec![
+            V3Message::Rename {
+                source: b"file".to_vec(),
+                destination: b"other".to_vec(),
+                mode: protocol_v3::RenameMode::Replace,
+                attr_mask: 0,
+            },
+            V3Message::Unlink {
+                path: b"file".to_vec(),
+            },
+            V3Message::Rmdir {
+                path: b"dir".to_vec(),
+            },
+            V3Message::Mkdir {
+                path: b"new".to_vec(),
+                mode: 0o755,
+                attr_mask: 0,
+            },
+            V3Message::Symlink {
+                target: b"file".to_vec(),
+                path: b"link".to_vec(),
+                attr_mask: 0,
+            },
+            V3Message::Link {
+                existing: b"file".to_vec(),
+                path: b"hard".to_vec(),
+                attr_mask: 0,
+            },
+            V3Message::Chown {
+                target: StatTarget::Path(b"file".to_vec()),
+                uid: Some(0),
+                gid: None,
+                follow: true,
+                attr_mask: 0,
+            },
+            V3Message::SetTimes {
+                target: StatTarget::Path(b"file".to_vec()),
+                atime: protocol_v3::TimeChange::Now,
+                mtime: protocol_v3::TimeChange::Now,
+                follow: true,
+                attr_mask: 0,
+            },
+            V3Message::SetPermissions {
+                target: StatTarget::Path(b"file".to_vec()),
+                mode: 0o777,
+                follow: true,
+                attr_mask: 0,
+            },
+        ];
+        // Every mutation the enum has, so a verb added without being added to
+        // `fs_is_write_class` fails here rather than reaching the filesystem.
+        assert_eq!(
+            mutations.len(),
+            9,
+            "a mutation was added without being covered here"
+        );
+        for request in &mutations {
+            let reply = mutate(&mut session, request);
+            assert_eq!(
+                error_code(&reply),
+                Some(FsErrorCode::ReadOnly),
+                "{request:?} was not refused: {reply:?}"
+            );
+        }
+        session.finish();
+
+        // Nothing happened.
+        assert!(root.path().join("file").exists());
+        assert!(root.path().join("dir").exists());
+        assert!(!root.path().join("new").exists());
+        assert!(!root.path().join("link").exists());
+        assert!(!root.path().join("hard").exists());
+    }
+
+    #[test]
+    fn fs_mutations_confine_both_of_their_paths() {
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"x").unwrap();
+        let mut session = FsLiveSession::start(Server::new(root.path()));
+
+        // A rename that only checked its source would let a client move a file
+        // anywhere the server process can write.
+        for request in [
+            V3Message::Rename {
+                source: b"file".to_vec(),
+                destination: b"../escaped".to_vec(),
+                mode: protocol_v3::RenameMode::Replace,
+                attr_mask: 0,
+            },
+            V3Message::Rename {
+                source: b"../../etc/passwd".to_vec(),
+                destination: b"stolen".to_vec(),
+                mode: protocol_v3::RenameMode::Replace,
+                attr_mask: 0,
+            },
+            V3Message::Link {
+                existing: b"../../etc/passwd".to_vec(),
+                path: b"stolen".to_vec(),
+                attr_mask: 0,
+            },
+            V3Message::Mkdir {
+                path: b"../escaped".to_vec(),
+                mode: 0o755,
+                attr_mask: 0,
+            },
+        ] {
+            let reply = mutate(&mut session, &request);
+            assert!(
+                matches!(reply, V3Message::Error { .. }),
+                "{request:?} escaped the export: {reply:?}"
+            );
+        }
+        session.finish();
+
+        assert!(root
+            .path()
+            .parent()
+            .is_some_and(|p| !p.join("escaped").exists()));
+        assert!(!root.path().join("stolen").exists());
+    }
+
     #[test]
     fn fs_interleaved_writes_on_two_handles_match_an_in_process_model() {
         use protocol_v3::open_flags;
@@ -12190,11 +13109,18 @@ mod tests {
                     self.signal.notify_all();
                     return V3Message::Done { related_id };
                 }
+                // Generous, because this is a deadlock guard rather than a
+                // deadline: it exists so a genuinely stuck pool fails instead
+                // of hanging the suite forever. Ten seconds was tight enough
+                // that heavy CPU contention — the whole workspace's tests at
+                // once — could keep the `fast` worker off a core for long
+                // enough to trip it, which failed the run for a reason that
+                // had nothing to do with ordering.
                 let (_guard, wait) = self
                     .signal
                     .wait_timeout_while(
                         self.fast_done.lock().unwrap(),
-                        std::time::Duration::from_secs(10),
+                        std::time::Duration::from_secs(60),
                         |done| !*done,
                     )
                     .unwrap();

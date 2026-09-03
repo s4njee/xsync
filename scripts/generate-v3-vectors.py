@@ -159,6 +159,50 @@ VALID: list[tuple[str, str, int, bytes, str]] = [
         'related_id=8, block_size=4096, total_bytes=1000, free_bytes=500, available_bytes=400, total_inodes=10, '
         'free_inodes=5, fs_type="apfs", max_name_len=255, case_sensitive=false, normalization=nfc, read_only=false',
     ),
+    # E5-S4 mutations (types 86-95).
+    ("rename-noreplace", "request", 86, blob(b"a") + blob(b"b") + u8(0) + u32(0), "source=[61], destination=[62], mode=0 (NOREPLACE), attr_mask=0"),
+    ("rename-exchange", "request", 86, blob(b"a") + blob(b"b") + u8(2) + u32(0x201), "source=[61], destination=[62], mode=2 (EXCHANGE), attr_mask=0x201 (OWNER|NAMES)"),
+    ("unlink", "request", 87, blob(b"a"), "path=[61]"),
+    ("rmdir", "request", 88, blob(b"d"), "path=[64]"),
+    ("mkdir", "request", 89, blob(b"d") + u32(0o755) + u32(0), "path=[64], mode=493, attr_mask=0"),
+    ("symlink-escaping-target", "request", 90, blob(b"../outside") + blob(b"l") + u32(0x80), "target=[2e2e2f6f757473696465] (stored verbatim, never resolved), path=[6c], attr_mask=0x80 (SYMLINK_TARGET)"),
+    ("link", "request", 91, blob(b"a") + blob(b"b") + u32(0), "existing=[61], path=[62], attr_mask=0"),
+    (
+        "chown-uid-only",
+        "request",
+        92,
+        u8(0) + blob(b"a") + u64(0) + boolean(True) + u32(1000) + boolean(False) + u32(0) + boolean(False) + u32(0),
+        "target=path, path=[61], handle=0, uid_present=true, uid=1000, gid_present=false, gid=0, follow=false, attr_mask=0",
+    ),
+    (
+        "set-times-omit-and-set",
+        "request",
+        93,
+        u8(1) + blob(b"") + u64(4) + u8(0) + i64(0) + u32(0) + u8(2) + i64(-1) + u32(999_999_999) + boolean(True) + u32(0),
+        "target=handle, path=[], handle=4, atime=OMIT, mtime=SET(-1s, 999999999ns), follow=true, attr_mask=0; "
+        "every TimeChange tag is the same width so the layout never depends on the value",
+    ),
+    (
+        "set-times-now",
+        "request",
+        93,
+        u8(0) + blob(b"a") + u64(0) + u8(1) + i64(0) + u32(0) + u8(1) + i64(0) + u32(0) + boolean(True) + u32(0),
+        "target=path, path=[61], handle=0, atime=NOW, mtime=NOW (resolved by the server, not the client), follow=true, attr_mask=0",
+    ),
+    (
+        "set-permissions",
+        "request",
+        94,
+        u8(0) + blob(b"a") + u64(0) + u32(0o640) + boolean(True) + u32(0),
+        "target=path, path=[61], handle=0, mode=416, follow=true, attr_mask=0",
+    ),
+    (
+        "mutated",
+        "response",
+        95,
+        u64(12) + attrs(2, 0o755, 0, 7, COOKIE(0x55)),
+        "related_id=12, attrs(presence=0, kind=2, mode=493, size=0, mtime_ns=7, cookie=[55;16])",
+    ),
     ("error-erofs", "response", 121, u64(9) + u16(3) + i32(30) + blob(b"read-only"), 'related_id=9, code=3 (EROFS), platform_errno=30, message="read-only"'),
     ("done", "response", 122, u64(9), "related_id=9"),
 ]
@@ -181,6 +225,25 @@ MALFORMED: list[tuple[str, int, bytes, str]] = [
     ("truncated-attrs", 57, u64(3) + u64(10) + u32(0) + u8(1), "truncated attrs"),
     ("stat-handle-with-path", 80, u8(1) + blob(b"a") + u64(10) + boolean(False) + u32(0), "stat target inconsistent"),
     ("readdir-zero-entries", 82, u64(11) + u64(0) + u32(0) + u32(0), "page size out of range"),
+    ("rename-unknown-mode", 86, blob(b"a") + blob(b"b") + u8(3) + u32(0), "invalid rename mode"),
+    (
+        "set-times-unknown-tag",
+        93,
+        u8(0) + blob(b"a") + u64(0) + u8(3) + i64(0) + u32(0) + u8(0) + i64(0) + u32(0) + boolean(True) + u32(0),
+        "invalid time change tag",
+    ),
+    (
+        "set-times-nanos-out-of-range",
+        93,
+        u8(0) + blob(b"a") + u64(0) + u8(2) + i64(0) + u32(1_000_000_000) + u8(0) + i64(0) + u32(0) + boolean(True) + u32(0),
+        "nanoseconds out of range",
+    ),
+    (
+        "chown-handle-with-path",
+        92,
+        u8(1) + blob(b"a") + u64(4) + boolean(False) + u32(0) + boolean(False) + u32(0) + boolean(False) + u32(0),
+        "stat target inconsistent",
+    ),
 ]
 
 

@@ -12,7 +12,8 @@ use std::thread;
 
 use tempfile::tempdir;
 use xsync_client::{
-    attr_presence, Access, Client, Error, ErrorCode, CREATE, DIRECTORY, READ, WRITE,
+    attr_presence, Access, Client, Error, ErrorCode, RenameMode, TimeChange, CREATE, DIRECTORY,
+    READ, WRITE,
 };
 use xsync_core::server::Server;
 
@@ -256,4 +257,169 @@ async fn a_dropped_connection_fails_waiting_requests_rather_than_hanging() {
     // Either the second mount was refused (the session mounts once) or the
     // connection had already gone; both are errors, neither is a hang.
     assert!(mount.is_err());
+}
+
+#[tokio::test]
+async fn the_mutation_set_works_end_to_end_over_a_real_socket() {
+    // One test walking the whole set, because the interesting thing is that
+    // they compose: make a directory, put something in it, move it, link it,
+    // stamp it, and take it all away again.
+    let root = tempdir().unwrap();
+    let address = serve(root.path().to_path_buf(), false);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+
+    let made = mount.mkdir(b"box", 0o755).await.expect("mkdir");
+    assert_eq!(made.kind, 2, "mkdir did not report a directory");
+
+    // `mkdir`, not `mkdir -p`: the parent has to exist.
+    let deep = mount.mkdir(b"absent/child", 0o755).await;
+    assert!(
+        matches!(
+            deep,
+            Err(Error::Server {
+                code: ErrorCode::NoEntry,
+                ..
+            })
+        ),
+        "{deep:?}"
+    );
+
+    for name in [&b"box/note.txt"[..], b"box/other.txt"] {
+        let file = mount
+            .open(name, READ | WRITE | CREATE)
+            .await
+            .expect("create");
+        file.write(0, b"hello").await.expect("write");
+        file.close().await.expect("close");
+    }
+
+    mount
+        .link(b"box/note.txt", b"box/hardlink")
+        .await
+        .expect("link");
+    mount
+        .symlink(b"note.txt", b"box/pointer")
+        .await
+        .expect("symlink");
+
+    // Renaming one hard link onto another is *not* a way to remove a name.
+    // POSIX says a rename whose two arguments resolve to the same file
+    // succeeds and does nothing, so both names survive — which is why the
+    // rename below uses a file with an inode of its own.
+    mount
+        .rename(b"box/note.txt", b"box/hardlink", RenameMode::Replace)
+        .await
+        .expect("same-inode rename is a successful no-op");
+    assert!(root.path().join("box/note.txt").exists());
+    assert!(root.path().join("box/hardlink").exists());
+
+    // NoReplace refuses an existing destination; Replace takes it.
+    let refused = mount
+        .rename(b"box/other.txt", b"box/note.txt", RenameMode::NoReplace)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Server {
+                code: ErrorCode::Exists,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    mount
+        .rename(b"box/other.txt", b"box/note.txt", RenameMode::Replace)
+        .await
+        .expect("rename replace");
+    assert!(!root.path().join("box/other.txt").exists());
+
+    let stamped = mount
+        .set_times(
+            b"box/note.txt",
+            TimeChange::Omit,
+            TimeChange::Set {
+                seconds: 1_000_000,
+                nanos: 0,
+            },
+            true,
+        )
+        .await
+        .expect("set times");
+    assert_eq!(stamped.mtime_ns, 1_000_000 * 1_000_000_000);
+
+    let moded = mount
+        .set_permissions(b"box/note.txt", 0o640, true)
+        .await
+        .expect("chmod");
+    assert_eq!(moded.mode & 0o777, 0o640);
+
+    // A directory with entries will not rmdir, and a directory will not unlink.
+    assert!(matches!(
+        mount.rmdir(b"box").await,
+        Err(Error::Server {
+            code: ErrorCode::NotEmpty,
+            ..
+        })
+    ));
+    assert!(matches!(
+        mount.unlink(b"box").await,
+        Err(Error::Server {
+            code: ErrorCode::IsDirectory,
+            ..
+        })
+    ));
+
+    for name in [&b"box/note.txt"[..], b"box/hardlink", b"box/pointer"] {
+        mount.unlink(name).await.expect("unlink");
+    }
+    mount.rmdir(b"box").await.expect("rmdir");
+    assert!(!root.path().join("box").exists());
+}
+
+/// Whether a call was refused because the mount is read-only.
+///
+/// Generic over the success type so the two removals, which answer nothing, go
+/// through the same check as the seven that answer with attributes.
+fn read_only<T>(result: &Result<T, Error>) -> bool {
+    matches!(
+        result,
+        Err(Error::Server {
+            code: ErrorCode::ReadOnly,
+            ..
+        })
+    )
+}
+
+#[tokio::test]
+async fn a_read_only_export_refuses_every_mutation() {
+    let root = tempdir().unwrap();
+    std::fs::write(root.path().join("file"), b"x").unwrap();
+    std::fs::create_dir(root.path().join("dir")).unwrap();
+    let address = serve(root.path().to_path_buf(), true);
+    let client = connect(&address).await;
+    let mount = client.mount(b"", Access::ReadWrite).await.expect("mount");
+    assert!(!mount.info().writable);
+
+    assert!(read_only(&mount.mkdir(b"new", 0o755).await));
+    assert!(read_only(&mount.unlink(b"file").await));
+    assert!(read_only(&mount.rmdir(b"dir").await));
+    assert!(read_only(&mount.symlink(b"file", b"link").await));
+    assert!(read_only(&mount.link(b"file", b"hard").await));
+    assert!(read_only(&mount.chown(b"file", Some(0), None, true).await));
+    assert!(read_only(
+        &mount
+            .set_times(b"file", TimeChange::Now, TimeChange::Now, true)
+            .await
+    ));
+    assert!(read_only(
+        &mount.set_permissions(b"file", 0o777, true).await
+    ));
+    assert!(read_only(
+        &mount.rename(b"file", b"other", RenameMode::Replace).await
+    ));
+
+    // Nothing happened.
+    assert!(root.path().join("file").exists());
+    assert!(!root.path().join("new").exists());
 }

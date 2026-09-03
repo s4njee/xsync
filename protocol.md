@@ -333,14 +333,47 @@ normal terminal response.
 | 83 | DirPage | related request ID `u64`, cursor `u64`, final-page boolean, count, entries |
 | 84 | StatFs | *(no fields)* |
 | 85 | FsInfo | related request ID `u64`, block size `u32`, total bytes `u64`, free bytes `u64`, available bytes `u64`, total inodes `u64`, free inodes `u64`, fs type UTF-8, max name length `u32`, case-sensitive boolean, normalization `u8`, read-only boolean |
+| 86 | Rename | source path, destination path, mode `u8` (0 `NOREPLACE`, 1 `REPLACE`, 2 `EXCHANGE`), attr mask `u32` |
+| 87 | Unlink | path |
+| 88 | Rmdir | path |
+| 89 | Mkdir | path, mode `u32`, attr mask `u32` |
+| 90 | Symlink | target, path, attr mask `u32` |
+| 91 | Link | existing path, new path, attr mask `u32` |
+| 92 | Chown | *stat target*, uid present boolean, uid `u32`, gid present boolean, gid `u32`, follow boolean, attr mask `u32` |
+| 93 | SetTimes | *stat target*, atime *time change*, mtime *time change*, follow boolean, attr mask `u32` |
+| 94 | SetPermissions | *stat target*, mode `u32`, follow boolean, attr mask `u32` |
+| 95 | Mutated | related request ID `u64`, attrs |
 | 121 | Error | related request ID `u64`, code `u16`, platform errno `i32`, UTF-8 message |
 | 122 | Done | related request ID `u64` |
 
+A *stat target* is the three fields `Stat` uses: tag `u8` (0 path, 1 handle),
+path, handle `u64`. Both fields are always present and the unused one must be
+zero or empty; a payload that fills both is rejected rather than resolved by
+preference.
+
+A *time change* is tag `u8` (0 `UTIME_OMIT`, 1 `UTIME_NOW`, 2 set), seconds
+`i64`, nanoseconds `u32` — **always all three**, whatever the tag, so the frame
+layout never depends on a value the peer chose. Nanoseconds must be less than
+1 000 000 000. `UTIME_NOW` is resolved by the server, whose clock is the one the
+filesystem stamps with.
+
+Types 86–94 are the mutations. Every one of them is refused with `EROFS` on a
+read-only mount before it reaches the filesystem. Those that leave something
+behind answer `Mutated` with the new attributes, so a client gets the fresh
+change cookie without a second round trip; `Unlink` and `Rmdir` answer `Done`,
+because there is nothing left to describe. `Rename` returns `EXDEV` across
+filesystems rather than falling back to a server-side copy: that would turn one
+atomic request into a long one that can half-succeed, and only the client can
+decide whether that is acceptable. A `Rename` whose two paths resolve to the
+same file succeeds and does nothing, as POSIX `rename` does.
+
 Reserved for later phases and never reused: 44–49 (authentication and export
 discovery), 52–55 (session resume, unmount, `MountChanged`), 64–69 (`SetSize`,
-`Allocate`, `Seek`, `Advise`, `HandleState`), 70–79 (staged uploads), 86–99
-(namespace mutations, `Access`, xattrs), 100–109 (locks and leases), 110–115
-(watches), 116–119 (compound), 120 (`Shutdown`).
+`Allocate`, `Seek`, `Advise`, `HandleState`), 70–79 (staged uploads), 96–99
+(`Access`/`AccessResult`, and two spare), 100–109 (locks and leases), 110–115
+(watches), 116–119 (compound), 120 (`Shutdown`), 123–127 (extended attributes —
+moved out of 86–99, which was assigned before anyone counted and holds four
+fewer types than the group needs).
 
 ### The attrs record
 
