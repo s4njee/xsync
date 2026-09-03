@@ -1606,6 +1606,12 @@ impl FsSessionState {
     fn release_handle(&self) {
         self.reserved_handles.fetch_sub(1, Ordering::AcqRel);
     }
+
+    /// Clone one handle out of the table, releasing the lock immediately: the
+    /// I/O that follows must not hold up an unrelated `Open` or `Close`.
+    fn handle(&self, id: u64) -> Option<Arc<OpenHandle>> {
+        self.handles.read().ok()?.get(&id).cloned()
+    }
 }
 
 /// One open file or directory.
@@ -1617,10 +1623,9 @@ struct OpenHandle {
     /// `FileExt`, which takes `&self`, so several workers can use one open
     /// file at once without a lock and without a shared seek offset.
     file: Option<fs::File>,
-    /// The flags it was opened with. Only recoverable here: `Read` must refuse
-    /// a handle opened write-only, and `Write` must know an `APPEND` handle
-    /// ignores its offset (E4-S2, E4-S3).
-    #[allow(dead_code, reason = "read by the E4-S2/E4-S3 handlers")]
+    /// The flags it was opened with. Only recoverable here: `Read` refuses a
+    /// handle opened write-only, and `Write` needs to know an `APPEND` handle
+    /// ignores its offset (E4-S3).
     flags: u32,
 }
 
@@ -1633,7 +1638,6 @@ impl FsSessionState {
 
     /// Whether this request was cancelled. A handler doing long work should
     /// poll this and stop early; a short one may ignore it.
-    #[allow(dead_code, reason = "polled by the E4/E5 handlers once they exist")]
     fn is_cancelled(&self, related_id: u64) -> bool {
         self.cancelled
             .lock()
@@ -1669,6 +1673,12 @@ impl FsHandler for ServerFsHandler {
                 attr_mask,
             } => open_handle(state, related_id, &path, flags, mode, attr_mask),
             V3Message::Close { handle } => close_handle(state, related_id, handle),
+            V3Message::Read {
+                handle,
+                offset,
+                length,
+                want_digest,
+            } => read_handle(state, related_id, handle, offset, length, want_digest),
             other => V3Message::Error {
                 related_id,
                 code: FsErrorCode::NotSupported,
@@ -2115,6 +2125,92 @@ fn open_handle(
     }
 }
 
+/// Positional read at `offset`, which is the offset in the file rather than a
+/// cursor: the platform primitives take `&self`, so several reads on one
+/// handle can be in flight at once with no shared seek position to race over.
+#[cfg(unix)]
+fn read_at(file: &fs::File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &fs::File, buffer: &mut [u8], offset: u64) -> io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+    file.seek_read(buffer, offset)
+}
+
+/// Read one byte range of an open file.
+fn read_handle(
+    state: &FsSessionState,
+    related_id: u64,
+    handle: u64,
+    offset: u64,
+    length: u32,
+    want_digest: bool,
+) -> V3Message {
+    use protocol_v3::open_flags;
+
+    let Some(open) = state.handle(handle) else {
+        return fs_error(related_id, FsErrorCode::BadHandle, "no such handle");
+    };
+    let Some(file) = open.file.as_ref() else {
+        return fs_error(
+            related_id,
+            FsErrorCode::IsDirectory,
+            "handle is a directory; use ReadDir",
+        );
+    };
+    if open.flags & open_flags::READ == 0 {
+        return fs_error(
+            related_id,
+            FsErrorCode::Access,
+            "handle was not opened for reading",
+        );
+    }
+    // The bound the mount advertised, not the envelope's: a client that
+    // ignores `max_read` gets a clear refusal rather than a larger allocation
+    // than the server offered.
+    if length > DEFAULT_FS_MAX_TRANSFER {
+        return fs_error(
+            related_id,
+            FsErrorCode::Invalid,
+            "read length exceeds the mount's max_read",
+        );
+    }
+
+    let mut data = vec![0_u8; length as usize];
+    let mut filled = 0_usize;
+    // `read_at` may return a short count for reasons other than end of file,
+    // so a short *response* is only honest once a read has actually returned
+    // zero. Looping here is what makes `eof` mean end of file.
+    while filled < data.len() {
+        if state.is_cancelled(related_id) {
+            return fs_error(related_id, FsErrorCode::Cancelled, "read cancelled");
+        }
+        match read_at(
+            file,
+            &mut data[filled..],
+            offset.saturating_add(filled as u64),
+        ) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return fs_io_error(related_id, &error, "read"),
+        }
+    }
+    let eof = filled < data.len();
+    data.truncate(filled);
+    let digest = want_digest.then(|| *blake3::hash(&data).as_bytes());
+    V3Message::ReadData {
+        related_id,
+        offset,
+        eof,
+        digest,
+        data,
+    }
+}
+
 /// Drop a handle. Closing one that is not open is this request's error, never
 /// the session's.
 fn close_handle(state: &FsSessionState, related_id: u64, handle: u64) -> V3Message {
@@ -2150,11 +2246,19 @@ fn fs_is_write_class(request: &V3Message) -> bool {
     }
 }
 
+/// How a request uses its handle's ordering domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandleKey {
+    handle: u64,
+    /// The request mutates the file, so it runs alone.
+    exclusive: bool,
+}
+
 /// One unit of work for the session's pool.
 struct FsJob {
     related_id: u64,
     /// The handle whose ordering domain this request belongs to, if any.
-    key: Option<u64>,
+    key: Option<HandleKey>,
     request: V3Message,
 }
 
@@ -2164,29 +2268,76 @@ enum FsEvent {
     Incoming(Result<Option<V3Frame>, V3CodecError>),
     Completed {
         related_id: u64,
-        key: Option<u64>,
+        key: Option<HandleKey>,
         response: V3Message,
     },
 }
 
-/// The ordering domain of a request.
+/// The ordering domain of a request, and whether it needs the domain to itself.
 ///
-/// Requests naming the same handle are applied in send order, so a `Write`
-/// followed by a `Read` on one handle observes the write. Everything else may
-/// execute concurrently and be answered out of order.
-fn fs_ordering_key(request: &V3Message) -> Option<u64> {
-    match request {
+/// Requests naming one handle are *applied* in send order, so a `Write`
+/// followed by a `Read` observes the write. Reads do not mutate and so cannot
+/// observe each other, which is why several of them may overlap without
+/// weakening that guarantee — and they must, because a streaming client keeps
+/// several 1 MiB reads outstanding on one file and serialising them would cost
+/// it a round trip per chunk.
+fn fs_ordering_key(request: &V3Message) -> Option<HandleKey> {
+    let (handle, exclusive) = match request {
         V3Message::Read { handle, .. }
-        | V3Message::Write { handle, .. }
-        | V3Message::Flush { handle }
-        | V3Message::Close { handle }
         | V3Message::ReadDir { handle, .. }
         | V3Message::Stat {
             target: StatTarget::Handle(handle),
             ..
-        } => Some(*handle),
-        _ => None,
+        } => (*handle, false),
+        V3Message::Write { handle, .. }
+        | V3Message::Flush { handle }
+        | V3Message::Close { handle } => (*handle, true),
+        _ => return None,
+    };
+    Some(HandleKey { handle, exclusive })
+}
+
+/// One handle's ordering domain: what is running on it and what is waiting.
+#[derive(Default)]
+struct HandleDomain {
+    /// Dispatched on this handle and not yet answered.
+    inflight: usize,
+    /// The in-flight request is exclusive, so nothing else may start.
+    exclusive: bool,
+    queue: VecDeque<FsJob>,
+}
+
+/// Start whatever the head of `handle`'s queue allows, returning the jobs to
+/// dispatch.
+///
+/// Shared requests start in a batch; an exclusive one waits for the batch to
+/// drain and then runs alone. The queue is strictly FIFO, so a `Write` behind
+/// a burst of reads is never starved by later reads jumping it.
+fn fs_pump_handle(domains: &mut HashMap<u64, HandleDomain>, handle: u64) -> Vec<FsJob> {
+    let mut ready = Vec::new();
+    let Some(domain) = domains.get_mut(&handle) else {
+        return ready;
+    };
+    while let Some(front) = domain.queue.front() {
+        let exclusive = front.key.is_some_and(|key| key.exclusive);
+        if domain.exclusive || (exclusive && domain.inflight > 0) {
+            break;
+        }
+        let job = domain
+            .queue
+            .pop_front()
+            .expect("front() just reported an entry");
+        domain.inflight += 1;
+        domain.exclusive = exclusive;
+        ready.push(job);
+        if exclusive {
+            break;
+        }
     }
+    if domain.inflight == 0 && domain.queue.is_empty() {
+        domains.remove(&handle);
+    }
+    ready
 }
 
 fn fs_error(related_id: u64, code: FsErrorCode, message: &str) -> V3Message {
@@ -2555,8 +2706,7 @@ impl Server {
         let mut negotiated_features: Option<u64> = None;
         let mut in_flight: usize = 0;
         let mut running: HashSet<u64> = HashSet::new();
-        let mut busy_handles: HashSet<u64> = HashSet::new();
-        let mut handle_queues: HashMap<u64, VecDeque<FsJob>> = HashMap::new();
+        let mut handle_domains: HashMap<u64, HandleDomain> = HashMap::new();
         // `None` until a `Mount` has answered; then the writability this
         // session was granted, with the reason a write is refused.
         let mut mount: Option<(bool, Vec<u8>)> = None;
@@ -2589,19 +2739,20 @@ impl Server {
                     write_v3(writer, self.next_id(), &response)?;
                     // Release this handle's ordering domain to the next
                     // request queued behind it, if any.
-                    if let Some(handle) = key {
-                        if let Some(next) =
-                            handle_queues.get_mut(&handle).and_then(VecDeque::pop_front)
-                        {
-                            running.insert(next.related_id);
-                            if work.send(next).is_err() {
+                    if let Some(key) = key {
+                        if let Some(domain) = handle_domains.get_mut(&key.handle) {
+                            domain.inflight -= 1;
+                            if domain.inflight == 0 {
+                                domain.exclusive = false;
+                            }
+                        }
+                        for job in fs_pump_handle(&mut handle_domains, key.handle) {
+                            running.insert(job.related_id);
+                            if work.send(job).is_err() {
                                 return Err(ServerError::UnexpectedMessage(
                                     "v3 worker pool stopped".to_owned(),
                                 ));
                             }
-                        } else {
-                            busy_handles.remove(&handle);
-                            handle_queues.remove(&handle);
                         }
                     }
                     continue;
@@ -2653,9 +2804,12 @@ impl Server {
                 }
                 // Likewise a cancel, which exists to overtake queued work.
                 (Some(_), V3Message::Cancel { related_id: target }) => {
-                    let queued = handle_queues.values_mut().find_map(|queue| {
-                        let position = queue.iter().position(|job| job.related_id == target)?;
-                        queue.remove(position)
+                    let queued = handle_domains.values_mut().find_map(|domain| {
+                        let position = domain
+                            .queue
+                            .iter()
+                            .position(|job| job.related_id == target)?;
+                        domain.queue.remove(position)
                     });
                     if queued.is_some() {
                         // Never started: this is the target's terminal response.
@@ -2767,28 +2921,25 @@ impl Server {
                         key,
                         request,
                     };
-                    match key {
-                        // This handle is already executing a request; hold this
-                        // one until that one answers, preserving send order.
-                        Some(handle) if busy_handles.contains(&handle) => {
-                            handle_queues.entry(handle).or_default().push_back(job);
-                        }
-                        Some(handle) => {
-                            busy_handles.insert(handle);
-                            running.insert(related_id);
-                            if work.send(job).is_err() {
-                                return Err(ServerError::UnexpectedMessage(
-                                    "v3 worker pool stopped".to_owned(),
-                                ));
-                            }
-                        }
-                        None => {
-                            running.insert(related_id);
-                            if work.send(job).is_err() {
-                                return Err(ServerError::UnexpectedMessage(
-                                    "v3 worker pool stopped".to_owned(),
-                                ));
-                            }
+                    // A keyed request always goes through its handle's queue,
+                    // even when the domain is idle, so send order is decided in
+                    // exactly one place.
+                    let ready = if let Some(key) = key {
+                        handle_domains
+                            .entry(key.handle)
+                            .or_default()
+                            .queue
+                            .push_back(job);
+                        fs_pump_handle(&mut handle_domains, key.handle)
+                    } else {
+                        vec![job]
+                    };
+                    for job in ready {
+                        running.insert(job.related_id);
+                        if work.send(job).is_err() {
+                            return Err(ServerError::UnexpectedMessage(
+                                "v3 worker pool stopped".to_owned(),
+                            ));
                         }
                     }
                 }
@@ -10602,6 +10753,235 @@ mod tests {
         }
     }
 
+    fn fs_read(handle: u64, offset: u64, length: u32, want_digest: bool) -> V3Message {
+        V3Message::Read {
+            handle,
+            offset,
+            length,
+            want_digest,
+        }
+    }
+
+    #[test]
+    fn fs_read_returns_the_requested_range_and_marks_end_of_file() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"0123456789").unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (3, fs_open(b"file", open_flags::READ, 0)),
+                // A range in the middle: neither at the start nor reaching EOF.
+                (4, fs_read(1, 2, 4, false)),
+                // Asking past the end returns what exists and says so.
+                (5, fs_read(1, 6, 100, false)),
+                // Starting at the end returns nothing, and still says so.
+                (6, fs_read(1, 10, 4, false)),
+            ],
+        );
+
+        let read = |id: u64| match fs_reply(&replies, id) {
+            V3Message::ReadData {
+                offset, eof, data, ..
+            } => (*offset, *eof, data.clone()),
+            other => panic!("request {id}: expected ReadData, got {other:?}"),
+        };
+        assert_eq!(read(4), (2, false, b"2345".to_vec()));
+        assert_eq!(read(5), (6, true, b"6789".to_vec()));
+        assert_eq!(read(6), (10, true, Vec::new()));
+    }
+
+    #[test]
+    fn fs_read_carries_a_digest_only_when_asked() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), b"hello").unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (3, fs_open(b"file", open_flags::READ, 0)),
+                (4, fs_read(1, 0, 5, true)),
+                (5, fs_read(1, 0, 5, false)),
+            ],
+        );
+
+        match fs_reply(&replies, 4) {
+            V3Message::ReadData { digest, data, .. } => {
+                assert_eq!(data, b"hello");
+                // The digest covers exactly the bytes returned, so a client can
+                // verify without knowing what it asked for.
+                assert_eq!(*digest, Some(*blake3::hash(b"hello").as_bytes()));
+            }
+            other => panic!("expected ReadData, got {other:?}"),
+        }
+        match fs_reply(&replies, 5) {
+            V3Message::ReadData { digest, .. } => assert_eq!(*digest, None),
+            other => panic!("expected ReadData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fs_read_refuses_a_bad_handle_a_directory_and_an_oversized_length() {
+        use protocol_v3::open_flags;
+
+        let root = tempdir().unwrap();
+        fs::create_dir(root.path().join("dir")).unwrap();
+        fs::write(root.path().join("file"), b"x").unwrap();
+
+        let replies = fs_run_serial(
+            root.path(),
+            &[
+                (
+                    3,
+                    fs_open(b"dir", open_flags::READ | open_flags::DIRECTORY, 0),
+                ),
+                // Handle 1 is the directory.
+                (4, fs_read(1, 0, 4, false)),
+                (5, fs_read(999, 0, 4, false)),
+                (6, fs_open(b"file", open_flags::WRITE, 0)),
+                // Handle 2 was opened write-only.
+                (7, fs_read(2, 0, 4, false)),
+                (8, fs_open(b"file", open_flags::READ, 0)),
+                // Handle 3 is readable, so the length is what is refused.
+                (9, fs_read(3, 0, DEFAULT_FS_MAX_TRANSFER + 1, false)),
+            ],
+        );
+
+        let code = |id: u64| match fs_reply(&replies, id) {
+            V3Message::Error { code, .. } => *code,
+            other => panic!("request {id}: expected Error, got {other:?}"),
+        };
+        assert_eq!(code(4), FsErrorCode::IsDirectory);
+        assert_eq!(code(5), FsErrorCode::BadHandle);
+        assert_eq!(code(7), FsErrorCode::Access);
+        // Above what the mount advertised as max_read, even though the
+        // envelope would carry it.
+        assert_eq!(code(9), FsErrorCode::Invalid);
+    }
+
+    #[test]
+    fn fs_reads_on_one_handle_run_concurrently() {
+        use protocol_v3::open_flags;
+
+        // Eight outstanding reads on one file is the streaming case, and the
+        // point of letting reads share their handle's ordering domain. The
+        // probe only releases when eight are inside it at once, so this fails
+        // if reads on one handle are serialised.
+        let root = tempdir().unwrap();
+        fs::write(root.path().join("file"), vec![7_u8; 4096]).unwrap();
+
+        let mut requests = vec![(3, fs_open(b"file", open_flags::READ, 0))];
+        for index in 0..8 {
+            requests.push((index + 4, fs_read(1, index * 512, 512, false)));
+        }
+
+        let root_path = root.path().to_path_buf();
+        let mut server = Server::new(&root_path).with_fs_limits(32, 8);
+        // Opens must still complete, so only reads park in the probe.
+        struct ReadProbe(Arc<ConcurrencyProbe>);
+        impl FsHandler for ReadProbe {
+            fn handle(
+                &self,
+                state: &FsSessionState,
+                related_id: u64,
+                request: V3Message,
+            ) -> V3Message {
+                if matches!(request, V3Message::Read { .. }) {
+                    return self.0.handle(state, related_id, request);
+                }
+                ServerFsHandler.handle(state, related_id, request)
+            }
+        }
+        server.fs_handler = Arc::new(ReadProbe(ConcurrencyProbe::new(8)));
+
+        let replies = fs_run_server(server, &requests);
+        for id in 4..12_u64 {
+            assert_eq!(
+                *fs_reply(&replies, id),
+                V3Message::Done { related_id: id },
+                "read {id} did not run concurrently with the others"
+            );
+        }
+    }
+
+    #[test]
+    fn fs_a_write_class_request_still_waits_for_the_reads_before_it() {
+        // Reads share the domain, but a Flush must not overtake them and must
+        // not start while any is still running: that is the ordering guarantee
+        // sharing is not allowed to weaken.
+        struct OrderRecorder {
+            seen: Mutex<Vec<&'static str>>,
+            inside_reads: Mutex<usize>,
+        }
+        impl FsHandler for OrderRecorder {
+            fn handle(
+                &self,
+                _state: &FsSessionState,
+                related_id: u64,
+                request: V3Message,
+            ) -> V3Message {
+                match request {
+                    V3Message::Read { .. } => {
+                        *self.inside_reads.lock().unwrap() += 1;
+                        self.seen.lock().unwrap().push("read");
+                        thread::sleep(std::time::Duration::from_millis(120));
+                        *self.inside_reads.lock().unwrap() -= 1;
+                        V3Message::Done { related_id }
+                    }
+                    V3Message::Flush { .. } => {
+                        let overlapped = *self.inside_reads.lock().unwrap() > 0;
+                        self.seen.lock().unwrap().push("flush");
+                        if overlapped {
+                            return fs_error(
+                                related_id,
+                                FsErrorCode::Busy,
+                                "flush ran while a read was still in flight",
+                            );
+                        }
+                        V3Message::Done { related_id }
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+
+        let root = tempdir().unwrap();
+        let recorder = Arc::new(OrderRecorder {
+            seen: Mutex::new(Vec::new()),
+            inside_reads: Mutex::new(0),
+        });
+        let mut server = Server::new(root.path()).with_fs_limits(16, 8);
+        server.fs_handler = Arc::clone(&recorder) as Arc<dyn FsHandler>;
+
+        let replies = fs_run_server(
+            server,
+            &[
+                (3, fs_read(1, 0, 16, false)),
+                (4, fs_read(1, 16, 16, false)),
+                (5, V3Message::Flush { handle: 1 }),
+                (6, fs_read(1, 32, 16, false)),
+            ],
+        );
+
+        for id in [3_u64, 4, 5, 6] {
+            assert_eq!(
+                *fs_reply(&replies, id),
+                V3Message::Done { related_id: id },
+                "{:?}",
+                fs_reply(&replies, id)
+            );
+        }
+        // The flush sits between the two batches of reads, never inside one.
+        assert_eq!(
+            *recorder.seen.lock().unwrap(),
+            vec!["read", "read", "flush", "read"]
+        );
+    }
+
     #[test]
     fn fs_session_executes_independent_requests_concurrently() {
         // 64 requests issued without awaiting, against a pool of 8. The probe
@@ -10683,7 +11063,7 @@ mod tests {
     }
 
     #[test]
-    fn fs_session_serialises_requests_on_one_handle() {
+    fn fs_session_serialises_write_class_requests_on_one_handle() {
         /// Records arrival order and fails loudly if a second request on the
         /// same handle is dispatched while the first is still running.
         struct HandleOrderProbe {
@@ -10721,16 +11101,14 @@ mod tests {
         let probe = Arc::new(HandleOrderProbe {
             arrivals: Mutex::new(Vec::new()),
         });
-        let read = |offset: u64| V3Message::Read {
-            handle: 1,
-            offset,
-            length: 4096,
-            want_digest: false,
-        };
+        // Flush is write-class, so it takes its handle's domain exclusively.
+        // Reads deliberately do *not* serialise (see
+        // `fs_reads_on_one_handle_run_concurrently`).
+        let flush = || V3Message::Flush { handle: 1 };
         let replies = fs_run_with_handler(
             Arc::clone(&probe) as Arc<dyn FsHandler>,
             (8, 8),
-            &[(3, read(0)), (4, read(1)), (5, read(2))],
+            &[(3, flush()), (4, flush()), (5, flush())],
         );
 
         // Same handle, so send order is preserved end to end even though the
@@ -10828,18 +11206,15 @@ mod tests {
         let probe = Arc::new(SlowFirst {
             seen: Mutex::new(Vec::new()),
         });
-        let read = |offset: u64| V3Message::Read {
-            handle: 1,
-            offset,
-            length: 4096,
-            want_digest: false,
-        };
+        // Write-class, so the second genuinely waits behind the first and is
+        // still queued when the cancel arrives.
+        let flush = || V3Message::Flush { handle: 1 };
         let replies = fs_run_with_handler(
             Arc::clone(&probe) as Arc<dyn FsHandler>,
             (8, 8),
             &[
-                (3, read(0)),
-                (4, read(1)),
+                (3, flush()),
+                (4, flush()),
                 (5, V3Message::Cancel { related_id: 4 }),
             ],
         );

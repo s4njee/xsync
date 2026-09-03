@@ -31,7 +31,8 @@ compatibility-matrix row and the f2/Kestrel consumer decision.
 | 1 | E3-S1 — Concurrent requests | **Done** 2026-09-03 |
 | 1 | E1-S4 — Mount and advertised writability (Phase 1 scope) | **Done** 2026-09-03 |
 | 1 | E4-S1 — Open and close handles | **Done** 2026-09-03 |
-| 1 | E4-S2 / E4-S3 — Positional read and write | Next |
+| 1 | E4-S2 — Positional read (server side) | **Done** 2026-09-03 |
+| 1 | E4-S3 — Positional write and flush | Next |
 | 1 | E4-S8, E5-S1–S3, E9-S1/S4/S6, E10-S1/S4 | Not started |
 | 2–6 | everything else | Not started |
 
@@ -687,20 +688,69 @@ As a client I can open a file and hold a handle across many operations.
 - The `Arc<OpenHandle>` clone-and-release pattern is the one to keep: it is what lets
   the pool stay concurrent once handlers actually block on I/O.
 
-#### X3-E4-S2 — Positional read
+#### X3-E4-S2 — Positional read — **Done (server side)**
+
+*Landed 2026-09-03 on xsync branch `v3`.*
+
 As a client I can read any byte range of an open file, with pipelining.
 
 **AC**
-- `Read(handle, offset, length, want_digest)` → one `ReadData(related, offset, data,
+- [x] `Read(handle, offset, length, want_digest)` → one `ReadData(related, offset, data,
   digest?)` response; `length ≤ max_read` negotiated at `Mount` (default 1 MiB, cap
   8 MiB to match `MAX_DATA_SEGMENT`); a short read is legal only at EOF and is marked
   `eof = true`.
-- When `want_digest` is set the response carries BLAKE3 of `data`; the client
-  library verifies before delivering.
-- Reads on different handles, or non-overlapping reads on one handle, run
+- [x] When `want_digest` is set the response carries BLAKE3 of `data`. *(The client
+  library that verifies before delivering is E9-S1; the server side is done.)*
+- [x] Reads on different handles, or non-overlapping reads on one handle, run
   concurrently on the server.
-- Benchmark (E8-S3): 8 outstanding 1 MiB reads saturate 1 GbE from a warm page
-  cache on the Mac→mars route the existing harness uses.
+- [ ] Benchmark (E8-S3): 8 outstanding 1 MiB reads saturate 1 GbE from a warm page
+  cache. **Deferred** to E8-S3 with the rest of the performance gates, which need the
+  harness extended; nothing here is measured against a wire yet.
+
+**Results**
+
+- **This story changed E3-S1's ordering model, and had to.** E3-S1 serialised every
+  request naming a handle, which would have made eight outstanding reads on one file
+  run one at a time — exactly the streaming case this story exists for, and the case
+  Excalibur's video preview depends on. Per-handle ordering only needs to bind where
+  one operation can observe another, and reads cannot observe reads.
+- Each handle now has a `HandleDomain`: a FIFO queue plus a count of what is in
+  flight. `Read`, `ReadDir` and a handle `Stat` are *shared* and start as a batch;
+  `Write`, `Flush` and `Close` are *exclusive*, wait for the batch to drain, and run
+  alone. The queue stays strictly FIFO, so a `Write` behind a burst of reads is not
+  starved by later reads jumping it. `fs_ordering_key` is the one place that says
+  which class a request is in.
+- The observable guarantee is unchanged, and there is a test for exactly that: reads,
+  a flush, then a read, with a handler that fails the test if the flush ever runs
+  while a read is in flight. It also asserts the flush lands *between* the two
+  batches rather than being reordered around them.
+- Two older tests had encoded the stricter behaviour — one asserted reads serialise,
+  one relied on a second read queueing behind the first. Both now use `Flush`, which
+  is genuinely exclusive. They were testing the implementation rather than the
+  contract, and the contract is what changed.
+- `read_at` loops until the buffer fills or a read returns zero, because the platform
+  call may return short for reasons other than end of file. That loop is what makes
+  `eof` mean end of file rather than "the server felt like stopping".
+- `Read` refuses before touching the file: an unknown handle is `EBADF`, a directory
+  handle `EISDIR`, a write-only handle `EACCES`, and a length above the mount's
+  advertised `max_read` is `EINVAL` even though the envelope would carry up to 8 MiB.
+- Cancellation is polled inside the read loop, so a large read can be abandoned
+  part-way rather than only between requests.
+- `FsSessionState::handle` clones the `Arc` out and drops the table lock before any
+  I/O, so a slow read never blocks an unrelated `Open` or `Close`.
+- Five new tests: ranges and end-of-file (mid-file, past the end, and starting at the
+  end), the digest present only when asked, the four refusals, eight concurrent reads
+  on one handle, and the write-class ordering barrier.
+
+**Next steps**
+
+- **E4-S3 (`Write`)** is the other half and now has everything it needs: the
+  exclusive class is already enforced, `OpenHandle` already carries the flags
+  `APPEND` handling needs, and `write_at` mirrors `read_at`.
+- **E9-S1** owns the client-side digest verification this story's `want_digest`
+  exists for; until then nothing checks it on receipt.
+- **E8-S3** should measure before `DEFAULT_FS_MAX_TRANSFER` (1 MiB) or the pool size
+  is tuned; both are currently reasoned guesses.
 
 #### X3-E4-S3 — Positional write and flush
 As a client I can write at an offset and know when the bytes are durable.
@@ -1232,7 +1282,7 @@ method list to be revised against what the GUI actually needs once M1 is running
 
 | Phase | Stories | Unlocks |
 |---|---|---|
-| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, **E4-S2–S3 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
+| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, ~~E4-S2~~, **E4-S3 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
 | **2. Daemon, TLS, identity** | E1-S1–S3, E1-S5, E2-S1, E2-S3–S5, E10-S2, E10-S6, E12-S1–S3 | Connect without SSH; exports; principals; the "New Connection" dialog's xsync tab is complete. |
 | **3. Durability and coherence** | E3-S2, E3-S3, E3-S5, E4-S6, E4-S7, E6-S1, E6-S4, E6-S5, E5-S4, E5-S7 | Resumable uploads that survive drops; locks for edit-in-place; complete mutation set. |
 | **4. Live views and speed** | E7, E6-S2, E8-S1–S5, E5-S2 cursor fix, E5-S5, E4-S4, E4-S5 | Auto-refreshing listings, leases, compound open-read, sparse. |

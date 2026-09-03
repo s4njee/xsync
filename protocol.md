@@ -444,6 +444,14 @@ asked for it.
   order; requests on different handles or paths have no ordering guarantee and
   the server may answer them out of order (responses correlate by related
   request ID).
+- "Applied in send order" binds only where an operation can observe another.
+  `Read`, `ReadDir` and a handle `Stat` do not mutate and so cannot observe
+  each other: a server may run several of them on one handle at once, which is
+  what lets a client keep a window of reads outstanding on a single file
+  instead of paying a round trip per chunk. `Write`, `Flush` and `Close` take
+  the handle to themselves — they wait for the requests sent before them to
+  finish, and the requests sent after them wait in turn. The queue stays FIFO,
+  so a `Write` behind a burst of reads is not starved by later ones.
 - `Open` answers `Opened` with the handle and the target's attributes, so an
   open needs no follow-up `Stat`. A directory must be opened with `DIRECTORY`,
   and a directory opened without it is `EISDIR` rather than a handle no read or
@@ -467,8 +475,14 @@ asked for it.
   response (`ECANCELED`); on one already executing it is advisory, and the
   request's own terminal response is the only answer the client receives, so a
   request is never answered twice.
-- `Read.length` is `1..=max read`. `ReadData.data` is at most 8 MiB; a short
-  read is legal only with `eof=true`. `Write.data` is `1..=max write`. When a
+- `Read` requires a handle opened with `READ`; one opened write-only is
+  `EACCES` and a directory handle is `EISDIR` (use `ReadDir`). `Read.length` is
+  `1..=max read`, and a length above the `max read` the mount advertised is
+  `EINVAL` even though the envelope could carry it. `ReadData.data` is at most
+  8 MiB; a short read is legal only with `eof=true`, and `eof` means the server
+  reached end of file rather than that it chose to return less — a short read
+  for any other reason is not permitted. `ReadData.offset` echoes the request,
+  so a client matching responses needs only the id. `Write.data` is `1..=max write`. When a
   digest is present it is BLAKE3 of `data`; a `Write` whose digest does not
   match is refused with code `23 EINTEGRITY` and nothing is written.
 - `WriteAck.stable` is true only when the bytes are already durable (export

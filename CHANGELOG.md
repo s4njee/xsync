@@ -10,6 +10,11 @@ one end of a transfer actually has.
 ## [Unreleased]
 
 ### Added
+- Protocol v3 `Read`: positional reads of an open file, optionally carrying a
+  BLAKE3 digest of the bytes returned. Reads on one handle now run
+  concurrently — they cannot observe each other, and serialising them would
+  cost a streaming client a round trip per chunk — while `Write`, `Flush` and
+  `Close` still take the handle exclusively and in send order.
 - Protocol v3 `Open`/`Close`: a session holds a bounded table of open file and
   directory handles. `Open` answers with the handle plus the attributes the
   request's `attr_mask` asked for, including an opaque change cookie, so an open
