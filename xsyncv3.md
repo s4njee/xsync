@@ -891,11 +891,10 @@ As an editor I can save a file back only if nobody else changed it.
   only, hidden — for Windows/macOS hidden bit parity). *(The record and its filling
   landed with E4-S1; this story added the `Stat` that asks for one. `flags` is
   carried but never set — the platform bits need per-OS work nothing needs yet.)*
-- [ ] Optional `owner_name`/`group_name` resolved server-side. **Deferred:**
-  `getpwuid`/`getgrgid` are FFI, and the workspace denies `unsafe_code` with one
-  documented exception. The block stays absent and the server does not advertise
-  `OWNER_NAMES`, so a client knows not to ask. Revisit with a vetted dependency if a
-  UI actually needs names.
+- [ ] Optional `owner_name`/`group_name` resolved server-side. **Deferred to E5-S1b**,
+  no longer for lint reasons: Decision 9 (§7) now permits the FFI. The block stays
+  absent and the server does not advertise `OWNER_NAMES`, so a client knows not to
+  ask. Waiting on a consumer that wants names rather than on permission to write it.
 - [x] `Stat(path, follow: bool)` = `stat`/`lstat`; `Stat(handle)` = `fstat`.
 - [x] Vectors cover every optional field present/absent. *(Frozen with the Phase 1
   table: `opened-minimal-attrs` has `presence=0`, `attrs-symlink-with-owner` carries
@@ -926,9 +925,15 @@ As an editor I can save a file back only if nobody else changed it.
 **AC**
 - Resolve `uid`/`gid` to names when the `names` mask bit is set, and advertise the
   `OWNER_NAMES` feature so a client knows it can ask.
-- No `unsafe` in this workspace: either a vetted dependency or an out-of-process
-  lookup.
+- Prefer a vetted crate (`nix`/`rustix` wrap `getpwuid_r` safely); hand-written FFI is
+  permitted under Decision 9 (§7) if none is adequate, confined to one module with a
+  `// SAFETY:` note per block.
 - A name that cannot be resolved leaves the block absent rather than inventing one.
+
+**No longer blocked.** This was carved out of E5-S1 because `getpwuid_r` is FFI and the
+workspace denied `unsafe_code` outright. Decision 9 reversed that: a feature should not
+disappear because of a lint. Schedulable whenever a consumer wants owner names —
+Excalibur's list has no owner column, so nothing waits on it today.
 
 #### X3-E5-S2 — Directory reading with attributes and stable cursors — **Done**
 
@@ -1292,7 +1297,9 @@ As an editor I can save a file back only if nobody else changed it.
 - Every path operation is confined to the export root (existing rule) and every
   handle operation is validated against the handle table, never by re-walking a
   path; `openat`-relative operations from a root descriptor on Unix; `RESOLVE_BENEATH`
-  where available.
+  where available. *(These are FFI. Decision 9 (§7) permits it here: confinement is
+  the last thing that should be weakened to satisfy a lint. Try `cap-std` or `rustix`
+  first — both wrap `openat` and `RESOLVE_BENEATH` safely.)*
 - `Rename`/`Link` refuse to move a file across export roots even when both are on
   one filesystem.
 
@@ -1544,6 +1551,37 @@ method list to be revised against what the GUI actually needs once M1 is running
    land without renumbering anything.
 4. **Phase 1 frames are uncompressed.** The envelope's zstd flag is reserved for
    E8-S4; a compressed v3 frame is rejected today.
+
+### Taken 2026-09-03, after Phase 1
+
+9. **`unsafe` FFI is permitted where no adequate safe crate exists.** The workspace
+   lint `unsafe_code = "deny"` stays the default and the presumption, but it is no
+   longer treated as absolute. Three Phase 1 stories bent around it and each paid a
+   different price: E1-S4 probes writability by creating a temp file instead of
+   calling `access`/`statvfs`; E5-S3 took a dependency (`fs4`) to reach `statvfs`;
+   E5-S1b (owner names, needing `getpwuid_r`) was carved out and deferred outright.
+   That third outcome is the one that made this a bad rule to hold absolutely: a
+   feature disappeared because of a lint, not because of a judgement about the
+   feature.
+
+   The order of preference is unchanged — a safe crate first, a vetted FFI crate
+   (`rustix`, `nix`, `cap-std`) second, hand-written `unsafe` last. What changes is
+   that the last option now exists. Where it is used:
+
+   - the `unsafe` is confined to one module with `#![allow(unsafe_code)]` on that
+     module alone, never on the crate or the workspace;
+   - every `unsafe` block carries a `// SAFETY:` comment stating the invariant it
+     relies on and why it holds;
+   - the safe wrapper around it is what the rest of the tree sees, and it is tested
+     including its error paths;
+   - `docs/supply-chain.md` records it, the same way a new dependency is recorded.
+
+   The immediate consequences: **E10-S1** can be written as specified —
+   `openat`-relative operations from a root descriptor and `RESOLVE_BENEATH` are FFI
+   and have no adequate safe equivalent, and confinement is exactly the kind of
+   security property that should not be weakened to satisfy a lint. **E5-S1b** is
+   unblocked and can leave the parking lot. **E5-S3**'s unknown inode counts and
+   `fs_type` can be filled in.
 
 ### Still open
 
