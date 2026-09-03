@@ -10,6 +10,12 @@ one end of a transfer actually has.
 ## [Unreleased]
 
 ### Added
+- `xsync-client`: `Client::from_split` drives a session over separate read and
+  write halves, which is what a child process and an SSH channel both are.
+  `Mount::open` now sends `0o666` before umask when the flags create a file;
+  it sent `0`, which the server took literally and produced a file the caller
+  could not then read. Both found by Excalibur's backend, the crate's first
+  consumer.
 - New crate `xsync-client`: an async client for the v3 filesystem protocol.
   Multiplexes requests over one connection, verifies read digests before handing
   bytes over, and exposes mount, stat, statfs, open, read, write, flush, close

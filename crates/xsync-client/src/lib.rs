@@ -302,6 +302,23 @@ impl Client {
         Self::start(reader, writer, requested_features).await
     }
 
+    /// Drive a session over separate read and write halves.
+    ///
+    /// The transports that matter are already split: a child process has a
+    /// stdout and a stdin, an SSH channel has two halves. [`Self::from_stream`]
+    /// is the convenience for the case where they are one object.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_stream`].
+    pub async fn from_split<R, W>(reader: R, writer: W, requested_features: u64) -> Result<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::start(reader, writer, requested_features).await
+    }
+
     /// Start `xs --server` on a remote host over SSH and speak v3 to it.
     ///
     /// `rsh` overrides the remote shell, as `xs -e` does; `None` uses `ssh`.
@@ -627,12 +644,18 @@ impl Mount {
 
     /// Open a file or directory.
     ///
+    /// When `flags` creates the file, its mode is `0o666` before the server's
+    /// umask, which is what an ordinary `open(2)` call passes. Sending `0`
+    /// would be taken literally and create a file nobody can read — including
+    /// the caller that just made it.
+    ///
     /// # Errors
     ///
     /// Fails when the path cannot be opened as asked, or the mount is not
     /// writable and `flags` would write.
     pub async fn open(&self, path: &[u8], flags: OpenFlags) -> Result<OpenFile> {
-        self.open_with(path, flags, 0, 0).await
+        let mode = if flags & CREATE == 0 { 0 } else { 0o666 };
+        self.open_with(path, flags, mode, 0).await
     }
 
     /// As [`Self::open`], with a creation mode and the attributes to return.
