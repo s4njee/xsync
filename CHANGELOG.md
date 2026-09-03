@@ -10,6 +10,11 @@ one end of a transfer actually has.
 ## [Unreleased]
 
 ### Added
+- Protocol v3 `StatFs`: capacity and filesystem facts for the mounted export.
+  Adds a dependency on `fs4` for free/available/total space, because this
+  workspace denies `unsafe_code` and `statvfs` is otherwise unreachable; inode
+  counts and the filesystem type name are reported as unknown rather than
+  guessed. See `docs/supply-chain.md`.
 - Protocol v3 `Stat` and `ReadDir`: attributes for a path (`stat` or `lstat`) or
   an open handle, and paged directory listings carrying each entry's attributes
   in the same round trip. Paging is a position in a snapshot taken at the first

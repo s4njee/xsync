@@ -16,26 +16,39 @@ dependency tree is visible as a diff rather than discovered during a release.
 
 ## Licence audit
 
-Audited 2026-08-26 across 115 dependencies with `--all-features`. Every licence
-in the tree is permissive and compatible with the declared `MIT OR Apache-2.0`.
+Re-audited 2026-09-03 across 135 packages with `--all-features` (the four
+workspace members included). Every licence in the tree is permissive and
+compatible with the declared `MIT OR Apache-2.0`. The previous audit, on
+2026-08-26, saw 115.
 
 | Count | Licence expression |
 |------:|---|
-| 82 | `MIT OR Apache-2.0` |
-| 9 | `MIT` |
+| 96 | `MIT OR Apache-2.0` |
+| 11 | `MIT` |
+| 7 | `Apache-2.0 OR MIT` |
 | 6 | `MIT/Apache-2.0` |
 | 5 | `Unlicense OR MIT` |
-| 5 | `Apache-2.0 OR MIT` |
 | 2 | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` |
 | 2 | `Unlicense/MIT` |
+| 1 | `(MIT OR Apache-2.0) AND Unicode-3.0` |
 | 1 | `CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception` |
 | 1 | `CC0-1.0 OR MIT-0 OR Apache-2.0` |
 | 1 | `MIT OR Apache-2.0 OR LGPL-2.1-or-later` |
-| 1 | `(MIT OR Apache-2.0) AND Unicode-3.0` |
+| 1 | `MIT OR Apache-2.0 OR Zlib` |
+| 1 | `Zlib OR Apache-2.0 OR MIT` |
+
+`Zlib` appears as one option in two dual/triple licences; the build takes an
+allowed option in both, so it is not added to `deny.toml`'s allow list.
 
 There is no copyleft-only dependency. The single crate offering
 `LGPL-2.1-or-later` offers it as one option among three; the build takes its MIT
 option, so no LGPL obligation attaches.
+
+## Direct dependencies added since the previous audit
+
+| Crate | Added by | Why, and what was considered |
+|---|---|---|
+| `fs4` 1.1.0 | `xsyncv3.md` E5-S3 (`StatFs`) | Free, available and total space for the mounted export. The workspace denies `unsafe_code`, so `statvfs` and `GetDiskFreeSpaceEx` are unreachable directly, and capacity is a stated requirement of the client this serves. `fs4` is the maintained successor to `fs2`, is `MIT OR Apache-2.0`, and its default feature set is `sync` only — no async runtime enters the tree. It does not expose inode counts or the filesystem type name, which is why `FsInfo` reports those as unknown rather than guessing. |
 
 ## Accepted findings
 

@@ -35,8 +35,9 @@ compatibility-matrix row and the f2/Kestrel consumer decision.
 | 1 | E4-S3 — Positional write and flush (server side) | **Done** 2026-09-03 |
 | 1 | E5-S1 — Full attributes (except owner names) | **Done** 2026-09-03 |
 | 1 | E5-S2 — Directory reading and cursors | **Done** 2026-09-03 |
-| 1 | E5-S3 — Capacity and filesystem facts | Next |
-| 1 | E4-S8, E5-S1b, E9-S1/S4/S6, E10-S1/S4 | Not started |
+| 1 | E5-S3 — Capacity and filesystem facts | **Done** 2026-09-03 |
+| 1 | E9-S1 — `xsync-client` async crate | Next |
+| 1 | E4-S8, E5-S1b, E9-S4/S6, E10-S1/S4 | Not started |
 | 2–6 | everything else | Not started |
 
 All of the above is on xsync branch `v3`, **uncommitted**. §0 below still describes the
@@ -977,13 +978,54 @@ As an editor I can save a file back only if nobody else changed it.
   millions-of-small-files corpora this project benchmarks, but a directory large
   enough to matter would want a streaming cursor; worth revisiting only with a case.
 
-#### X3-E5-S3 — Capacity and filesystem facts
+#### X3-E5-S3 — Capacity and filesystem facts — **Done (except inodes and fs type)**
+
+*Landed 2026-09-03 on xsync branch `v3`.*
+
 **AC**
-- `StatFs(export)` → `block_size`, `total_bytes`, `free_bytes`, `available_bytes`
-  (to this identity, honouring quotas where the OS exposes them), `total_inodes`,
-  `free_inodes`, `fs_type` string, `max_name_len`, `case_sensitive`, `normalization`,
-  `read_only` (the *filesystem*, distinct from the export's `ro`).
-- Excalibur's "2.4 TB free of 16 TB" reads `available_bytes` / `total_bytes`.
+- [x] `StatFs(export)` → `block_size`, `total_bytes`, `free_bytes`, `available_bytes`
+  (to this identity), `max_name_len`, `case_sensitive`, `normalization`, `read_only`
+  (the *filesystem*, distinct from the export's `ro`).
+- [ ] `total_inodes`, `free_inodes`, `fs_type`. **Not available without FFI:** no safe
+  wrapper exposes `statvfs`'s `f_files`/`f_ffree` or the filesystem's type name. They
+  are reported as `0` and empty, which the frozen contract already defines as
+  unknown, and `protocol.md` now says a client must render a mount without them.
+- [x] Excalibur's "2.4 TB free of 16 TB" reads `available_bytes` / `total_bytes`.
+
+**Results**
+
+- **A dependency, deliberately.** Capacity is a stated requirement of the client this
+  serves, and `statvfs` is FFI in a workspace that denies `unsafe_code`. `fs4` is the
+  maintained successor to `fs2`, is `MIT OR Apache-2.0`, and its default feature set
+  is `sync` only, so no async runtime enters the tree. `docs/supply-chain.md` now
+  records the addition, the reasoning and a re-audited licence table (135 packages,
+  up from 115 in August); `cargo deny check` passes all four gates.
+- `available_bytes` is what a capacity display should show: it excludes the root-only
+  reserve that `free_bytes` includes. Asserted as `available ≤ free ≤ total` rather
+  than pinned to values that depend on the machine.
+- **The write barrier became a typed enum.** A `&'static str` was enough while only
+  `MountInfo.reason` read it, but `FsInfo.read_only` asks about the *filesystem* and
+  `MountInfo.access` about the export — the same probe, two different questions. A
+  test asserts a `ro` export over a writable filesystem reports `read_only = false`,
+  which the string version could only have got right by accident.
+- Facts that cost a probe (case sensitivity, normalization, name limit, whether the
+  filesystem is read-only) are computed once at `Mount` into a `OnceLock` and reused.
+  `StatFs` must not re-probe: the probe writes a file, and a status bar may ask often.
+- A test asserts `FsInfo` and `MountInfo` agree on the fields they share, since they
+  describe one filesystem and disagreeing would be a bug a client cannot work around.
+- **Every Phase 1 request verb now has a handler.** The pooled handler's fallback arm
+  is reachable only by a frame that is not a request — a response type sent the wrong
+  way, or a type from a later phase — so its message and its test now say that
+  instead of "not implemented".
+
+**Next steps**
+
+- **E9-S1 (the client crate)** is the remaining Phase 1 blocker for Excalibur; the
+  server surface it needs is now complete.
+- Inode counts and `fs_type` want the same answer as E5-S1b's owner names: a vetted
+  dependency or an out-of-process lookup. Worth doing together if either is needed.
+- **E8-S5** should measure `StatFs`; a status bar polling it must not cost a probe,
+  which is why the facts are cached.
 
 #### X3-E5-S4 — Complete mutation set
 **AC**
@@ -1406,7 +1448,7 @@ method list to be revised against what the GUI actually needs once M1 is running
 
 | Phase | Stories | Unlocks |
 |---|---|---|
-| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, ~~E4-S2~~, ~~E4-S3~~, ~~E5-S1~~, ~~E5-S2~~, **E5-S3 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
+| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, ~~E4-S1~~, ~~E4-S2~~, ~~E4-S3~~, ~~E5-S1~~, ~~E5-S2~~, ~~E5-S3~~, **E9-S1 next**, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
 | **2. Daemon, TLS, identity** | E1-S1–S3, E1-S5, E2-S1, E2-S3–S5, E10-S2, E10-S6, E12-S1–S3 | Connect without SSH; exports; principals; the "New Connection" dialog's xsync tab is complete. |
 | **3. Durability and coherence** | E3-S2, E3-S3, E3-S5, E4-S6, E4-S7, E6-S1, E6-S4, E6-S5, E5-S4, E5-S7 | Resumable uploads that survive drops; locks for edit-in-place; complete mutation set. |
 | **4. Live views and speed** | E7, E6-S2, E8-S1–S5, E5-S2 cursor fix, E5-S5, E4-S4, E4-S5 | Auto-refreshing listings, leases, compound open-read, sparse. |

@@ -26,6 +26,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1581,6 +1582,10 @@ struct FsSessionState {
     handles: RwLock<HashMap<u64, Arc<OpenHandle>>>,
     /// Never reused within a session, and never `0`.
     next_handle: AtomicU64,
+    /// Facts about the export that cost a probe, computed once at mount.
+    /// `StatFs` answers from these rather than probing again, because the
+    /// probe writes a file and a status bar may ask often.
+    facts: OnceLock<MountFacts>,
     /// Reserved handle slots: incremented *before* an open starts and released
     /// if it fails. Reading the table's length instead would let every worker
     /// see room at once and overshoot the cap by the width of the pool.
@@ -1678,7 +1683,9 @@ trait FsHandler: Send + Sync {
 ///
 /// `Mount` is not here: it is session setup, answered on the session thread
 /// (like the `Features` exchange) because every other verb's admissibility
-/// depends on its answer. The rest answer `EOPNOTSUPP` until E4 and E5 land.
+/// depends on its answer. Every other Phase 1 request has a handler, so the
+/// fallback arm is reached only by a frame that is not a request — a response
+/// type sent the wrong way, or a type from a later phase.
 struct ServerFsHandler;
 
 impl FsHandler for ServerFsHandler {
@@ -1715,18 +1722,62 @@ impl FsHandler for ServerFsHandler {
                 max_entries,
                 attr_mask,
             } => read_dir_handle(state, related_id, handle, cursor, max_entries, attr_mask),
+            V3Message::StatFs => stat_fs(state, related_id),
             other => V3Message::Error {
                 related_id,
                 code: FsErrorCode::NotSupported,
                 platform_errno: 0,
                 message: format!(
-                    "v3 message type {} is negotiated but not implemented by this build",
+                    "v3 message type {} is not a request this server handles",
                     protocol_v3::message_type(&other)
                 )
                 .into_bytes(),
             },
         }
     }
+}
+
+/// Why a session may not write.
+///
+/// A string was enough while only `MountInfo.reason` consumed it, but
+/// `FsInfo.read_only` describes the *filesystem* and `MountInfo.access` the
+/// export, and those are different questions with the same answer here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteBarrier {
+    /// The operator configured the export read-only.
+    ExportReadOnly,
+    /// The filesystem itself is mounted read-only.
+    FilesystemReadOnly,
+    /// This identity may not write in the export root.
+    NoPermission,
+    /// The root refused a write for some other reason.
+    Unwritable,
+}
+
+impl WriteBarrier {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::ExportReadOnly => "export is read-only",
+            Self::FilesystemReadOnly => "filesystem is mounted read-only",
+            Self::NoPermission => "no write permission on the export root",
+            Self::Unwritable => "the export root does not accept writes",
+        }
+    }
+
+    const fn is_filesystem(self) -> bool {
+        matches!(self, Self::FilesystemReadOnly)
+    }
+}
+
+/// Facts about an export that cost a probe to learn.
+#[derive(Debug, Clone, Copy)]
+struct MountFacts {
+    case_sensitive: bool,
+    normalization: protocol_v3::Normalization,
+    max_name_len: u32,
+    /// The filesystem is read-only, as distinct from the export being
+    /// configured `ro`.
+    filesystem_read_only: bool,
 }
 
 /// Why this session may not write, or `None` when it may.
@@ -1739,20 +1790,20 @@ impl FsHandler for ServerFsHandler {
 /// same unique-prefix discipline, so this adds no new class of side effect.
 ///
 /// It is deliberately not a per-path evaluation; that is `Access` (E5-S7).
-fn write_barrier(state: &FsSessionState) -> Option<&'static str> {
+fn write_barrier(state: &FsSessionState) -> Option<WriteBarrier> {
     if state.read_only {
-        return Some("export is read-only");
+        return Some(WriteBarrier::ExportReadOnly);
     }
     match tempfile::Builder::new()
         .prefix(".xsync-write-probe-")
         .tempfile_in(&state.root)
     {
         Ok(_probe) => None,
-        Err(error) if is_read_only_filesystem(&error) => Some("filesystem is mounted read-only"),
+        Err(error) if is_read_only_filesystem(&error) => Some(WriteBarrier::FilesystemReadOnly),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-            Some("no write permission on the export root")
+            Some(WriteBarrier::NoPermission)
         }
-        Err(_) => Some("the export root does not accept writes"),
+        Err(_) => Some(WriteBarrier::Unwritable),
     }
 }
 
@@ -1830,7 +1881,7 @@ fn mount_info(
     let reason = if effective_writable {
         Vec::new()
     } else if let Some(barrier) = barrier {
-        barrier.as_bytes().to_vec()
+        barrier.reason().as_bytes().to_vec()
     } else {
         // Nothing stops a write; the client simply asked for a read-only mount.
         b"mounted read-only at the client's request".to_vec()
@@ -1848,6 +1899,15 @@ fn mount_info(
         supports |= protocol_v3::supports::NORMALIZATION_INSENSITIVE;
     }
     let (max_name_len, max_path_len) = name_and_path_limits();
+    let normalization = protocol_v3::Normalization::None;
+    // Cached for `StatFs`, which answers the same questions and must not run
+    // the probe again on every call.
+    let _ = state.facts.set(MountFacts {
+        case_sensitive: !semantics.case_insensitive,
+        normalization,
+        max_name_len,
+        filesystem_read_only: barrier.is_some_and(WriteBarrier::is_filesystem),
+    });
 
     V3Message::MountInfo {
         related_id,
@@ -1863,7 +1923,7 @@ fn mount_info(
         // name it is given, and the probe cannot observe a filesystem that
         // does, so claiming NFC or NFD here would be a guess. Whether two
         // forms collide is reported through `supports` instead.
-        normalization: protocol_v3::Normalization::None,
+        normalization,
         max_name_len,
         max_path_len,
         supports,
@@ -2424,6 +2484,47 @@ fn stat_target(
     }
 }
 
+/// Capacity and filesystem facts for the mounted export.
+fn stat_fs(state: &FsSessionState, related_id: u64) -> V3Message {
+    let Some(facts) = state.facts.get() else {
+        return fs_error(
+            related_id,
+            FsErrorCode::Invalid,
+            "session is not mounted; send Mount and await MountInfo first",
+        );
+    };
+    let usage = match fs4::statvfs(&state.root) {
+        Ok(usage) => usage,
+        Err(error) => return fs_io_error(related_id, &error, "statfs"),
+    };
+    let block_size = match u32::try_from(usage.allocation_granularity()) {
+        Ok(0) | Err(_) => 4096,
+        Ok(size) => size,
+    };
+    V3Message::FsInfo {
+        related_id,
+        block_size,
+        total_bytes: usage.total_space(),
+        free_bytes: usage.free_space(),
+        // What this identity may actually use, which is what a capacity
+        // display should show: it excludes the reserve root-only space that
+        // `free_bytes` includes.
+        available_bytes: usage.available_space(),
+        // Inode accounting and the filesystem's type name need `statvfs`
+        // fields no safe wrapper exposes. `0` and an empty name are the
+        // contract's "unknown" rather than a guess.
+        total_inodes: 0,
+        free_inodes: 0,
+        fs_type: Vec::new(),
+        max_name_len: facts.max_name_len,
+        case_sensitive: facts.case_sensitive,
+        normalization: facts.normalization,
+        // The filesystem, not the export: a writable filesystem behind a
+        // `ro` export reports `false` here and `ro` in `MountInfo`.
+        read_only: facts.filesystem_read_only,
+    }
+}
+
 /// One page of a directory handle's listing.
 fn read_dir_handle(
     state: &FsSessionState,
@@ -2962,6 +3063,7 @@ impl Server {
             root: self.root.clone(),
             read_only: self.fs_read_only,
             cancelled: Mutex::new(HashSet::new()),
+            facts: OnceLock::new(),
             handles: RwLock::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             reserved_handles: AtomicU64::new(0),
@@ -10192,7 +10294,11 @@ mod tests {
                 ),
                 (3, V3Message::Keepalive { nonce: 7 }),
                 (4, fs_mount()),
-                (5, V3Message::StatFs),
+                // A response type sent as a request. Every Phase 1 request now
+                // has a handler, so this is what the fallback arm is for, and
+                // it must still be a per-request error rather than a dead
+                // session.
+                (5, V3Message::Done { related_id: 0 }),
             ],
         );
 
@@ -10216,8 +10322,6 @@ mod tests {
         );
         assert_eq!(replies[1].message, V3Message::KeepaliveAck { nonce: 7 });
         assert!(matches!(replies[2].message, V3Message::MountInfo { .. }));
-        // A verb whose handler has not landed yet is a per-request error, not
-        // a dead session.
         match &replies[3].message {
             V3Message::Error {
                 related_id, code, ..
@@ -11963,6 +12067,77 @@ mod tests {
             paged < single * 5 + std::time::Duration::from_millis(250),
             "paging looks quadratic: {paged:?} in pages of 256 against {single:?} in one page"
         );
+    }
+
+    #[test]
+    fn fs_statfs_reports_capacity_and_the_filesystem_facts() {
+        let root = tempdir().unwrap();
+        let replies = fs_run_serial(root.path(), &[(3, V3Message::StatFs)]);
+
+        let V3Message::FsInfo {
+            related_id,
+            block_size,
+            total_bytes,
+            free_bytes,
+            available_bytes,
+            fs_type,
+            max_name_len,
+            case_sensitive,
+            read_only,
+            total_inodes,
+            free_inodes,
+            ..
+        } = fs_reply(&replies, 3)
+        else {
+            panic!("expected FsInfo, got {:?}", fs_reply(&replies, 3))
+        };
+        assert_eq!(*related_id, 3);
+        assert!(*block_size > 0);
+        assert!(*total_bytes > 0, "a real filesystem has a size");
+        // What a capacity display shows. Available excludes the root-only
+        // reserve that free includes, so it cannot exceed it.
+        assert!(*available_bytes <= *free_bytes);
+        assert!(*free_bytes <= *total_bytes);
+        assert!(*max_name_len > 0);
+        // A temp dir is writable, so the *filesystem* is not read-only even
+        // though an export over it might be.
+        assert!(!*read_only);
+        // Documented as unknown rather than guessed.
+        assert_eq!(*total_inodes, 0);
+        assert_eq!(*free_inodes, 0);
+        assert!(fs_type.is_empty());
+
+        // The same facts the mount reported, not a second probe's answer.
+        let mount = fs_mount_facts(Server::new(root.path()), fs_mount());
+        let V3Message::MountInfo {
+            case_sensitive: mount_case,
+            max_name_len: mount_name_len,
+            ..
+        } = mount
+        else {
+            panic!("expected MountInfo")
+        };
+        assert_eq!(*case_sensitive, mount_case);
+        assert_eq!(*max_name_len, mount_name_len);
+    }
+
+    #[test]
+    fn fs_statfs_separates_a_read_only_export_from_a_read_only_filesystem() {
+        // The export is configured `ro`; the filesystem underneath is not.
+        // MountInfo must say the session cannot write, and FsInfo must not
+        // blame the filesystem for it.
+        let root = tempdir().unwrap();
+        let replies = fs_run_server(
+            Server::new(root.path()).read_only(true),
+            &[(3, V3Message::StatFs)],
+        );
+        match fs_reply(&replies, 3) {
+            V3Message::FsInfo { read_only, .. } => assert!(
+                !*read_only,
+                "a `ro` export must not report its filesystem as read-only"
+            ),
+            other => panic!("expected FsInfo, got {other:?}"),
+        }
     }
 
     #[test]

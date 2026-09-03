@@ -531,8 +531,17 @@ asked for it.
   never missed; a name that has disappeared by the time its page is built is
   left out rather than failing the page.
 - `FsInfo.read_only` describes the filesystem, distinct from the export's
-  access. `fs type` is UTF-8 of at most 256 bytes. Inode counts of `0` mean
-  unknown.
+  access: a writable filesystem behind a `ro` export reports `false` here and
+  `ro` in `MountInfo`. `fs type` is UTF-8 of at most 256 bytes, and empty means
+  the server does not know it. Inode counts of `0` mean unknown. A server
+  reports unknown rather than guessing, so a client must be able to display a
+  mount whose inode counts and filesystem name it never learns.
+- `free bytes` counts every free byte; `available bytes` counts what this
+  identity may actually use, which on most Unix filesystems is smaller because
+  of the root-only reserve. A capacity display wants `available`. `FsInfo`
+  repeats `max name len`, `case sensitive` and `normalization` from `MountInfo`
+  and must agree with it: they describe the same filesystem and a server
+  answers both from one probe.
 - `Error.code` is frozen: `1 ENOENT`, `2 EACCES`, `3 EROFS`, `4 EEXIST`,
   `5 ENOTEMPTY`, `6 EISDIR`, `7 ENOTDIR`, `8 EXDEV`, `9 ESTALE`, `10 ENOSPC`,
   `11 EDQUOT`, `12 ENAMETOOLONG`, `13 ELOOP`, `14 EBUSY`, `15 EWOULDBLOCK`,

@@ -19,6 +19,11 @@ workspace = true
 blake3 = { version = "1", features = ["prefer_intrinsics"] }
 crossbeam-channel = "0.5"
 filetime = "0.2"
+# Free/total/available space without FFI. The workspace denies `unsafe_code`,
+# and `statvfs`/`GetDiskFreeSpaceEx` are the only other way to answer `StatFs`
+# (`xsyncv3.md` E5-S3). Default features are `sync` only, so no async runtime
+# comes with it.
+fs4 = "1"
 fslock = "0.2"
 globset = "0.4"
 ignore = "0.4"
