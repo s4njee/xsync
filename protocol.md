@@ -415,11 +415,21 @@ asked for it.
 - `MountInfo.effective_writable` is the single source of truth for whether the
   session may write. `reason` is required (non-empty) when it is false and must
   be empty when it is true; `access=1` with `effective_writable=true` is a
-  protocol error. `supports` bits (`1 XATTRS`, `2 SYMLINKS`, `4 HARDLINKS`,
-  `8 LOCKS`, `16 LEASES`, `32 NOTIFY`, `64 NOTIFY_POLLING`, `128 SPARSE`)
-  describe the filesystem and unknown bits are preserved. `max read` and
-  `max write` are in `1..=8 MiB` and bound `Read.length` and `Write.data`.
-  Cache hints of `0` mean "no hint".
+  protocol error. `access` is what the export grants and `effective_writable`
+  is what this session got, so a client asking for `ro` on a `rw` export sees
+  `access=0` with `effective_writable=false` and a reason saying so.
+  `supports` bits (`1 XATTRS`, `2 SYMLINKS`, `4 HARDLINKS`, `8 LOCKS`,
+  `16 LEASES`, `32 NOTIFY`, `64 NOTIFY_POLLING`, `128 SPARSE`,
+  `256 CASE_INSENSITIVE`, `512 NORMALIZATION_INSENSITIVE`) are set only when
+  the filesystem can do the thing **and** this server exposes it, so a bit is a
+  promise a client may act on rather than a description of the volume. Unknown
+  bits are preserved. `max read` and `max write` are in `1..=8 MiB` and bound
+  `Read.length` and `Write.data`. Cache hints of `0` mean "no hint".
+- `normalization` is the form the filesystem *applies* to a name it is given.
+  Whether it can tell two canonically-equivalent forms apart is the separate
+  `NORMALIZATION_INSENSITIVE` bit, because a filesystem may preserve what it is
+  given and still fold the two for comparison, as APFS does. Neither field
+  implies the other, and a client that writes names needs the bit.
 - `Open.flags` bits: `1 READ`, `2 WRITE`, `4 CREATE`, `8 EXCL`, `16 TRUNC`,
   `32 APPEND`, `64 NOFOLLOW`, `128 DIRECTORY`. Any other bit is a protocol
   error, as is: no `READ`, `WRITE` or `DIRECTORY`; `CREATE`, `EXCL`, `TRUNC` or
@@ -483,7 +493,16 @@ asked for it.
   above plus types 18–20. A v1 or v2 frame after a v3 selection, or a v3 frame
   after a v1 or v2 selection, is a protocol error.
 - The client sends `Features` immediately after selection and `Mount` after
-  `FeaturesAck`; every other request requires a completed `Mount`.
+  `FeaturesAck`; every other request requires a completed `Mount` and is
+  answered `EINVAL` before one. A session mounts once; a second `Mount` is
+  `EINVAL`. Because the mount answers whether the session may write at all, a
+  server answers it before it begins serving anything else rather than
+  concurrently with it.
+- On a mount whose `effective_writable` is false, every write-class request --
+  `Write`, and `Open` carrying `WRITE`, `CREATE`, `EXCL`, `TRUNC` or `APPEND` --
+  is refused with `EROFS` before the filesystem is touched, and the refusal
+  carries the mount's own `reason`, so a client shows one explanation
+  everywhere. Such a refusal is an expected answer, not a server fault.
 - Errors are per-request and do not terminate the session unless the error is a
   framing, bounds, duplicate-ID or other protocol error.
 - Byte-exact vectors live in `protocol-v3-vectors/`; the codec is

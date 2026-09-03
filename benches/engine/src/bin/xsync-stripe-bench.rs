@@ -85,7 +85,7 @@ const LARGE_SIZES_MIB: [u64; 3] = [4, 16, 64];
 fn main() -> Result<(), BenchError> {
     let cli = Cli::parse();
     if let Some(root) = &cli.server {
-        xsync_core::server::run_server_stdio(root.clone()).map_err(BenchError::Transfer)?;
+        xsync_core::server::run_server_stdio(root.clone(), false).map_err(BenchError::Transfer)?;
         return Ok(());
     }
     if cli.repetitions == 0 {

@@ -215,6 +215,19 @@ pub mod supports {
     pub const NOTIFY_POLLING: u64 = 1 << 6;
     /// Sparse-aware allocation and seek.
     pub const SPARSE: u64 = 1 << 7;
+    /// Names differing only by case are the same file (APFS, NTFS).
+    ///
+    /// Distinct from `MountInfo.case_sensitive`, which is the same fact; this
+    /// bit exists so the pair below can be reported together.
+    pub const CASE_INSENSITIVE: u64 = 1 << 8;
+    /// Canonically-equivalent Unicode forms are the same file.
+    ///
+    /// `MountInfo.normalization` says which form the filesystem *applies*;
+    /// this says whether it can tell two forms apart, which is the question a
+    /// client writing names actually has. A filesystem may preserve what it is
+    /// given (applying nothing) and still fold the two for comparison, so
+    /// neither field implies the other.
+    pub const NORMALIZATION_INSENSITIVE: u64 = 1 << 9;
 }
 
 /// `Features` bitmap: optional v3 message groups. The negotiated set is the

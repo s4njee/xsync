@@ -1557,8 +1557,9 @@ fn publish_error_response(related_id: u64, error: &str) -> V2Message {
 /// export root and the set of cancelled requests.
 struct FsSessionState {
     /// Export root every path in the session resolves below.
-    #[allow(dead_code, reason = "read by the E1-S4/E4/E5 handlers once they exist")]
     root: PathBuf,
+    /// The operator asked for a read-only export (`xs --server --read-only`).
+    read_only: bool,
     cancelled: Mutex<HashSet<u64>>,
 }
 
@@ -1590,10 +1591,14 @@ trait FsHandler: Send + Sync {
     fn handle(&self, state: &FsSessionState, related_id: u64, request: V3Message) -> V3Message;
 }
 
-/// The default handler: every verb is negotiated but not yet implemented.
-struct UnimplementedFsHandler;
+/// The server's pooled filesystem handler.
+///
+/// `Mount` is not here: it is session setup, answered on the session thread
+/// (like the `Features` exchange) because every other verb's admissibility
+/// depends on its answer. The rest answer `EOPNOTSUPP` until E4 and E5 land.
+struct ServerFsHandler;
 
-impl FsHandler for UnimplementedFsHandler {
+impl FsHandler for ServerFsHandler {
     fn handle(&self, _state: &FsSessionState, related_id: u64, request: V3Message) -> V3Message {
         V3Message::Error {
             related_id,
@@ -1605,6 +1610,171 @@ impl FsHandler for UnimplementedFsHandler {
             )
             .into_bytes(),
         }
+    }
+}
+
+/// Why this session may not write, or `None` when it may.
+///
+/// Answered by creating and removing a uniquely-named probe file. That is a
+/// side effect, but it is the only portable way to learn whether *this* user
+/// may write on *this* mount, and it answers in one question what a read-only
+/// mount flag, a denying mode and a denying ACL would each answer separately.
+/// `PathSemantics::probe` already writes here for the same reason and with the
+/// same unique-prefix discipline, so this adds no new class of side effect.
+///
+/// It is deliberately not a per-path evaluation; that is `Access` (E5-S7).
+fn write_barrier(state: &FsSessionState) -> Option<&'static str> {
+    if state.read_only {
+        return Some("export is read-only");
+    }
+    match tempfile::Builder::new()
+        .prefix(".xsync-write-probe-")
+        .tempfile_in(&state.root)
+    {
+        Ok(_probe) => None,
+        Err(error) if is_read_only_filesystem(&error) => Some("filesystem is mounted read-only"),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Some("no write permission on the export root")
+        }
+        Err(_) => Some("the export root does not accept writes"),
+    }
+}
+
+#[cfg(unix)]
+fn is_read_only_filesystem(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EROFS)
+}
+
+#[cfg(not(unix))]
+const fn is_read_only_filesystem(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Conventional name and path limits for the export root.
+///
+/// These are the values every filesystem xsync serves today actually uses.
+/// Reading the real `pathconf` limits needs an FFI call, and the workspace
+/// denies `unsafe_code` for one documented exception; a per-filesystem limit is
+/// not worth becoming the second. A client uses these to validate input before
+/// a round trip, and the server still rejects an over-long name on its merits.
+const fn name_and_path_limits() -> (u32, u32) {
+    if cfg!(windows) {
+        (255, 260)
+    } else {
+        (255, 4096)
+    }
+}
+
+/// Facts about the export, computed once per `Mount`.
+fn mount_info(
+    state: &FsSessionState,
+    related_id: u64,
+    export: &[u8],
+    requested_access: protocol_v3::Access,
+) -> V3Message {
+    // Phase 1 serves exactly the one root `xs --server` was given; named
+    // exports arrive with the daemon (E1-S2), so anything but the empty name
+    // is a client error rather than a missing export.
+    if !export.is_empty() {
+        return fs_error(
+            related_id,
+            FsErrorCode::NoEntry,
+            "this server has one unnamed export; send an empty export name",
+        );
+    }
+    match std::fs::metadata(&state.root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return fs_error(
+                related_id,
+                FsErrorCode::NotDirectory,
+                "export root is not a directory",
+            )
+        }
+        Err(error) => {
+            return V3Message::Error {
+                related_id,
+                code: FsErrorCode::NoEntry,
+                platform_errno: error.raw_os_error().unwrap_or(0),
+                message: b"export root does not exist".to_vec(),
+            }
+        }
+    }
+
+    let barrier = write_barrier(state);
+    // The client's request can only narrow what the export allows.
+    let read_only =
+        state.read_only || requested_access == protocol_v3::Access::ReadOnly || barrier.is_some();
+    let access = if state.read_only {
+        protocol_v3::Access::ReadOnly
+    } else {
+        protocol_v3::Access::ReadWrite
+    };
+    let effective_writable = !read_only;
+    let reason = if effective_writable {
+        Vec::new()
+    } else if let Some(barrier) = barrier {
+        barrier.as_bytes().to_vec()
+    } else {
+        // Nothing stops a write; the client simply asked for a read-only mount.
+        b"mounted read-only at the client's request".to_vec()
+    };
+
+    let semantics = crate::pathsem::PathSemantics::probe(&state.root);
+    let mut supports = 0;
+    if cfg!(unix) {
+        supports |= protocol_v3::supports::SYMLINKS;
+    }
+    if semantics.case_insensitive {
+        supports |= protocol_v3::supports::CASE_INSENSITIVE;
+    }
+    if semantics.normalization_insensitive {
+        supports |= protocol_v3::supports::NORMALIZATION_INSENSITIVE;
+    }
+    let (max_name_len, max_path_len) = name_and_path_limits();
+
+    V3Message::MountInfo {
+        related_id,
+        export: Vec::new(),
+        access,
+        effective_writable,
+        reason,
+        // There is no operator-supplied option string without an exports file
+        // (E1-S2); a client shows `reason` instead of inventing one here.
+        options: Vec::new(),
+        case_sensitive: !semantics.case_insensitive,
+        // What the filesystem *applies*. Neither APFS nor ext4 rewrites the
+        // name it is given, and the probe cannot observe a filesystem that
+        // does, so claiming NFC or NFD here would be a guess. Whether two
+        // forms collide is reported through `supports` instead.
+        normalization: protocol_v3::Normalization::None,
+        max_name_len,
+        max_path_len,
+        supports,
+        max_read: DEFAULT_FS_MAX_TRANSFER,
+        max_write: DEFAULT_FS_MAX_TRANSFER,
+        // Cache lifetime hints need leases to be meaningful (E8-S1).
+        attr_cache_ms: 0,
+        dir_cache_ms: 0,
+    }
+}
+
+/// Whether a request would modify the export, and so must be refused on a
+/// mount that is not writable before it reaches the filesystem.
+fn fs_is_write_class(request: &V3Message) -> bool {
+    match request {
+        V3Message::Open { flags, .. } => {
+            use protocol_v3::open_flags;
+            flags
+                & (open_flags::WRITE
+                    | open_flags::CREATE
+                    | open_flags::EXCL
+                    | open_flags::TRUNC
+                    | open_flags::APPEND)
+                != 0
+        }
+        V3Message::Write { .. } => true,
+        _ => false,
     }
 }
 
@@ -1674,6 +1844,7 @@ pub struct Server {
     fs_features: u64,
     fs_max_in_flight: usize,
     fs_workers: usize,
+    fs_read_only: bool,
     fs_handler: Arc<dyn FsHandler>,
 }
 
@@ -1701,8 +1872,19 @@ impl Server {
             fs_features: 0,
             fs_max_in_flight: DEFAULT_FS_MAX_IN_FLIGHT,
             fs_workers: DEFAULT_FS_WORKERS,
-            fs_handler: Arc::new(UnimplementedFsHandler),
+            fs_read_only: false,
+            fs_handler: Arc::new(ServerFsHandler),
         }
+    }
+
+    /// Serve the export read-only.
+    ///
+    /// The mount reports `access = ro` with a reason, and every write-class
+    /// request is refused with `EROFS` before it reaches the filesystem.
+    #[must_use]
+    pub const fn read_only(mut self, read_only: bool) -> Self {
+        self.fs_read_only = read_only;
+        self
     }
 
     /// Bound one v3 session's concurrency.
@@ -1949,6 +2131,7 @@ impl Server {
 
         let state = Arc::new(FsSessionState {
             root: self.root.clone(),
+            read_only: self.fs_read_only,
             cancelled: Mutex::new(HashSet::new()),
         });
         let (work, jobs) = crossbeam_channel::unbounded::<FsJob>();
@@ -1984,6 +2167,9 @@ impl Server {
         let mut running: HashSet<u64> = HashSet::new();
         let mut busy_handles: HashSet<u64> = HashSet::new();
         let mut handle_queues: HashMap<u64, VecDeque<FsJob>> = HashMap::new();
+        // `None` until a `Mount` has answered; then the writability this
+        // session was granted, with the reason a write is refused.
+        let mut mount: Option<(bool, Vec<u8>)> = None;
         let mut eof = false;
 
         loop {
@@ -2101,6 +2287,75 @@ impl Server {
                             &fs_error(target, FsErrorCode::Cancelled, "request already complete"),
                         )?;
                     }
+                }
+                // Session setup, so answered here rather than on the pool: it
+                // runs once, nothing else may run before it, and handling it
+                // inline is what lets the gates below be a simple check rather
+                // than a race against an in-flight mount. It probes the export
+                // (a temporary file and `pathsem`), which is the one place a
+                // session blocks on I/O before its workers can start.
+                (
+                    Some(_),
+                    V3Message::Mount {
+                        export,
+                        requested_access,
+                    },
+                ) => {
+                    let response = if mount.is_some() {
+                        fs_error(
+                            related_id,
+                            FsErrorCode::Invalid,
+                            "this session is already mounted",
+                        )
+                    } else {
+                        let info = mount_info(&state, related_id, &export, requested_access);
+                        if let V3Message::MountInfo {
+                            effective_writable,
+                            reason,
+                            ..
+                        } = &info
+                        {
+                            mount = Some((*effective_writable, reason.clone()));
+                        }
+                        info
+                    };
+                    write_v3(writer, self.next_id(), &response)?;
+                }
+                // Every verb needs the mount's answer first: it is what says
+                // whether the session may write at all.
+                (Some(_), _) if mount.is_none() => {
+                    write_v3(
+                        writer,
+                        self.next_id(),
+                        &fs_error(
+                            related_id,
+                            FsErrorCode::Invalid,
+                            "session is not mounted; send Mount and await MountInfo first",
+                        ),
+                    )?;
+                }
+                // Refused here rather than in a worker, so a write on a
+                // read-only mount never reaches the filesystem at all.
+                (Some(_), request)
+                    if fs_is_write_class(&request)
+                        && mount.as_ref().is_some_and(|(writable, _)| !writable) =>
+                {
+                    let reason = mount
+                        .as_ref()
+                        .map_or_else(Vec::new, |(_, reason)| reason.clone());
+                    server_log(format_args!(
+                        "refused write-class request {related_id} on a read-only mount"
+                    ));
+                    write_v3(
+                        writer,
+                        self.next_id(),
+                        &V3Message::Error {
+                            related_id,
+                            code: FsErrorCode::ReadOnly,
+                            platform_errno: 0,
+                            message: reason,
+                        },
+                    )?;
                 }
                 (Some(_), request) => {
                     if in_flight >= self.fs_max_in_flight {
@@ -4258,15 +4513,15 @@ impl Server {
 ///
 /// # Errors
 /// Returns [`ServerError`] on failure.
-pub fn run_server_stdio(root: PathBuf) -> Result<(), ServerError> {
+pub fn run_server_stdio(root: PathBuf, read_only: bool) -> Result<(), ServerError> {
     server_log(format_args!(
-        "process started: pid={}, root={}",
+        "process started: pid={}, root={}, read_only={read_only}",
         std::process::id(),
         root.display()
     ));
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut server = Server::new(root);
+    let mut server = Server::new(root).read_only(read_only);
     let reader = BufReader::new(stdin);
     let mut writer = BufWriter::with_capacity(TRANSPORT_WRITE_BUFFER, stdout);
     server_log("waiting for client handshake");
@@ -4298,6 +4553,11 @@ pub const MAX_PIPELINED_FRAMES: usize = 2048;
 /// E1-S5). Past it a request is refused with `ELIMIT`; it never stalls the
 /// session, because a stalled reader cannot service a keepalive or a cancel.
 pub const DEFAULT_FS_MAX_IN_FLIGHT: usize = 64;
+
+/// Largest `Read.length` and `Write.data` a v3 session accepts, advertised in
+/// `MountInfo`. The envelope caps this at `MAX_DATA_SEGMENT` (8 MiB); 1 MiB is
+/// the point where a read is one frame and still fits comfortably in flight.
+pub const DEFAULT_FS_MAX_TRANSFER: u32 = 1024 * 1024;
 
 /// Worker threads executing v3 requests for one session.
 ///
@@ -9092,25 +9352,21 @@ mod tests {
                     },
                 ),
                 (3, V3Message::Keepalive { nonce: 7 }),
-                (
-                    4,
-                    V3Message::Mount {
-                        export: Vec::new(),
-                        requested_access: crate::protocol_v3::Access::ReadWrite,
-                    },
-                ),
+                (4, fs_mount()),
+                (5, V3Message::StatFs),
             ],
         );
 
         let mut output = Vec::new();
-        Server::new(tempdir().unwrap().path())
+        let root = tempdir().unwrap();
+        Server::new(root.path())
             .with_fs_features(FS_LOCKS)
             .run(Cursor::new(input), &mut output)
             .unwrap();
 
         let (advertised, replies) = fs_server_replies(output);
         assert!(advertised & CAP_FS_V3 != 0);
-        assert_eq!(replies.len(), 3);
+        assert_eq!(replies.len(), 4);
         // The granted set is the intersection: the client asked for notify too.
         assert_eq!(
             replies[0].message,
@@ -9120,13 +9376,14 @@ mod tests {
             }
         );
         assert_eq!(replies[1].message, V3Message::KeepaliveAck { nonce: 7 });
-        // Mount is negotiated but unimplemented until E1-S4; it must be a
-        // per-request error, not a dead session.
-        match &replies[2].message {
+        assert!(matches!(replies[2].message, V3Message::MountInfo { .. }));
+        // A verb whose handler has not landed yet is a per-request error, not
+        // a dead session.
+        match &replies[3].message {
             V3Message::Error {
                 related_id, code, ..
             } => {
-                assert_eq!(*related_id, 4);
+                assert_eq!(*related_id, 5);
                 assert_eq!(*code, FsErrorCode::NotSupported);
             }
             other => panic!("expected Error, got {other:?}"),
@@ -9329,17 +9586,19 @@ mod tests {
         }
     }
 
-    /// Feed `requests` to a session whose handler is `handler`, returning the
-    /// v3 responses in the order the server wrote them.
-    fn fs_run_with_handler(
-        handler: Arc<dyn FsHandler>,
-        limits: (usize, usize),
-        requests: &[(u64, V3Message)],
-    ) -> Vec<V3Frame> {
-        let mut frames = vec![(2, V3Message::Features { features: 0 })];
+    fn fs_mount() -> V3Message {
+        V3Message::Mount {
+            export: Vec::new(),
+            requested_access: protocol_v3::Access::ReadWrite,
+        }
+    }
+
+    /// Run `requests` against `server`, returning the v3 responses in the order
+    /// the server wrote them, with the `FeaturesAck` and `MountInfo` that open
+    /// every session dropped.
+    fn fs_run_server(mut server: Server, requests: &[(u64, V3Message)]) -> Vec<V3Frame> {
+        let mut frames = vec![(2, V3Message::Features { features: 0 }), (1000, fs_mount())];
         frames.extend(requests.iter().cloned());
-        let mut server = Server::new(tempdir().unwrap().path()).with_fs_limits(limits.0, limits.1);
-        server.fs_handler = handler;
         let mut output = Vec::new();
         server
             .run(
@@ -9348,8 +9607,291 @@ mod tests {
             )
             .unwrap();
         let (_, replies) = fs_server_replies(output);
-        // Drop the FeaturesAck; every caller here cares about what follows.
-        replies[1..].to_vec()
+        assert!(
+            matches!(replies[1].message, V3Message::MountInfo { .. }),
+            "session did not mount: {:?}",
+            replies[1].message
+        );
+        replies[2..].to_vec()
+    }
+
+    /// As [`fs_run_server`], with the pooled handler replaced for the test.
+    fn fs_run_with_handler(
+        handler: Arc<dyn FsHandler>,
+        limits: (usize, usize),
+        requests: &[(u64, V3Message)],
+    ) -> Vec<V3Frame> {
+        // Held until `fs_run_server` returns: the mount probes this root, so
+        // it has to still exist.
+        let root = tempdir().unwrap();
+        let mut server = Server::new(root.path()).with_fs_limits(limits.0, limits.1);
+        server.fs_handler = handler;
+        fs_run_server(server, requests)
+    }
+
+    /// Open a session, mount, and return the `MountInfo` verbatim.
+    fn fs_mount_facts(mut server: Server, request: V3Message) -> V3Message {
+        let frames = [(2, V3Message::Features { features: 0 }), (1000, request)];
+        let mut output = Vec::new();
+        server
+            .run(
+                Cursor::new(fs_client_input(FS_V3_CLIENT, &frames)),
+                &mut output,
+            )
+            .unwrap();
+        let (_, replies) = fs_server_replies(output);
+        replies[1].message.clone()
+    }
+
+    #[test]
+    fn fs_mount_reports_a_writable_export() {
+        let root = tempdir().unwrap();
+        let facts = fs_mount_facts(Server::new(root.path()), fs_mount());
+        let V3Message::MountInfo {
+            related_id,
+            access,
+            effective_writable,
+            reason,
+            max_read,
+            max_write,
+            max_name_len,
+            max_path_len,
+            case_sensitive,
+            supports,
+            ..
+        } = facts
+        else {
+            panic!("expected MountInfo, got {facts:?}")
+        };
+        assert_eq!(related_id, 1000);
+        assert_eq!(access, protocol_v3::Access::ReadWrite);
+        assert!(effective_writable, "a fresh temp dir must be writable");
+        // The contract ties these together: a reason exists only when a write
+        // is refused.
+        assert!(reason.is_empty());
+        assert_eq!(max_read, DEFAULT_FS_MAX_TRANSFER);
+        assert_eq!(max_write, DEFAULT_FS_MAX_TRANSFER);
+        assert!(max_name_len > 0 && max_path_len > 0);
+        // Case sensitivity is a property of whichever filesystem the temp dir
+        // landed on, so assert only that it agrees with the probe rather than
+        // hard-coding this machine's answer.
+        let probed = crate::pathsem::PathSemantics::probe(root.path());
+        assert_eq!(case_sensitive, !probed.case_insensitive);
+        assert_eq!(
+            supports & protocol_v3::supports::CASE_INSENSITIVE != 0,
+            probed.case_insensitive
+        );
+    }
+
+    #[test]
+    fn fs_mount_reports_a_read_only_export_with_its_reason() {
+        let root = tempdir().unwrap();
+        let facts = fs_mount_facts(Server::new(root.path()).read_only(true), fs_mount());
+        let V3Message::MountInfo {
+            access,
+            effective_writable,
+            reason,
+            ..
+        } = facts
+        else {
+            panic!("expected MountInfo, got {facts:?}")
+        };
+        assert_eq!(access, protocol_v3::Access::ReadOnly);
+        assert!(!effective_writable);
+        assert_eq!(reason, b"export is read-only");
+    }
+
+    #[test]
+    fn fs_mount_lets_a_client_ask_for_less_than_the_export_allows() {
+        // The export is writable; the client asked not to be able to write, so
+        // the mount is read-only and says why.
+        let root = tempdir().unwrap();
+        let facts = fs_mount_facts(
+            Server::new(root.path()),
+            V3Message::Mount {
+                export: Vec::new(),
+                requested_access: protocol_v3::Access::ReadOnly,
+            },
+        );
+        let V3Message::MountInfo {
+            access,
+            effective_writable,
+            reason,
+            ..
+        } = facts
+        else {
+            panic!("expected MountInfo, got {facts:?}")
+        };
+        // `access` is what the *export* grants; `effective_writable` is what
+        // this session got.
+        assert_eq!(access, protocol_v3::Access::ReadWrite);
+        assert!(!effective_writable);
+        assert_eq!(reason, b"mounted read-only at the client's request");
+    }
+
+    #[test]
+    fn fs_mount_refuses_a_named_export_and_a_missing_root() {
+        let root = tempdir().unwrap();
+        let named = fs_mount_facts(
+            Server::new(root.path()),
+            V3Message::Mount {
+                export: b"media".to_vec(),
+                requested_access: protocol_v3::Access::ReadWrite,
+            },
+        );
+        assert!(
+            matches!(
+                named,
+                V3Message::Error {
+                    code: FsErrorCode::NoEntry,
+                    ..
+                }
+            ),
+            "{named:?}"
+        );
+
+        let missing = fs_mount_facts(Server::new(root.path().join("gone")), fs_mount());
+        assert!(
+            matches!(
+                missing,
+                V3Message::Error {
+                    code: FsErrorCode::NoEntry,
+                    ..
+                }
+            ),
+            "{missing:?}"
+        );
+    }
+
+    /// Records every request that reached the pool.
+    struct RecordingHandler {
+        seen: Mutex<Vec<u8>>,
+    }
+
+    impl FsHandler for RecordingHandler {
+        fn handle(
+            &self,
+            _state: &FsSessionState,
+            related_id: u64,
+            request: V3Message,
+        ) -> V3Message {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(protocol_v3::message_type(&request));
+            V3Message::Done { related_id }
+        }
+    }
+
+    #[test]
+    fn fs_read_only_mount_refuses_writes_before_the_filesystem() {
+        let root = tempdir().unwrap();
+        let recorder = Arc::new(RecordingHandler {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut server = Server::new(root.path()).read_only(true);
+        server.fs_handler = Arc::clone(&recorder) as Arc<dyn FsHandler>;
+
+        let replies = fs_run_server(
+            server,
+            &[
+                (
+                    3,
+                    V3Message::Open {
+                        path: b"new".to_vec(),
+                        flags: protocol_v3::open_flags::WRITE | protocol_v3::open_flags::CREATE,
+                        mode: 0o644,
+                        attr_mask: 0,
+                    },
+                ),
+                (
+                    4,
+                    V3Message::Write {
+                        handle: 1,
+                        offset: 0,
+                        digest: None,
+                        data: b"hi".to_vec(),
+                    },
+                ),
+                (
+                    5,
+                    V3Message::Open {
+                        path: b"existing".to_vec(),
+                        flags: protocol_v3::open_flags::READ,
+                        mode: 0,
+                        attr_mask: 0,
+                    },
+                ),
+            ],
+        );
+
+        assert_eq!(replies.len(), 3);
+        for (index, expected) in [(0, 3_u64), (1, 4)] {
+            match &replies[index].message {
+                V3Message::Error {
+                    related_id,
+                    code,
+                    message,
+                    ..
+                } => {
+                    assert_eq!(*related_id, expected);
+                    assert_eq!(*code, FsErrorCode::ReadOnly);
+                    // The refusal carries the mount's own reason, so a client
+                    // shows one explanation everywhere.
+                    assert_eq!(message, b"export is read-only");
+                }
+                other => panic!("expected EROFS, got {other:?}"),
+            }
+        }
+        // The read-class open was not gated and did reach the pool; the two
+        // write-class requests never did.
+        assert_eq!(replies[2].message, V3Message::Done { related_id: 5 });
+        assert_eq!(
+            *recorder.seen.lock().unwrap(),
+            vec![protocol_v3::types::OPEN]
+        );
+    }
+
+    #[test]
+    fn fs_session_requires_exactly_one_mount_before_any_verb() {
+        let root = tempdir().unwrap();
+        let mut output = Vec::new();
+        let frames = [
+            (2, V3Message::Features { features: 0 }),
+            // Before any mount.
+            (3, V3Message::StatFs),
+            (4, fs_mount()),
+            // A second mount on a mounted session.
+            (5, fs_mount()),
+        ];
+        Server::new(root.path())
+            .run(
+                Cursor::new(fs_client_input(FS_V3_CLIENT, &frames)),
+                &mut output,
+            )
+            .unwrap();
+        let (_, replies) = fs_server_replies(output);
+
+        assert!(matches!(
+            replies[1].message,
+            V3Message::Error {
+                related_id: 3,
+                code: FsErrorCode::Invalid,
+                ..
+            }
+        ));
+        assert!(matches!(
+            replies[2].message,
+            V3Message::MountInfo { related_id: 4, .. }
+        ));
+        assert!(matches!(
+            replies[3].message,
+            V3Message::Error {
+                related_id: 5,
+                code: FsErrorCode::Invalid,
+                ..
+            }
+        ));
     }
 
     #[test]

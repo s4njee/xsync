@@ -10,6 +10,11 @@ one end of a transfer actually has.
 ## [Unreleased]
 
 ### Added
+- Protocol v3 `Mount`: a session attaches to the `xs --server` root and receives
+  its writability, the reason a write is refused, case/normalization semantics,
+  name and path limits, and a `supports` bitmap. `xs --server --read-only` serves
+  an export read-only; write-class requests are then refused with `EROFS` before
+  the filesystem is touched. Every other verb requires a completed mount.
 - Protocol v3 concurrency: a v3 session dispatches requests to a bounded worker
   pool and answers them out of order, while requests naming the same handle stay
   in send order. `Features`, `Keepalive` and `Cancel` are answered without waiting

@@ -108,7 +108,7 @@ fn main() -> Result<(), BenchError> {
 
     // If launched as a server child, serve over stdio and exit.
     if let Some(root) = &cli.server {
-        xsync_core::server::run_server_stdio(root.clone()).map_err(BenchError::Serve)?;
+        xsync_core::server::run_server_stdio(root.clone(), false).map_err(BenchError::Serve)?;
         return Ok(());
     }
     if cli.repetitions == 0 {

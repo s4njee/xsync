@@ -146,6 +146,15 @@ struct Cli {
     #[arg(long, hide = true)]
     server: bool,
 
+    /// Serve the root read-only (with `--server`).
+    ///
+    /// The v3 mount reports `access = ro` with a reason, and every write-class
+    /// request is refused before it reaches the filesystem. This is the only
+    /// access control the SSH transport has: an exports file with per-principal
+    /// rules arrives with the daemon.
+    #[arg(long, hide = true, requires = "server")]
+    read_only: bool,
+
     /// Remote transport: auto prefers xsync and falls back only when unavailable.
     #[arg(long, value_enum, default_value_t = TransportArg::Auto)]
     transport: TransportArg,
@@ -836,7 +845,7 @@ fn run(cli: &Cli, matches: &ArgMatches) -> Result<RunOutcome, CliError> {
             .as_deref()
             .or(cli.dest.as_deref())
             .map_or_else(|| std::path::PathBuf::from("."), std::path::PathBuf::from);
-        xsync_core::server::run_server_stdio(root)?;
+        xsync_core::server::run_server_stdio(root, cli.read_only)?;
         return Ok(RunOutcome::Complete);
     }
 

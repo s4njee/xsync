@@ -29,8 +29,9 @@ compatibility-matrix row and the f2/Kestrel consumer decision.
 | 1 | E3-S6 — Capability negotiation | **Done** 2026-09-03 |
 | 1 | E3-S7 — Error model (Phase 1 scope) | **Done** 2026-09-03 |
 | 1 | E3-S1 — Concurrent requests | **Done** 2026-09-03 |
-| 1 | E1-S4 — Mount and advertised writability | Next |
-| 1 | E4-S1–S3, E4-S8, E5-S1–S3, E9-S1/S4/S6, E10-S1/S4 | Not started |
+| 1 | E1-S4 — Mount and advertised writability (Phase 1 scope) | **Done** 2026-09-03 |
+| 1 | E4-S1 — Open and close handles | Next |
+| 1 | E4-S2–S3, E4-S8, E5-S1–S3, E9-S1/S4/S6, E10-S1/S4 | Not started |
 | 2–6 | everything else | Not started |
 
 All of the above is on xsync branch `v3`, **uncommitted**. §0 below still describes the
@@ -194,24 +195,89 @@ As a client I can list the exports a server offers before choosing one, like
   unless the export sets `browseable_when_denied = true`.
 - `xs exports host[:port]` prints the table; `--json` prints it as JSONL.
 
-#### X3-E1-S4 — Advertised writability and mount facts
+#### X3-E1-S4 — Advertised writability and mount facts — **Done (Phase 1 scope)**
+
+*Landed 2026-09-03 on xsync branch `v3`.*
+
 As a client I learn, at mount time and on every reconnect, whether I can write, and
 why not if I can't.
 
 **AC**
-- `Mount` request names an export and returns a `MountInfo`: `export_name`, `access`
+- [x] `Mount` request names an export and returns a `MountInfo`: `export_name`, `access`
   (`ro`/`rw`), `effective_writable: bool` (access ∧ principal permitted ∧ filesystem
   not read-only), `reason` string when not writable (e.g. `export is ro`,
   `filesystem mounted read-only`, `principal squashed to nobody`), `options` string,
   `case_sensitive: bool`, `normalization: none|nfc|nfd`, `max_name_len`,
   `max_path_len`, `supports` bitmap (xattrs, symlinks, hardlinks, locks, leases,
-  notify, sparse).
-- The server re-evaluates `effective_writable` on reconnect (E3-S2) and whenever
+  notify, sparse). *(No principal term yet: identity mapping is E2-S4, and the SSH
+  transport's principal is the login user. `options` is empty because there is no
+  exports file to supply one until E1-S2.)*
+- [ ] The server re-evaluates `effective_writable` on reconnect (E3-S2) and whenever
   the export table is reloaded; a change is pushed as a `MountChanged` notification.
-- A write-class request against an `ro` mount is refused with `EROFS` *before*
+  **Deferred:** both halves need machinery this phase does not have — session resume
+  is E3-S2 and the reloadable export table is E1-S2. `MountChanged`'s type is
+  reserved (52–55) and unassigned.
+- [x] A write-class request against an `ro` mount is refused with `EROFS` *before*
   touching the filesystem, and the refusal is not logged as an error.
-- Test: flip an export from `rw` to `ro` via reload while a session is open; the
-  session receives `MountChanged`, and its next write gets `EROFS`.
+- [ ] Test: flip an export from `rw` to `ro` via reload while a session is open; the
+  session receives `MountChanged`, and its next write gets `EROFS`. **Deferred** with
+  the reload it tests. The `EROFS` half is covered against a read-only server.
+
+**Results**
+
+- `Mount` is answered **on the session thread**, not the worker pool. It is session
+  setup like the `Features` exchange, it runs once, nothing else may run before it,
+  and answering it inline is what lets the gates below be a plain check instead of a
+  race against an in-flight mount. It is the one place a session blocks on I/O before
+  its workers start.
+- **Writability is probed, not inferred.** `write_barrier` creates and removes a
+  uniquely-named temporary file in the export root. That is a side effect, but it is
+  the only portable way to learn whether *this* user may write on *this* mount, and it
+  answers in one question what a read-only mount flag, a denying mode and a denying
+  ACL would each answer separately. `PathSemantics::probe` already writes there for the
+  same reason, so it adds no new class of side effect. The alternative — `statvfs` plus
+  `access(2)` — needs three `unsafe` blocks, and the workspace denies `unsafe_code` with
+  one documented exception; a mount probe is not worth becoming the second.
+- `xs --server --read-only` is the whole of Phase 1's access control, and it is honest
+  about that: `access = ro` with `reason = "export is read-only"`. Per-principal rules
+  arrive with the daemon.
+- **`access` and `effective_writable` are different questions**, and the split showed up
+  as soon as a client asked for `ro` on a writable export: `access` is what the export
+  grants, `effective_writable` is what this session got. That is now stated in
+  `protocol.md` and has its own test.
+- **Two `supports` bits were added** — `CASE_INSENSITIVE` (256) and
+  `NORMALIZATION_INSENSITIVE` (512) — because implementing the story exposed a modelling
+  gap in the freeze: the wire's `normalization` field says which form a filesystem
+  *applies*, but the fact a client writing names actually needs is whether two
+  canonically-equivalent forms collide, and APFS applies nothing while folding both.
+  Reporting `Nfc` there would have been a guess. Adding bits to a bitmap whose unknown
+  bits are preserved is the extension point the freeze was designed around, and no
+  consumer has imported the vectors yet.
+- The `supports` contract is now stricter and more useful: a bit is set only when the
+  filesystem can do the thing **and** this server exposes it, so it is a promise a
+  client may act on rather than a description of the volume. Under that rule Phase 1
+  advertises `SYMLINKS` plus whatever the probe found.
+- The write gate lives on the session thread, so a write to a read-only mount never
+  reaches a worker, let alone the filesystem, and the `EROFS` carries the mount's own
+  `reason` so a client shows one explanation everywhere. A test asserts the pool never
+  saw the two write-class requests and did see the read-class one.
+- `max_name_len` / `max_path_len` are the conventional 255 / 4096 (255 / 260 on
+  Windows) rather than real `pathconf` values, for the same `unsafe` reason.
+- Six new tests: writable mount facts, read-only export, a client narrowing its own
+  access, a named export and a missing root both refused, the `EROFS` gate proving the
+  pool was never reached, and mount-exactly-once ordering.
+
+**Next steps**
+
+- **E4-S1 (`Open`)** is next and is the first verb to need the handle table, which is
+  the first shared mutable state the pool will contend on.
+- `FsSessionState` should carry the `MountInfo` once E4/E5 handlers need writability
+  per-path; today only the session thread needs it.
+- `MountChanged`, reload and reconnect re-evaluation land with E1-S2 and E3-S2, and
+  should be done together since they share the "writability changed under a live
+  session" path.
+- Real `pathconf` limits and a `statvfs`-based read-only check both want FFI; revisit
+  only if a filesystem is found where the conventional answers mislead.
 
 #### X3-E1-S5 — Session limits
 As an operator I can bound what one session or one principal may hold.
@@ -1106,7 +1172,7 @@ method list to be revised against what the GUI actually needs once M1 is running
 
 | Phase | Stories | Unlocks |
 |---|---|---|
-| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, **E1-S4 next**, E4-S1–S3, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
+| **1. Random access over SSH** | ~~E11-S1 (table)~~, ~~E3-S6~~, ~~E3-S7~~, ~~E3-S1~~, ~~E1-S4~~, **E4-S1 next**, E4-S2–S3, E4-S8, E5-S1–S3, E1-S4 (writability over `--server` with a `--read-only` flag), E9-S1, E9-S4, E9-S6, E10-S1, E10-S4 | Excalibur can browse, preview, stream media, edit-in-place and show RW/RO + capacity against `ssh host xs --server`. **This is the minimum Excalibur dependency.** |
 | **2. Daemon, TLS, identity** | E1-S1–S3, E1-S5, E2-S1, E2-S3–S5, E10-S2, E10-S6, E12-S1–S3 | Connect without SSH; exports; principals; the "New Connection" dialog's xsync tab is complete. |
 | **3. Durability and coherence** | E3-S2, E3-S3, E3-S5, E4-S6, E4-S7, E6-S1, E6-S4, E6-S5, E5-S4, E5-S7 | Resumable uploads that survive drops; locks for edit-in-place; complete mutation set. |
 | **4. Live views and speed** | E7, E6-S2, E8-S1–S5, E5-S2 cursor fix, E5-S5, E4-S4, E4-S5 | Auto-refreshing listings, leases, compound open-read, sparse. |
